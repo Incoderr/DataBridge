@@ -1,0 +1,316 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/public-sans";
+@import "@fontsource-variable/geist";
+
+/* JetBrains Mono - the signature JetBrains typeface, loaded from fontsource */
+@import "@fontsource-variable/jetbrains-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ============================================================
+   JetBrains / Darcula-inspired theme tokens
+   DataGrip + IntelliJ Database tool window palette.
+   ============================================================ */
+:root {
+    /* Light theme (IntelliJ Light) */
+    --background: oklch(0.975 0.002 240);          /* #F2F2F2 sidebar area */
+    --foreground: oklch(0.22 0.02 250);           /* #1F1F1F text — high contrast */
+    --card: oklch(1 0 0);                          /* #FFFFFF panels */
+    --card-foreground: oklch(0.22 0.02 250);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.22 0.02 250);
+    --primary: oklch(0.5 0.2 255);               /* #1E80FF vivid blue */
+    --primary-foreground: oklch(0.98 0 0);
+    --secondary: oklch(0.96 0.003 240);
+    --secondary-foreground: oklch(0.22 0.02 250);
+    --muted: oklch(0.95 0.003 240);
+    --muted-foreground: oklch(0.42 0.01 250);    /* #5A5A5A — clearly readable */
+    --accent: oklch(0.93 0.03 255);               /* light blue hover */
+    --accent-foreground: oklch(0.2 0.02 250);
+    --destructive: oklch(0.56 0.22 25);
+    --border: oklch(0.84 0.003 240);             /* #D5D5D5 — visible divider */
+    --input: oklch(0.9 0.003 240);
+    --ring: oklch(0.5 0.2 255);
+    --chart-1: oklch(0.5 0.2 255);
+    --chart-2: oklch(0.5 0.22 145);
+    --chart-3: oklch(0.6 0.2 70);
+    --chart-4: oklch(0.55 0.22 320);
+    --chart-5: oklch(0.55 0.2 0);
+    --radius: 0;
+
+    /* JetBrains-specific surfaces */
+    --jb-toolbar: oklch(1 0 0);                   /* toolbar panel */
+    --jb-toolbar-border: oklch(0.84 0.003 240);
+    --jb-active-tab: oklch(1 0 0);
+    --jb-inactive-tab: oklch(0.96 0.003 240);
+    --jb-tree-bg: oklch(0.985 0.002 240);          /* slight tint so it stands from card */
+    --jb-tree-hover: oklch(0.93 0.01 245);
+    --jb-tree-selected: oklch(0.9 0.05 255);
+    --jb-tree-fg: oklch(0.22 0.02 250);
+    --jb-table-header: oklch(0.97 0.003 240);
+    --jb-table-border: oklch(0.86 0.003 240);
+    --jb-table-row-alt: oklch(0.99 0 0);
+    --jb-table-selected: oklch(0.93 0.05 255);
+    --jb-statusbar: oklch(0.94 0.005 250);
+    --jb-statusbar-fg: oklch(0.35 0.01 250);
+    --jb-connection-ok: oklch(0.5 0.18 145);
+    --jb-connection-err: oklch(0.55 0.22 25);
+    --jb-keyword: oklch(0.4 0.2 305);
+    --jb-string: oklch(0.36 0.16 145);
+    --jb-number: oklch(0.5 0.2 25);
+    --jb-comment: oklch(0.42 0.02 145);
+
+    --sidebar: oklch(0.99 0 0);
+    --sidebar-foreground: oklch(0.22 0.02 250);
+    --sidebar-primary: oklch(0.5 0.2 255);
+    --sidebar-primary-foreground: oklch(0.98 0 0);
+    --sidebar-accent: oklch(0.93 0.03 255);
+    --sidebar-accent-foreground: oklch(0.22 0.02 250);
+    --sidebar-border: oklch(0.84 0.003 240);
+    --sidebar-ring: oklch(0.5 0.2 255);
+
+    /* react-complex-tree overrides */
+    --rct-color-tree-bg: transparent;
+    --rct-color-tree-focus-outline: none;
+    --rct-color-focustree-item-selected-bg: var(--jb-tree-selected);
+    --rct-color-focustree-item-selected-text: var(--jb-tree-fg);
+    --rct-color-focustree-item-focused-border: var(--primary);
+    --rct-color-focustree-item-draggingover-bg: var(--accent);
+    --rct-color-focustree-item-draggingover-color: inherit;
+    --rct-color-nonfocustree-item-selected-bg: var(--jb-table-row-alt);
+    --rct-color-nonfocustree-item-selected-text: inherit;
+    --rct-color-nonfocustree-item-focused-border: var(--border);
+    --rct-color-search-highlight-bg: var(--accent);
+    --rct-color-drag-between-line-bg: var(--primary);
+    --rct-color-arrow: oklch(0.5 0.01 250);
+    --rct-item-height: 22px;
+    --rct-color-renaming-input-submitbutton-bg: inherit;
+    --rct-color-renaming-input-submitbutton-bg-hover: var(--primary);
+    --rct-color-renaming-input-submitbutton-bg-active: var(--primary);
+    --rct-color-renaming-input-submitbutton-text: inherit;
+    --rct-color-renaming-input-submitbutton-text-hover: #ffffff;
+    --rct-color-renaming-input-submitbutton-text-active: #ffffff;
+    --rct-color-focustree-item-hover-bg: var(--jb-tree-hover);
+}
+
+.dark {
+    /* Dark theme (Darcula) - the signature JetBrains look */
+    --background: oklch(0.2764 0.0079 264.44);          /* #2B2B2B main bg */
+    --foreground: oklch(0.85 0.01 245);           /* #A9B7C6 text */
+    --card: oklch(0.23 0.003 250);                /* #262626 panels */
+    --card-foreground: oklch(0.85 0.01 245);
+    --popover: oklch(0.23 0.003 250);
+    --popover-foreground: oklch(0.85 0.01 245);
+    --primary: oklch(0.62 0.18 255);             /* #408EEC bright blue */
+    --primary-foreground: oklch(0.13 0.002 250);
+    --secondary: oklch(0.31 0.005 250);          /* #323232 */
+    --secondary-foreground: oklch(0.85 0.01 245);
+    --muted: oklch(0.31 0.005 250);
+    --muted-foreground: oklch(0.62 0.01 245);
+    --accent: oklch(0.36 0.03 255);               /* hover */
+    --accent-foreground: oklch(0.92 0.01 245);
+    --destructive: oklch(0.62 0.22 25);
+    --border: oklch(0.35 0.005 250);             /* #3F4244 */
+    --input: oklch(0.2 0.003 250);
+    --ring: oklch(0.62 0.18 255);
+    --chart-1: oklch(0.62 0.18 255);
+    --chart-2: oklch(0.7 0.18 145);
+    --chart-3: oklch(0.72 0.2 70);
+    --chart-4: oklch(0.68 0.2 320);
+    --chart-5: oklch(0.62 0.22 25);
+
+    /* JetBrains-specific surfaces (Darcula) */
+    --jb-toolbar: oklch(0.2175 0.0042 264.48);          /* #323232 toolbar */
+    --jb-toolbar-border: oklch(0.4 0.005 250);
+    --jb-active-tab: oklch(0.42 0.015 255);      /* active tab lighter blue tint */
+    --jb-inactive-tab: oklch(0.2175 0.0042 264.48);
+    --jb-tree-bg: oklch(0.2175 0.0042 264.48);          /* #2B2B2B */
+    --jb-tree-hover: oklch(0.34 0.01 250);
+    --jb-tree-selected: oklch(0.35 0.05 255);     /* #214283-ish */
+    --jb-tree-fg: oklch(0.85 0.01 245);
+    --jb-table-header: oklch(0.2175 0.0042 264.48);
+    --jb-table-border: oklch(0.4 0.005 250);
+    --jb-table-row-alt: oklch(0.2175 0.0042 264.48);
+    --jb-table-selected: oklch(0.32 0.05 255);
+    --jb-statusbar: oklch(0.31 0.005 250);
+    --jb-statusbar-fg: oklch(0.62 0.01 245);
+    --jb-connection-ok: oklch(0.65 0.18 145);
+    --jb-connection-err: oklch(0.68 0.22 25);
+    --jb-keyword: oklch(0.68 0.18 305);          /* purple */
+    --jb-string: oklch(0.6 0.18 145);             /* green */
+    --jb-number: oklch(0.72 0.2 70);              /* orange */
+    --jb-comment: oklch(0.55 0.02 145);
+
+    --sidebar: oklch(0.27 0.003 250);
+    --sidebar-foreground: oklch(0.85 0.01 245);
+    --sidebar-primary: oklch(0.62 0.18 255);
+    --sidebar-primary-foreground: oklch(0.13 0.002 250);
+    --sidebar-accent: oklch(0.36 0.03 255);
+    --sidebar-accent-foreground: oklch(0.92 0.01 245);
+    --sidebar-border: oklch(0.35 0.005 250);
+    --sidebar-ring: oklch(0.62 0.18 255);
+
+    /* react-complex-tree overrides for dark */
+    --rct-color-arrow: oklch(0.62 0.01 245);
+}
+
+@theme inline {
+    --font-sans: 'Public Sans Variable', sans-serif;
+    --font-heading: 'Geist Variable', sans-serif;
+    --font-mono: 'JetBrains Mono Variable', 'Geist Mono Variable', ui-monospace, monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    /* JetBrains IDEs default to 13px UI on the platform font; emulate tight */
+    font-size: 13px;
+    line-height: 1.45;
+    }
+  html {
+    @apply font-sans;
+    /* Tighten to JetBrains scale */
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    }
+}
+
+/* ============================================================
+   JetBrains-style scrollbar (Darcula look): thin, subtle, square
+   ============================================================ */
+@layer utilities {
+  .jb-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--jb-toolbar-border) transparent;
+  }
+  .jb-scroll::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  .jb-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .jb-scroll::-webkit-scrollbar-thumb {
+    background: var(--jb-toolbar-border);
+    border: 2px solid var(--background);
+    border-radius: 0;
+  }
+  .jb-scroll::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+  }
+  .jb-scroll::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* Square corners befitting JetBrains; tighten gaps in toolbars */
+  .jb-square { border-radius: 0; }
+}
+
+/* Tab strip divider look */
+.jb-tabstrip {
+  background: var(--jb-inactive-tab);
+  border-bottom: 1px solid var(--jb-toolbar-border);
+}
+.jb-tab {
+  background: var(--jb-inactive-tab);
+  color: var(--muted-foreground);
+  border-right: 1px solid var(--jb-toolbar-border);
+  position: relative;
+}
+.jb-tab[data-active="true"] {
+  background: var(--jb-active-tab);
+  color: var(--foreground);
+}
+.jb-tab[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 2px;
+  /*background: var(--primary);*/
+}
+
+/* React-complex-tree typography tweaks - JetBrains look */
+.rct-tree-root-list {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.rct-tree-item-button {
+  height: 22px;
+  border-radius: 0;
+}
+
+/* ============================================================
+   Sidebar icon visibility — explicit, high-contrast tokens
+   so the narrow toolbar is readable on both themes.
+   ============================================================ */
+.jb-sidebtn {
+  /* The narrow vertical toolbar buttons. Default state: medium dark stroke. */
+  color: var(--foreground);
+  background: transparent;
+  transition: background 120ms, color 120ms;
+}
+.jb-sidebtn:hover {
+  background: var(--jb-tree-hover);
+  color: var(--primary);
+}
+.jb-sidebtn[data-active="true"] {
+  background: var(--jb-tree-selected);
+  color: var(--primary);
+}
+.jb-sidebtn[data-danger="true"]:hover {
+  color: var(--destructive);
+}
+
+/* ============================================================
+   Drag-resize helpers for hand-rolled panes (when not using
+   react-resizable-panels). The body uses react-resizable-panels,
+   these are kept available for any future direct usage.
+   ============================================================ */
+.jb-resizer {
+  position: relative;
+  flex: 0 0 6px;
+  background: var(--jb-toolbar-border);
+  cursor: col-resize;
+  transition: background 120ms;
+}
+.jb-resizer[data-orientation="vertical"] { cursor: row-resize; }
+.jb-resizer:hover, .jb-resizer[data-active="true"] {
+  background: var(--primary);
+}
