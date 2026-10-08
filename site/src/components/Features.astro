@@ -1,0 +1,132 @@
+---
+import Icon from "./Icon.astro";
+
+const features = [
+    {
+        icon: "database",
+        tone: "blue",
+        title: "Three databases, one interface",
+        text: "PostgreSQL, MySQL and SQLite. MongoDB and Redis — coming later.",
+    },
+    {
+        icon: "zap",
+        tone: "violet",
+        title: "Speed without Electron",
+        text: "Rust and GPUI: launches instantly and stays smooth on huge tables.",
+    },
+    {
+        icon: "code",
+        tone: "green",
+        title: "Connected in a minute",
+        text: "A connection string or plain fields — whatever you prefer.",
+    },
+    {
+        icon: "table",
+        tone: "orange",
+        title: "Tables you'll enjoy reading",
+        text: "A million rows is no problem. Types are color-coded, one click opens the full row.",
+    },
+    {
+        icon: "shield",
+        tone: "pink",
+        title: "Everything local",
+        text: "No clouds, no telemetry, no accounts. Your database never leaves your machine.",
+    },
+    {
+        icon: "chart",
+        tone: "sky",
+        title: "The whole structure at a glance",
+        text: "Schemas, tables, views and functions — in one tree, with instant search.",
+    },
+];
+---
+
+<section id="features" class="features">
+    <div class="container">
+        <div class="section-head">
+            <span class="badge">Features</span>
+            <h2>Everything you need to work with data</h2>
+            <p>
+                One job — looking at data. No pain.
+            </p>
+        </div>
+
+        <ul class="grid">
+            {features.map((f) => (
+                <li>
+                    <span class={`ico ico--${f.tone}`}>
+                        <Icon name={f.icon} size={26} />
+                    </span>
+                    <h3>{f.title}</h3>
+                    <p>{f.text}</p>
+                </li>
+            ))}
+        </ul>
+    </div>
+</section>
+
+<style>
+    .features {
+        padding: 72px 0 96px;
+    }
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 56px;
+        margin-top: 64px;
+    }
+    .ico {
+        display: grid;
+        place-items: center;
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        margin-bottom: 18px;
+    }
+    .ico--blue {
+        background: #e7efff;
+        color: #2563eb;
+    }
+    .ico--violet {
+        background: #ede9ff;
+        color: #6d3df5;
+    }
+    .ico--green {
+        background: #dff7ea;
+        color: #16a05b;
+    }
+    .ico--pink {
+        background: #fde8f4;
+        color: #d92d8f;
+    }
+    .ico--orange {
+        background: #fff0dc;
+        color: #ea8a12;
+    }
+    .ico--sky {
+        background: #e3f0ff;
+        color: #2b7be8;
+    }
+    h3 {
+        font-size: 16px;
+        font-weight: 700;
+        margin-bottom: 10px;
+    }
+    li p {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.7;
+        max-width: 300px;
+    }
+    @media (max-width: 900px) {
+        .grid {
+            grid-template-columns: repeat(2, 1fr);
+        }
+    }
+    @media (max-width: 560px) {
+        .grid {
+            grid-template-columns: 1fr;
+            gap: 40px;
+        }
+    }
+</style>

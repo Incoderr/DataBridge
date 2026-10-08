@@ -1,0 +1,26 @@
+---
+interface Props {
+    href?: string;
+}
+const { href = "/" } = Astro.props;
+---
+
+<a href={href} class="logo" aria-label="DataBridge — home">
+    <svg width="26" height="30" viewBox="0 0 26 30" aria-hidden="true">
+        <path d="M1 7v16c0 3.3 5.4 6 12 6s12-2.7 12-6V7z" fill="#1241a8" />
+        <path d="M1 7v7c0 3.3 5.4 6 12 6s12-2.7 12-6V7z" fill="#1a56db" />
+        <ellipse cx="13" cy="7" rx="12" ry="6" fill="#3d8bff" />
+    </svg>
+    <span>DataBridge</span>
+</a>
+
+<style>
+    .logo {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 700;
+        font-size: 19px;
+        letter-spacing: -0.01em;
+    }
+</style>

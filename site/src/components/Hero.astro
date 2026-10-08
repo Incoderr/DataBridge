@@ -1,0 +1,83 @@
+---
+import Icon from "./Icon.astro";
+import DbPreview from "./DbPreview.astro";
+---
+
+<section class="hero">
+    <div class="container hero__grid">
+        <div class="hero__copy">
+            <span class="badge">A desktop client for your databases</span>
+            <h1>
+                Browse your
+                <br />
+                databases
+                <br />
+                <span>without the pain</span>
+            </h1>
+            <p>
+                A fast desktop client for Windows. PostgreSQL, MySQL and
+                SQLite — in one window: open a database, see the data.
+            </p>
+            <div class="hero__cta">
+                <a
+                    href="https://github.com/Incoderr/DataBridge/releases"
+                    class="btn btn--primary"
+                    target="_blank"
+                    rel="noopener"
+                >
+                    Download for free <Icon name="download" size={18} />
+                </a>
+                <a href="#features" class="btn btn--link">
+                    <Icon name="play" size={22} /> Learn more
+                </a>
+            </div>
+        </div>
+        <div class="hero__visual">
+            <DbPreview />
+        </div>
+    </div>
+</section>
+
+<style>
+    .hero {
+        padding: 40px 0 80px;
+        background: linear-gradient(180deg, #eef4ff 0%, #fff 100%);
+    }
+    .hero__grid {
+        display: grid;
+        grid-template-columns: 1fr 1.05fr;
+        gap: 40px;
+        align-items: center;
+    }
+    h1 {
+        font-size: clamp(36px, 4.6vw, 52px);
+        line-height: 1.12;
+        letter-spacing: -0.03em;
+        font-weight: 800;
+        margin: 22px 0 24px;
+    }
+    h1 span {
+        color: var(--blue);
+    }
+    .hero__copy p {
+        color: #3b4659;
+        font-size: 15px;
+        line-height: 1.8;
+        max-width: 440px;
+    }
+    .hero__cta {
+        display: flex;
+        align-items: center;
+        gap: 28px;
+        margin-top: 36px;
+        flex-wrap: wrap;
+    }
+    @media (max-width: 960px) {
+        .hero__grid {
+            grid-template-columns: 1fr;
+        }
+        .hero {
+            padding-bottom: 56px;
+        }
+    }
+</style>

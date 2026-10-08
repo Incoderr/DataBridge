@@ -1,0 +1,156 @@
+:root {
+    --blue: #1560f0;
+    --blue-dark: #0f4cc4;
+    --blue-soft: #eaf1ff;
+    --navy: #0f1a2e;
+    --text: #0f1a2e;
+    --muted: #5b6678;
+    --line: #e4e9f2;
+    --radius: 10px;
+    --container: 1200px;
+    font-family:
+        "Inter",
+        system-ui,
+        -apple-system,
+        "Segoe UI",
+        sans-serif;
+}
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+html {
+    scroll-behavior: smooth;
+}
+body {
+    margin: 0;
+    color: var(--text);
+    background: #fff;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+}
+h1,
+h2,
+h3,
+p {
+    margin: 0;
+}
+a {
+    color: inherit;
+    text-decoration: none;
+}
+ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 3px;
+    border-radius: 6px;
+}
+@media (prefers-reduced-motion: reduce) {
+    html {
+        scroll-behavior: auto;
+    }
+}
+
+.container {
+    width: min(var(--container), 100% - 48px);
+    margin-inline: auto;
+}
+section[id] {
+    scroll-margin-top: 80px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: var(--blue-soft);
+    color: var(--blue);
+    font-size: 13px;
+    font-weight: 500;
+}
+.badge--dark {
+    background: rgba(255, 255, 255, 0.08);
+    color: #8db4ff;
+}
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    height: 48px;
+    padding: 0 24px;
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 1;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition:
+        background 0.15s,
+        border-color 0.15s,
+        color 0.15s;
+}
+.btn--sm {
+    height: 40px;
+    padding: 0 18px;
+    font-size: 14px;
+}
+.btn--primary {
+    background: var(--blue);
+    color: #fff;
+    box-shadow: 0 6px 16px -6px rgba(21, 96, 240, 0.6);
+}
+.btn--primary:hover {
+    background: var(--blue-dark);
+}
+.btn--outline {
+    background: #fff;
+    border-color: #cfd6e4;
+    color: var(--text);
+}
+.btn--outline:hover {
+    border-color: var(--blue);
+    color: var(--blue);
+}
+.btn--ghost-dark {
+    background: transparent;
+    border-color: var(--blue);
+    color: #fff;
+}
+.btn--ghost-dark:hover {
+    background: rgba(21, 96, 240, 0.2);
+}
+.btn--link {
+    height: auto;
+    padding: 0;
+    background: none;
+    color: var(--text);
+    font-size: 14px;
+}
+.btn--link:hover {
+    color: var(--blue);
+}
+
+.section-head {
+    text-align: center;
+    max-width: 720px;
+    margin-inline: auto;
+}
+.section-head h2 {
+    font-size: clamp(28px, 3.4vw, 38px);
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+    margin: 18px 0 16px;
+}
+.section-head p {
+    color: var(--muted);
+    font-size: 17px;
+}

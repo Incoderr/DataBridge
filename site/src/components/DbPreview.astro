@@ -1,0 +1,288 @@
+---
+// A faithful stylized preview of the real DataBridge UI: near-black theme,
+// colored column-type tokens, schema tree and the records grid footer.
+const rows = [
+    [1, "Ivan Petrov", "ivan@example.com", "2024-01-12 10:24"],
+    [2, "Anna Smirnova", "anna@example.com", "2024-01-13 14:32"],
+    [3, "Dmitry Kuznetsov", "dmitry@example.com", "2024-01-14 09:17"],
+    [4, "Olga Ivanova", "olga@example.com", "2024-01-15 11:03"],
+    [5, "Sergey Popov", "sergey@example.com", "2024-01-16 16:45"],
+    [6, "Maria Lebedeva", "maria@example.com", "2024-01-17 12:21"],
+    [7, "Alexey Fedorov", "alexey@example.com", "2024-01-18 08:56"],
+    [8, "Ekaterina Nikitina", "katya@example.com", "2024-01-19 15:42"],
+];
+const columns = [
+    { name: "id", type: "int8", tone: "int" },
+    { name: "name", type: "varchar(120)", tone: "text" },
+    { name: "email", type: "varchar(255)", tone: "text" },
+    { name: "created_at", type: "timestamptz", tone: "date" },
+];
+---
+
+<div
+    class="win"
+    role="img"
+    aria-label="DataBridge interface: the users table in PostgreSQL"
+>
+    <div class="win__bar">
+        <i style="background:#ff5f57"></i>
+        <i style="background:#febc2e"></i>
+        <i style="background:#28c840"></i>
+        <span>DataBridge</span>
+    </div>
+    <div class="win__body">
+        <aside class="side">
+            <div class="side__title">PostgreSQL</div>
+            <ul>
+                <li class="grp">Schemas</li>
+                <li class="sub">public</li>
+                <li class="sub sub2 active">users</li>
+                <li class="sub sub2">orders</li>
+                <li class="sub sub2">products</li>
+                <li class="sub">auth</li>
+                <li class="side__title">MySQL</li>
+                <li class="side__title">SQLite</li>
+            </ul>
+        </aside>
+
+        <div class="main">
+            <div class="main__top">
+                <strong>users</strong>
+                <span class="status"><i></i>Connected · 12 ms</span>
+                <span class="search">schema.table…</span>
+            </div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        {columns.map((c) => (
+                            <th>
+                                {c.name}
+                                <em class={`t t--${c.tone}`}>{c.type}</em>
+                            </th>
+                        ))}
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows.map((r, i) => (
+                        <tr class:list={{ sel: i === 2 }}>
+                            <td>{r[0] + 1}</td>
+                            <td>{r[0]}</td>
+                            <td>{r[1]}</td>
+                            <td>{r[2]}</td>
+                            <td>{r[3]}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+
+            <div class="foot">
+                <span>1–8 of 24,812 · 8 rows fetched in 12 ms</span>
+                <span class="pager">
+                    <b>‹</b>
+                    Page 1 / 3102
+                    <b>›</b>
+                </span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+    .win {
+        border-radius: 10px;
+        overflow: hidden;
+        background: #0e0f12;
+        color: #e7e9ec;
+        box-shadow:
+            0 30px 60px -20px rgba(15, 26, 46, 0.45),
+            0 0 0 1px rgba(255, 255, 255, 0.08);
+        font-size: 10px;
+    }
+    .win__bar {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        padding: 8px 10px;
+        background: #14161a;
+        color: #8b909a;
+        font-size: 9px;
+    }
+    .win__bar span {
+        margin-left: 6px;
+    }
+    .win__bar i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+    }
+    .win__body {
+        display: grid;
+        grid-template-columns: 118px 1fr;
+    }
+    .side {
+        background: #14161a;
+        border-right: 1px solid #25282e;
+        padding: 10px 6px;
+    }
+    .side__title {
+        font-weight: 600;
+        color: #e7e9ec;
+        padding: 4px 8px;
+    }
+    .side ul {
+        margin-top: 4px;
+    }
+    .side li {
+        padding: 4px 8px;
+        border-radius: 4px;
+        color: #8b909a;
+    }
+    .side .grp {
+        color: #5c626b;
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    .side .sub {
+        padding-left: 18px;
+    }
+    .side .sub2 {
+        padding-left: 30px;
+    }
+    .side .active {
+        background: #3e8bff;
+        color: #fff;
+    }
+    .main {
+        padding: 12px 12px 10px;
+        min-width: 0;
+    }
+    .main__top {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid #25282e;
+    }
+    .main__top strong {
+        font-size: 13px;
+        font-weight: 600;
+    }
+    .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: #8b909a;
+        font-size: 8px;
+    }
+    .status i {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: #3fb950;
+    }
+    .search {
+        margin-left: auto;
+        border: 1px solid #25282e;
+        background: #121317;
+        border-radius: 6px;
+        padding: 5px 10px;
+        color: #5c626b;
+        width: 120px;
+        font-size: 9px;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+            monospace;
+    }
+    th {
+        text-align: left;
+        font-weight: 500;
+        color: #e7e9ec;
+        background: #14161a;
+        padding: 7px 8px;
+        border-bottom: 1px solid #25282e;
+        white-space: nowrap;
+    }
+    th em {
+        font-style: normal;
+        font-size: 8.5px;
+        margin-left: 4px;
+    }
+    .t--int {
+        color: #e3b341;
+    }
+    .t--text {
+        color: #e8873c;
+    }
+    .t--date {
+        color: #58a6ff;
+    }
+    td {
+        padding: 7px 8px;
+        border-bottom: 1px solid #1e2126;
+        white-space: nowrap;
+        color: #c9cdd4;
+    }
+    th:first-child,
+    td:first-child {
+        width: 26px;
+        color: #5c626b;
+        text-align: right;
+        padding-right: 10px;
+    }
+    td:nth-child(2) {
+        color: #e3b341;
+    }
+    td:nth-child(5) {
+        color: #58a6ff;
+    }
+    .sel td {
+        background: #3e8bff;
+        color: #fff;
+        border-color: #3e8bff;
+    }
+    .sel td:first-child,
+    .sel td:nth-child(2),
+    .sel td:nth-child(5) {
+        color: #fff;
+    }
+    .foot {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 10px;
+        color: #8b909a;
+        font-size: 9px;
+    }
+    .pager {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .pager b {
+        font-weight: 400;
+        min-width: 18px;
+        text-align: center;
+        padding: 3px 4px;
+        border-radius: 5px;
+        color: #8b909a;
+        background: #1f2126;
+    }
+    @media (max-width: 560px) {
+        .win__body {
+            grid-template-columns: 1fr;
+        }
+        .side {
+            display: none;
+        }
+        td:nth-child(5),
+        th:nth-child(5) {
+            display: none;
+        }
+    }
+</style>

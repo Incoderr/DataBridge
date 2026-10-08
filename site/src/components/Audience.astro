@@ -1,0 +1,124 @@
+---
+import Icon from "./Icon.astro";
+
+const items = [
+    {
+        icon: "code",
+        title: "Developers",
+        text: "Peek at the database without spinning up an IDE.",
+    },
+    {
+        icon: "chart",
+        title: "Analysts",
+        text: "Find the row you need and read it — no SQL required.",
+    },
+    {
+        icon: "database",
+        title: "DBAs",
+        text: "Quickly check the structure of any database.",
+    },
+    {
+        icon: "users",
+        title: "Teams",
+        text: "A light client that needs no explaining.",
+    },
+];
+---
+
+<section id="how" class="audience">
+    <div class="container audience__grid">
+        <div>
+            <span class="badge badge--dark">Who it's for</span>
+            <h2>
+                Fits right into
+                <br />
+                the way you work
+            </h2>
+            <p>
+                One window instead of a dozen tabs, terminals and heavy IDEs.
+            </p>
+            <a
+                href="https://github.com/Incoderr/DataBridge/releases"
+                class="btn btn--ghost-dark"
+                target="_blank"
+                rel="noopener"
+            >
+                Download free <Icon name="arrow" size={18} />
+            </a>
+        </div>
+
+        <ul class="cards">
+            {items.map((i) => (
+                <li>
+                    <span class="ico">
+                        <Icon name={i.icon} size={24} />
+                    </span>
+                    <h3>{i.title}</h3>
+                    <p>{i.text}</p>
+                </li>
+            ))}
+        </ul>
+    </div>
+</section>
+
+<style>
+    .audience {
+        background: #0e0f12;
+        color: #e7e9ec;
+        padding: 56px 0;
+    }
+    .audience__grid {
+        display: grid;
+        grid-template-columns: 1fr 1.15fr;
+        gap: 48px;
+        align-items: center;
+    }
+    h2 {
+        font-size: clamp(26px, 3vw, 32px);
+        line-height: 1.2;
+        letter-spacing: -0.02em;
+        margin: 18px 0 16px;
+    }
+    .audience__grid > div > p {
+        color: #8b909a;
+        font-size: 15px;
+        max-width: 360px;
+        margin-bottom: 28px;
+    }
+    .cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 28px 36px;
+    }
+    .ico {
+        display: grid;
+        place-items: center;
+        width: 40px;
+        height: 40px;
+        border-radius: 10px;
+        border: 1px solid #25282e;
+        background: #181a1f;
+        color: #3e8bff;
+        margin-bottom: 12px;
+    }
+    h3 {
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 6px;
+    }
+    .cards p {
+        color: #8b909a;
+        font-size: 12px;
+        line-height: 1.65;
+    }
+    @media (max-width: 900px) {
+        .audience__grid {
+            grid-template-columns: 1fr;
+        }
+    }
+    @media (max-width: 520px) {
+        .cards {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>

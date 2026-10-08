@@ -1,0 +1,136 @@
+---
+import Icon from "./Icon.astro";
+---
+
+<section id="download" class="cta">
+    <div class="container cta__grid">
+        <div>
+            <span class="badge">Get started</span>
+            <h2>
+                Your data is closer
+                <br />
+                than you think
+            </h2>
+            <p>
+                Free, open source, no sign-up. Grab a ready build — or compile
+                it yourself.
+            </p>
+        </div>
+
+        <div class="cta__btns">
+            <a
+                href="https://github.com/Incoderr/DataBridge/releases"
+                class="btn btn--primary"
+                target="_blank"
+                rel="noopener"
+            >
+                <Icon name="download" size={18} /> Download from GitHub
+            </a>
+            <a
+                href="https://github.com/Incoderr/DataBridge"
+                class="btn btn--outline"
+                target="_blank"
+                rel="noopener"
+            >
+                <Icon name="github" size={18} /> Source code
+            </a>
+        </div>
+
+        <svg class="cta__art" viewBox="0 0 280 170" aria-hidden="true">
+            <rect
+                x="6"
+                y="84"
+                width="72"
+                height="62"
+                rx="12"
+                fill="#fff"
+                stroke="#dbe6fb"
+            />
+            <g stroke="#f0a73a" stroke-width="2" fill="none">
+                <rect x="26" y="102" width="32" height="26" rx="3" />
+                <path d="M26 111h32M26 120h32M42 102v26" />
+            </g>
+            <rect
+                x="196"
+                y="48"
+                width="74"
+                height="62"
+                rx="12"
+                fill="#eef3ff"
+                stroke="#dbe6fb"
+            />
+            <text
+                x="233"
+                y="87"
+                text-anchor="middle"
+                font-size="22"
+                fill="#7a9cf0"
+                font-family="Inter, sans-serif"
+            >
+                &lt;/&gt;
+            </text>
+            <path
+                d="M96 40v78c0 12 20 22 44 22s44-10 44-22V40z"
+                fill="#1a56db"
+            />
+            <path
+                d="M96 70v12c0 10 20 18 44 18s44-8 44-18V70z"
+                fill="#2f7bff"
+                opacity=".55"
+            />
+            <path
+                d="M96 100v10c0 10 20 18 44 18s44-8 44-18v-10z"
+                fill="#2f7bff"
+                opacity=".35"
+            />
+            <ellipse cx="140" cy="40" rx="44" ry="16" fill="#5aa0ff" />
+        </svg>
+    </div>
+</section>
+
+<style>
+    .cta {
+        background: linear-gradient(180deg, #fff, #eef4ff);
+        padding: 40px 0;
+    }
+    .cta__grid {
+        display: grid;
+        grid-template-columns: 1.1fr auto 1fr;
+        gap: 48px;
+        align-items: center;
+    }
+    h2 {
+        font-size: clamp(24px, 2.8vw, 30px);
+        line-height: 1.2;
+        letter-spacing: -0.02em;
+        margin: 14px 0 12px;
+    }
+    .cta__grid > div:first-child p {
+        color: var(--muted);
+        font-size: 14px;
+        max-width: 360px;
+    }
+    .cta__btns {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+    }
+    .cta__art {
+        width: 100%;
+        max-width: 280px;
+        justify-self: end;
+    }
+    @media (max-width: 960px) {
+        .cta__grid {
+            grid-template-columns: 1fr;
+            gap: 28px;
+        }
+        .cta__btns {
+            align-items: flex-start;
+        }
+        .cta__art {
+            justify-self: start;
+            max-width: 220px;
+        }
+    }
+</style>

@@ -1,0 +1,83 @@
+---
+import Logo from "./Logo.astro";
+import Icon from "./Icon.astro";
+
+const repo = "https://github.com/Incoderr/DataBridge";
+const nav = [
+    { label: "Features", href: "#features" },
+    { label: "Who it's for", href: "#how" },
+    { label: "Download", href: "#download" },
+    { label: "GitHub", href: repo },
+];
+const year = new Date().getFullYear();
+---
+
+<footer class="footer" id="faq">
+    <div class="container">
+        <div class="footer__row">
+            <Logo />
+            <nav aria-label="Footer navigation">
+                {nav.map((i) => (
+                    <a href={i.href} target={i.href.startsWith("http") ? "_blank" : undefined} rel="noopener">
+                        {i.label}
+                    </a>
+                ))}
+            </nav>
+            <div class="social">
+                <a href={repo} aria-label="GitHub" target="_blank" rel="noopener">
+                    <Icon name="github" size={20} />
+                </a>
+            </div>
+        </div>
+        <div class="footer__bottom">
+            <span>© {year} DataBridge. Open source.</span>
+            <span class="legal">
+                <a href={`${repo}/releases`} target="_blank" rel="noopener">Releases</a>
+                <a href={`${repo}/issues`} target="_blank" rel="noopener">Issues</a>
+                <a href={repo} target="_blank" rel="noopener">Source</a>
+            </span>
+        </div>
+    </div>
+</footer>
+
+<style>
+    .footer {
+        padding: 24px 0 20px;
+    }
+    .footer__row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        flex-wrap: wrap;
+        padding-bottom: 20px;
+        border-bottom: 1px solid var(--line);
+    }
+    nav {
+        display: flex;
+        gap: 32px;
+        font-size: 12px;
+        flex-wrap: wrap;
+    }
+    nav a:hover,
+    .legal a:hover {
+        color: var(--blue);
+    }
+    .social {
+        display: flex;
+        gap: 22px;
+    }
+    .footer__bottom {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+        padding-top: 16px;
+        font-size: 11px;
+        color: var(--muted);
+    }
+    .legal {
+        display: flex;
+        gap: 28px;
+    }
+</style>

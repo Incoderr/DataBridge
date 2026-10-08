@@ -1,0 +1,70 @@
+---
+import Logo from "./Logo.astro";
+import Icon from "./Icon.astro";
+
+const repo = "https://github.com/Incoderr/DataBridge";
+const nav = [
+    { label: "Features", href: "#features" },
+    { label: "Who it's for", href: "#how" },
+    { label: "Download", href: "#download" },
+];
+---
+
+<header class="header">
+    <div class="container header__row">
+        <Logo />
+        <nav class="nav" aria-label="Основная навигация">
+            {nav.map((i) => (
+                <a href={i.href}>{i.label}</a>
+            ))}
+        </nav>
+        <div class="header__actions">
+            <a href={repo} class="btn btn--outline btn--sm" target="_blank" rel="noopener">
+                <Icon name="github" size={16} /> GitHub
+            </a>
+        </div>
+    </div>
+</header>
+
+<style>
+    .header {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        background: rgba(255, 255, 255, 0.88);
+        backdrop-filter: blur(10px);
+    }
+    .header__row {
+        display: flex;
+        align-items: center;
+        gap: 48px;
+        height: 64px;
+    }
+    .nav {
+        display: flex;
+        gap: 32px;
+        font-size: 13px;
+        font-weight: 500;
+        flex: 1;
+    }
+    .nav a:hover {
+        color: var(--blue);
+    }
+    .header__actions {
+        display: flex;
+        gap: 12px;
+    }
+    @media (max-width: 900px) {
+        .nav {
+            display: none;
+        }
+        .header__row {
+            justify-content: space-between;
+        }
+    }
+    @media (max-width: 480px) {
+        .header__actions .btn--outline {
+            display: none;
+        }
+    }
+</style>
