@@ -1,0 +1,12 @@
+{
+    // Static-assets-only Worker for the Astro landing page.
+    // Deployed via Workers Builds: root directory `site`, build `pnpm build`,
+    // deploy `npx wrangler deploy` (this file is read from the root directory).
+    // Served at https://databridge.<account>.workers.dev/ — domain root, so the
+    // Astro config intentionally has no `base` sub-path.
+    "name": "databridge",
+    "compatibility_date": "2026-10-01",
+    "assets": {
+        "directory": "./dist"
+    }
+}

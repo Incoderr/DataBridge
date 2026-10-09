@@ -15,7 +15,8 @@ removed; the GPUI Rust app is the only product code in this repo.
     `runtime` and the drivers land in stages 1–2)
   - `/assets` — fonts (embedded with `include_bytes!`) and SVG icons
   - `/site` — Astro landing page. Separate Node toolchain (pnpm), own `AGENTS.md`,
-    deployed to GitHub Pages. Do not mix toolchains: the repo root is **cargo-only**,
+    deployed to Cloudflare Pages (build root directory `site`, output `site/dist`).
+    Do not mix toolchains: the repo root is **cargo-only**,
     Rust changes must never touch `site/` and vice versa.
 
 ## Commands
