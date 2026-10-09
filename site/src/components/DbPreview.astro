@@ -1,6 +1,11 @@
 ---
 // A faithful stylized preview of the real DataBridge UI: near-black theme,
 // colored column-type tokens, schema tree and the records grid footer.
+// Three tabs mirror the real surfaces of the app — the records grid, the
+// schema diagram (ERD cards with PK/FK badges and bezier FK edges) and the
+// connection wizard (db type, URL, test connection).
+import Icon from "./Icon.astro";
+
 const rows = [
     [1, "Ivan Petrov", "ivan@example.com", "2024-01-12 10:24"],
     [2, "Anna Smirnova", "anna@example.com", "2024-01-13 14:32"],
@@ -17,77 +22,327 @@ const columns = [
     { name: "email", type: "varchar(255)", tone: "text" },
     { name: "created_at", type: "timestamptz", tone: "date" },
 ];
+
+// Diagram cards: positions are px inside the fixed 380x290 ERD scene and the
+// bezier anchors in the SVG below match the PK/FK row centers.
+const toneOf: Record<string, string> = {
+    int8: "int",
+    varchar: "text",
+    timestamptz: "date",
+    numeric: "num",
+};
+const erdCards = [
+    {
+        name: "users",
+        x: 10,
+        y: 16,
+        w: 120,
+        cols: [
+            { b: "PK", n: "id", t: "int8" },
+            { n: "name", t: "varchar" },
+            { n: "email", t: "varchar" },
+            { n: "created_at", t: "timestamptz" },
+        ],
+    },
+    {
+        name: "orders",
+        x: 246,
+        y: 26,
+        w: 124,
+        cols: [
+            { b: "PK", n: "id", t: "int8" },
+            { b: "FK", n: "user_id", t: "int8" },
+            { b: "FK", n: "product_id", t: "int8" },
+            { n: "total", t: "numeric" },
+            { n: "created_at", t: "timestamptz" },
+        ],
+    },
+    {
+        name: "products",
+        x: 128,
+        y: 176,
+        w: 128,
+        cols: [
+            { b: "PK", n: "id", t: "int8" },
+            { n: "title", t: "varchar" },
+            { n: "price", t: "numeric" },
+        ],
+    },
+];
 ---
 
-<div
-    class="win"
-    role="img"
-    aria-label="DataBridge interface: the users table in PostgreSQL"
->
+<div class="win" aria-label="DataBridge interface preview">
     <div class="win__bar">
         <i style="background:#ff5f57"></i>
         <i style="background:#febc2e"></i>
         <i style="background:#28c840"></i>
         <span>DataBridge</span>
     </div>
-    <div class="win__body">
-        <aside class="side">
-            <div class="side__title">PostgreSQL</div>
-            <ul>
-                <li class="grp">Schemas</li>
-                <li class="sub">public</li>
-                <li class="sub sub2 active">users</li>
-                <li class="sub sub2">orders</li>
-                <li class="sub sub2">products</li>
-                <li class="sub">auth</li>
-                <li class="side__title">MySQL</li>
-                <li class="side__title">SQLite</li>
-            </ul>
-        </aside>
 
-        <div class="main">
-            <div class="main__top">
-                <strong>users</strong>
-                <span class="status"><i></i>Connected · 12 ms</span>
-                <span class="search">schema.table…</span>
+    <div class="win__tabs" role="tablist" aria-label="Interface views">
+        <button
+            class="tab"
+            role="tab"
+            id="db-tab-records"
+            aria-selected="true"
+            aria-controls="db-panel-records"
+        >
+            <Icon name="table" size={12} /> Records
+        </button>
+        <button
+            class="tab"
+            role="tab"
+            id="db-tab-diagram"
+            aria-selected="false"
+            aria-controls="db-panel-diagram"
+        >
+            <Icon name="diagram" size={12} /> Diagram
+        </button>
+        <button
+            class="tab"
+            role="tab"
+            id="db-tab-connect"
+            aria-selected="false"
+            aria-controls="db-panel-connect"
+        >
+            <Icon name="plug" size={12} /> Connect
+        </button>
+    </div>
+
+    <div class="win__panes">
+        <!-- Records grid -->
+        <div
+            class="pane"
+            id="db-panel-records"
+            role="tabpanel"
+            aria-labelledby="db-tab-records"
+        >
+            <div class="win__body">
+                <aside class="side">
+                    <div class="side__title">PostgreSQL</div>
+                    <ul>
+                        <li class="grp">Schemas</li>
+                        <li class="sub">public</li>
+                        <li class="sub sub2 active">users</li>
+                        <li class="sub sub2">orders</li>
+                        <li class="sub sub2">products</li>
+                        <li class="sub">auth</li>
+                        <li class="side__title">MySQL</li>
+                        <li class="side__title">SQLite</li>
+                    </ul>
+                </aside>
+
+                <div class="main">
+                    <div class="main__top">
+                        <strong>users</strong>
+                        <span class="status"><i></i>Connected · 12 ms</span>
+                        <span class="search">schema.table…</span>
+                    </div>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                {columns.map((c) => (
+                                    <th>
+                                        {c.name}
+                                        <em class={`t t--${c.tone}`}>{c.type}</em>
+                                    </th>
+                                ))}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows.map((r, i) => (
+                                <tr class:list={{ sel: i === 2 }}>
+                                    <td>{r[0] + 1}</td>
+                                    <td>{r[0]}</td>
+                                    <td>{r[1]}</td>
+                                    <td>{r[2]}</td>
+                                    <td>{r[3]}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+
+                    <div class="foot">
+                        <span>1–8 of 24,812 · 8 rows fetched in 12 ms</span>
+                        <span class="pager">
+                            <b>‹</b>
+                            Page 1 / 3102
+                            <b>›</b>
+                        </span>
+                    </div>
+                </div>
             </div>
+        </div>
 
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        {columns.map((c) => (
-                            <th>
-                                {c.name}
-                                <em class={`t t--${c.tone}`}>{c.type}</em>
-                            </th>
-                        ))}
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows.map((r, i) => (
-                        <tr class:list={{ sel: i === 2 }}>
-                            <td>{r[0] + 1}</td>
-                            <td>{r[0]}</td>
-                            <td>{r[1]}</td>
-                            <td>{r[2]}</td>
-                            <td>{r[3]}</td>
-                        </tr>
-                    ))}
-                </tbody>
-            </table>
+        <!-- Schema diagram (ERD) -->
+        <div
+            class="pane"
+            id="db-panel-diagram"
+            role="tabpanel"
+            aria-labelledby="db-tab-diagram"
+            hidden
+        >
+            <div class="win__body">
+                <aside class="side">
+                    <div class="side__title">PostgreSQL</div>
+                    <ul>
+                        <li class="grp">public</li>
+                        <li class="sub sub2">users</li>
+                        <li class="sub sub2">orders</li>
+                        <li class="sub sub2">products</li>
+                        <li class="sub sub2 active">Schema diagram</li>
+                        <li class="side__title">MySQL</li>
+                        <li class="side__title">SQLite</li>
+                    </ul>
+                </aside>
 
-            <div class="foot">
-                <span>1–8 of 24,812 · 8 rows fetched in 12 ms</span>
-                <span class="pager">
-                    <b>‹</b>
-                    Page 1 / 3102
-                    <b>›</b>
-                </span>
+                <div class="main">
+                    <div class="wtabs">
+                        <span>users</span>
+                        <span class="on">Schema diagram</span>
+                    </div>
+
+                    <div class="erd">
+                        <div class="erd__scene">
+                            <svg
+                                class="erd__edges"
+                                viewBox="0 0 380 290"
+                                aria-hidden="true"
+                            >
+                                <!-- users.id -> orders.user_id -->
+                                <path
+                                    d="M130 43 C 186 43, 190 69.5, 246 69.5"
+                                />
+                                <!-- products.id -> orders.product_id -->
+                                <path
+                                    d="M192 176 C 220 176, 214 86.5, 246 86.5"
+                                />
+                                <circle cx="130" cy="43" r="2.5"></circle>
+                                <circle cx="246" cy="69.5" r="2.5"></circle>
+                                <circle cx="192" cy="176" r="2.5"></circle>
+                                <circle cx="246" cy="86.5" r="2.5"></circle>
+                            </svg>
+                            {erdCards.map((c) => (
+                                <div
+                                    class="card"
+                                    style={`left:${c.x}px; top:${c.y}px; width:${c.w}px`}
+                                >
+                                    <div class="card__head">{c.name}</div>
+                                    {c.cols.map((col) => (
+                                        <div class="crow">
+                                            {col.b && (
+                                                <i
+                                                    class:list={[
+                                                        "chip",
+                                                        {
+                                                            "chip--pk": col.b ===
+                                                                "PK",
+                                                            "chip--fk": col.b ===
+                                                                "FK",
+                                                        },
+                                                    ]}
+                                                >
+                                                    {col.b}
+                                                </i>
+                                            )}
+                                            <span>{col.n}</span>
+                                            <em class={`t t--${toneOf[col.t]}`}>
+                                                {col.t}
+                                            </em>
+                                        </div>
+                                    ))}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Connection wizard -->
+        <div
+            class="pane pane--connect"
+            id="db-panel-connect"
+            role="tabpanel"
+            aria-labelledby="db-tab-connect"
+            hidden
+        >
+            <div class="wiz">
+                <div class="wiz__head">New connection</div>
+                <div class="wiz__dbs">
+                    <span class="on"><i style="background:#336791"></i>PostgreSQL</span>
+                    <span><i style="background:#4479a1"></i>MySQL</span>
+                    <span><i style="background:#f29b3c"></i>SQLite</span>
+                </div>
+                <span class="wiz__label">Connection URL</span>
+                <div class="wiz__input">postgres://localhost:5432/shop</div>
+                <div class="wiz__hint">
+                    or fill in host, port, user and password
+                </div>
+                <div class="wiz__actions">
+                    <span class="ok">
+                        <Icon name="check" size={11} /> Success · 12 ms
+                    </span>
+                    <span class="wiz__btn wiz__btn--test">Test connection</span>
+                    <span class="wiz__btn wiz__btn--go">Connect</span>
+                </div>
             </div>
         </div>
     </div>
 </div>
+
+<script>
+    // Tab switching for the interface preview. The tabs auto-cycle once to
+    // show all three views, and stop forever after the first interaction.
+    const root = document.querySelector(".win");
+    if (root) {
+        const tabs = Array.from(root.querySelectorAll('[role="tab"]'));
+        const panes = Array.from(root.querySelectorAll('[role="tabpanel"]'));
+        let current = 0;
+        let timer: ReturnType<typeof setInterval> | null = null;
+
+        const stop = () => {
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+        };
+
+        const show = (i: number) => {
+            current = i;
+            tabs.forEach((t, n) => t.setAttribute("aria-selected", String(n === i)));
+            panes.forEach((p, n) => {
+                p.hidden = n !== i;
+            });
+        };
+
+        tabs.forEach((t, i) => {
+            t.addEventListener("click", () => {
+                stop();
+                show(i);
+            });
+            t.addEventListener("keydown", (e) => {
+                if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                e.preventDefault();
+                stop();
+                const d = e.key === "ArrowRight" ? 1 : -1;
+                const n = (i + d + tabs.length) % tabs.length;
+                show(n);
+                (tabs[n] as HTMLElement).focus();
+            });
+        });
+
+        if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+            timer = setInterval(() => {
+                show((current + 1) % tabs.length);
+            }, 5000);
+        }
+        root.addEventListener("pointerdown", stop, { once: true });
+        root.addEventListener("focusin", stop, { once: true });
+    }
+</script>
 
 <style>
     .win {
@@ -106,6 +361,7 @@ const columns = [
         gap: 5px;
         padding: 8px 10px;
         background: #14161a;
+        border-bottom: 1px solid #25282e;
         color: #8b909a;
         font-size: 9px;
     }
@@ -116,6 +372,45 @@ const columns = [
         width: 7px;
         height: 7px;
         border-radius: 50%;
+    }
+    .win__tabs {
+        display: flex;
+        gap: 4px;
+        padding: 8px 10px;
+        background: #14161a;
+        border-bottom: 1px solid #25282e;
+    }
+    .tab {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 11px;
+        border: 0;
+        border-radius: 6px;
+        background: none;
+        color: #8b909a;
+        font-family: inherit;
+        font-size: 9.5px;
+        cursor: pointer;
+        transition:
+            background 0.15s,
+            color 0.15s;
+    }
+    .tab:hover {
+        color: #c9cdd4;
+    }
+    .tab[aria-selected="true"] {
+        background: #1f2126;
+        color: #fff;
+    }
+    .win__panes {
+        min-height: 378px;
+    }
+    .pane[hidden] {
+        display: none;
+    }
+    .pane:not([hidden]) {
+        animation: pane-in 0.25s ease both;
     }
     .win__body {
         display: grid;
@@ -222,6 +517,9 @@ const columns = [
     .t--date {
         color: #58a6ff;
     }
+    .t--num {
+        color: #3fb950;
+    }
     td {
         padding: 7px 8px;
         border-bottom: 1px solid #1e2126;
@@ -273,6 +571,262 @@ const columns = [
         color: #8b909a;
         background: #1f2126;
     }
+
+    /* Diagram pane */
+    .wtabs {
+        display: flex;
+        gap: 6px;
+        padding-bottom: 10px;
+    }
+    .wtabs span {
+        padding: 5px 12px;
+        border-radius: 6px;
+        background: #1f2126;
+        color: #8b909a;
+        font-size: 9px;
+    }
+    .wtabs .on {
+        background: #262b33;
+        color: #fff;
+    }
+    .erd {
+        position: relative;
+        display: grid;
+        place-items: center;
+        height: 314px;
+        margin: 2px 0 12px;
+        border: 1px solid #25282e;
+        border-radius: 8px;
+        overflow: hidden;
+        background-color: #101216;
+        background-image: radial-gradient(
+            rgba(255, 255, 255, 0.07) 1px,
+            transparent 1px
+        );
+        background-size: 13px 13px;
+    }
+    .erd__scene {
+        position: relative;
+        width: 380px;
+        height: 290px;
+    }
+    .erd__edges {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+    }
+    .erd__edges path {
+        fill: none;
+        stroke: #58a6ff;
+        stroke-width: 1.5;
+        opacity: 0.85;
+    }
+    .erd__edges circle {
+        fill: #58a6ff;
+    }
+    .card {
+        position: absolute;
+        background: #14161a;
+        border: 1px solid #2b2f36;
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 6px 14px -8px rgba(0, 0, 0, 0.6);
+    }
+    .card__head {
+        display: flex;
+        align-items: center;
+        height: 18px;
+        padding: 0 8px;
+        background: #1a1d22;
+        border-bottom: 1px solid #25282e;
+        color: #e7e9ec;
+        font-weight: 600;
+        font-size: 9px;
+    }
+    .crow {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 17px;
+        padding: 0 7px;
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+            monospace;
+        font-size: 8.5px;
+        color: #c9cdd4;
+    }
+    .crow span {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .crow em {
+        font-style: normal;
+        font-size: 8px;
+    }
+    .chip {
+        font-style: normal;
+        font-size: 7px;
+        line-height: 1;
+        font-weight: 600;
+        padding: 2px 3px;
+        border-radius: 3px;
+    }
+    .chip--pk {
+        background: rgba(227, 179, 65, 0.16);
+        color: #e3b341;
+    }
+    .chip--fk {
+        background: rgba(88, 166, 255, 0.16);
+        color: #58a6ff;
+    }
+
+    /* Connect pane */
+    .pane--connect {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 378px;
+        background: #101216;
+    }
+    .wiz {
+        width: min(320px, 84%);
+        background: #14161a;
+        border: 1px solid #25282e;
+        border-radius: 10px;
+        padding: 22px 20px;
+        box-shadow: 0 14px 34px -18px rgba(0, 0, 0, 0.7);
+    }
+    .wiz__head {
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 14px;
+    }
+    .wiz__dbs {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 16px;
+    }
+    .wiz__dbs span {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 6px 10px;
+        border: 1px solid #25282e;
+        border-radius: 7px;
+        background: #121317;
+        color: #8b909a;
+        font-size: 9.5px;
+    }
+    .wiz__dbs .on {
+        border-color: #3e8bff;
+        background: #16233d;
+        color: #fff;
+    }
+    .wiz__dbs i {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+    }
+    .wiz__label {
+        display: block;
+        font-size: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #5c626b;
+        margin-bottom: 6px;
+    }
+    .wiz__input {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+            monospace;
+        font-size: 10px;
+        color: #c9cdd4;
+        background: #0f1115;
+        border: 1px solid #25282e;
+        border-radius: 6px;
+        padding: 9px 10px;
+        margin-bottom: 6px;
+        white-space: nowrap;
+        overflow: hidden;
+    }
+    .wiz__hint {
+        font-size: 8.5px;
+        color: #5c626b;
+        margin-bottom: 18px;
+    }
+    .wiz__actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+    .ok {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: #3fb950;
+        font-size: 9px;
+        margin-right: auto;
+    }
+    .wiz__btn {
+        display: inline-flex;
+        align-items: center;
+        padding: 7px 12px;
+        border-radius: 6px;
+        font-size: 9.5px;
+    }
+    .wiz__btn--test {
+        border: 1px solid #25282e;
+        background: #1f2126;
+        color: #c9cdd4;
+    }
+    .wiz__btn--go {
+        background: #3e8bff;
+        color: #fff;
+    }
+
+    @keyframes pane-in {
+        from {
+            opacity: 0;
+            transform: translateY(4px);
+        }
+        to {
+            opacity: 1;
+            transform: none;
+        }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .pane:not([hidden]) {
+            animation: none;
+        }
+    }
+
+    @media (max-width: 640px) {
+        .erd__scene {
+            zoom: 0.8;
+        }
+        .erd {
+            height: 248px;
+        }
+    }
+    @media (max-width: 430px) {
+        .erd__scene {
+            zoom: 0.72;
+        }
+        .erd {
+            height: 225px;
+        }
+    }
+    @media (max-width: 350px) {
+        .erd__scene {
+            zoom: 0.62;
+        }
+        .erd {
+            height: 196px;
+        }
+    }
     @media (max-width: 560px) {
         .win__body {
             grid-template-columns: 1fr;
@@ -283,6 +837,15 @@ const columns = [
         td:nth-child(5),
         th:nth-child(5) {
             display: none;
+        }
+        .win__panes {
+            min-height: 340px;
+        }
+        .pane--connect {
+            min-height: 340px;
+        }
+        .erd {
+            margin-bottom: 8px;
         }
     }
 </style>
