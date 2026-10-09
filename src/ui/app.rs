@@ -5,20 +5,24 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, svg, App, Context, DispatchPhase, Entity, IntoElement, MouseButton,
-    MouseMoveEvent, MouseUpEvent, ParentElement, SharedString, Styled, Window,
+    canvas, div, px, rgb, svg, App, Context, DispatchPhase, DragMoveEvent, Entity,
+    ExternalPaths, FileDropEvent, FontWeight, IntoElement, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, SharedString, Styled, Window,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use gpui_component::tab::{Tab, TabBar};
-use gpui_component::{ActiveTheme, Icon, IconName, Sizable, Size};
+use gpui_component::{
+    ActiveTheme, Icon, IconName, Sizable, Size, VirtualListScrollHandle,
+};
 
 use crate::core::mock;
 use crate::core::model::{ConnectionStatus, DbConnection, DbType, SchemaMeta, TableMeta};
 use crate::core::registry;
 use crate::core::session::SessionHandle;
+use crate::core::storage;
 use crate::ui::diagram::SchemaDiagram;
-use crate::ui::nav_tree::SelectedPath;
+use crate::ui::nav_tree::{SelectedPath, TreeRow};
 use crate::ui::theme;
 use crate::ui::workspace::{OpenTab, RecordsView, TabKind};
 
@@ -63,6 +67,9 @@ pub enum WorkspaceView {
 }
 
 pub struct DataBridge {
+    /// `--mock` demo mode: seeded connections on the mock driver, nothing
+    /// read from or written to the connection store.
+    pub mock: bool,
     pub connections: Vec<DbConnection>,
     pub active_conn: Option<DbConnection>,
     /// Data-plane handle for the active connection — all DB access.
@@ -79,10 +86,20 @@ pub struct DataBridge {
     pub filter_only_tables: bool,
     pub nav_width: f32,
     pub resizing_nav: bool,
+    /// Flat visible-row model of the explorer tree — rebuilt on every
+    /// render by `render_nav_tree`; the virtual list turns only the
+    /// on-screen range into elements.
+    pub nav_rows: Vec<TreeRow>,
+    /// Scroll state of the virtualized tree body. Held on the entity so
+    /// the position survives repaints; reset when a connection opens.
+    pub tree_scroll: VirtualListScrollHandle,
     /// Settings dialog visibility (interface scale chooser).
     pub show_settings: bool,
     // visual state
     pub grid_view: bool,
+    /// External files are dragged over the window right now — the
+    /// "drop it here" hint overlay is up.
+    pub drag_over: bool,
     // connection wizard
     pub wizard: WizardState,
 }
@@ -109,8 +126,18 @@ impl DataBridge {
             chosen_existing: None,
         };
 
+        // `--mock` demo mode: seeded connections served by the mock
+        // driver, nothing persisted. Otherwise the Stage-3 store supplies
+        // the real recent connections (most recently used first).
+        let demo = registry::is_mock();
+
         Self {
-            connections: mock::seed_connections(),
+            mock: demo,
+            connections: if demo {
+                mock::seed_connections()
+            } else {
+                storage::load_connections()
+            },
             active_conn: None,
             session: None,
             schemas: Vec::new(),
@@ -123,8 +150,11 @@ impl DataBridge {
             filter_only_tables: false,
             nav_width: 288.0,
             resizing_nav: false,
+            nav_rows: Vec::new(),
+            tree_scroll: VirtualListScrollHandle::new(),
             show_settings: false,
             grid_view: true,
+            drag_over: false,
             wizard,
         }
     }
@@ -249,6 +279,16 @@ impl DataBridge {
         cx.notify();
     }
 
+    /// Drop a remembered connection from the wizard's list; outside demo
+    /// mode also from the connection store and the OS keyring.
+    pub fn forget_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.connections.retain(|c| c.id != id);
+        if !self.mock {
+            storage::forget_connection(id);
+        }
+        cx.notify();
+    }
+
     /// Back to the connection wizard (disconnect / new connection).
     pub fn terminate(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.active_conn.as_ref().map(|c| c.id.clone()) {
@@ -298,10 +338,12 @@ impl DataBridge {
                 return;
             }
         };
-        if let Some(c) = self.connections.iter_mut().find(|c| c.id == conn.id) {
-            *c = conn.clone();
-        } else {
-            self.connections.push(conn.clone());
+        // Recents first: the just-used connection moves to the top of the
+        // wizard's list; outside demo mode it is persisted (JSON + keyring).
+        self.connections.retain(|c| c.id != conn.id);
+        self.connections.insert(0, conn.clone());
+        if !self.mock {
+            storage::remember_connection(&conn);
         }
         self.active_conn = Some(conn);
         self.session = Some(session.clone());
@@ -311,6 +353,9 @@ impl DataBridge {
         self.view = None;
         self.query.clear();
         self.expanded = HashSet::from(["conn".to_string(), "schemas".to_string()]);
+        // Fresh tree for the new connection — also resets the tree scroll.
+        self.nav_rows.clear();
+        self.tree_scroll = VirtualListScrollHandle::new();
         self.wizard.phase = Phase::Choose;
         self.wizard.error = None;
 
@@ -464,19 +509,103 @@ impl DataBridge {
 
 impl Render for DataBridge {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.active_conn.is_none() {
-            return self.render_wizard(window, cx).into_any_element();
-        }
-
-        let p = theme::palette(cx);
         let resizing = self.resizing_nav;
+        let show_settings = self.show_settings;
+        // Self-heal the hint flag on every frame: any repaint during an
+        // active file drag raises the hint even if a move event was
+        // missed (our app has no internal drags, so an active drag is
+        // always external files).
+        let dragging = cx.has_active_drag();
+        if dragging != self.drag_over {
+            self.drag_over = dragging;
+        }
+        let drag_over = self.drag_over;
         let view = cx.entity();
-        let layout = div()
+        let content = if self.active_conn.is_none() {
+            self.render_wizard(window, cx).into_any_element()
+        } else {
+            self.render_explorer(cx).into_any_element()
+        };
+
+        // The shared full-window shell: one drop zone for both the wizard
+        // and the explorer, the drag-over hint on top of everything, and
+        // the FileDrop watcher that hides the hint when the drag leaves.
+        //
+        // Child order matters: an absolutely positioned `canvas` (a
+        // layout leaf) corrupts the geometry of absolute siblings laid
+        // out after it (observed empirically with gpui 0.2 / taffy 0.9),
+        // so it must stay LAST — behind the settings overlay and the
+        // drop hint.
+        div()
+            .id("window-root")
+            .relative()
+            .size_full()
+            .when(resizing, |this| this.cursor_col_resize())
+            // Files dragged over the window → raise the drop hint.
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                |this, _: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    if !this.drag_over {
+                        this.drag_over = true;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drag_over = false;
+                this.open_dropped_paths(paths, window, cx);
+            }))
+            .child(content)
+            .when(show_settings, |this| {
+                this.child(self.render_settings_dialog(cx))
+            })
+            .when(drag_over, |this| this.child(self.render_drop_hint(cx)))
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    {
+                        let view = view.clone();
+                        move |_, _, window, _cx| {
+                            let view = view.clone();
+                            window.on_mouse_event(
+                                move |e: &FileDropEvent, phase, _, cx: &mut App| {
+                                    if phase == DispatchPhase::Bubble
+                                        && matches!(e, FileDropEvent::Exited)
+                                    {
+                                        view.update(cx, |this, cx| {
+                                            if this.drag_over {
+                                                this.drag_over = false;
+                                                cx.notify();
+                                            }
+                                        });
+                                    }
+                                },
+                            );
+                        }
+                    },
+                )
+                // Pinned insets: without them the absolute children land at
+                // their *static* position (right below the in-flow content)
+                // in drag frames — outside the visible window.
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+    }
+}
+
+impl DataBridge {
+    /// The explorer: rail + tree + splitter + workspace. Extracted from
+    /// `render` so the shared shell (drop zone, drag-over hint, settings
+    /// overlay) can wrap both it and the wizard.
+    fn render_explorer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let view = cx.entity();
+        div()
             .id("app")
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
-            .when(resizing, |this| this.cursor_col_resize())
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
                 if this.resizing_nav && !e.dragging() {
                     // Button was released outside the window and the OS never
@@ -521,6 +650,10 @@ impl Render for DataBridge {
                     },
                 )
                 .absolute()
+                // Pinned insets — keep it at the window origin in drag
+                // frames too (see the shell comment).
+                .top_0()
+                .left_0()
                 .size_full(),
             )
             .child(
@@ -568,20 +701,61 @@ impl Render for DataBridge {
                                 None => crate::ui::workspace::empty_state(cx).into_any_element(),
                             }),
                     ),
-            );
+            )
+    }
 
-        // Settings overlay (interface scale chooser) on top of the layout.
-        if self.show_settings {
-            let mut root = div().relative().size_full();
-            if resizing {
-                root = root.cursor_col_resize();
-            }
-            root.child(layout)
-                .child(self.render_settings_dialog(cx))
-                .into_any_element()
-        } else {
-            layout.into_any_element()
-        }
+    /// The full-window hint shown while database files are dragged over
+    /// the window: a veil plus a dashed card telling the user the drop is
+    /// welcome. Purely visual — no ids, no hitboxes — so the drop itself
+    /// keeps flowing to the shell's `on_drop`.
+    fn render_drop_hint(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let sqlite = DbType::Sqlite;
+        div()
+            .absolute()
+            // Pinned insets — see the shell comment: auto insets let the
+            // element slip to its static position (below the window) in
+            // drag frames.
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(p.background.opacity(0.55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .px(px(44.))
+                    .py(px(28.))
+                    .bg(p.card)
+                    .border_2()
+                    .border_dashed()
+                    .border_color(p.primary.opacity(0.65))
+                    .rounded(px(12.))
+                    .shadow_lg()
+                    .child(
+                        svg()
+                            .path(sqlite.brand_icon())
+                            .size(px(36.))
+                            .flex_none()
+                            .text_color(rgb(sqlite.brand_color())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child("Drop the database file here"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(p.muted_fg)
+                            .child("SQLite: .db · .sqlite · .sqlite3 · .db3"),
+                    ),
+            )
     }
 }
 
@@ -638,6 +812,9 @@ impl DataBridge {
         let backdrop = div()
             .id("settings-backdrop")
             .absolute()
+            // Pinned insets — see the shell comment on drag-frame layout.
+            .top_0()
+            .left_0()
             .size_full()
             .bg(gpui::black().opacity(0.35))
             .cursor_pointer()

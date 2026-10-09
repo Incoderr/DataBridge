@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connected,
@@ -18,7 +20,7 @@ pub enum ConnectionStatus {
     Connecting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DbType {
     PostgreSql,
     MySql,

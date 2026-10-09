@@ -22,14 +22,17 @@ removed; the GPUI Rust app is the only product code in this repo.
 ## Commands
 
 ```
-cargo run                             # run the app
+cargo run                             # run the app (real connections, Stage-3 store)
+cargo run -- --mock                   # demo mode: seeded connections on the mock driver
 cargo check                           # fast type check
 cargo check --no-default-features     # must compile: mock-only build (verify feature isolation)
+cargo test                            # core unit tests (storage mapping, URL sanitize)
 cargo build --release
 ```
 
-There are no tests yet. The first tests belong in `core` (model mapping, mock
-determinism); driver integration tests require a live DB and must be `#[ignore]`d.
+Tests live in `core` (`storage`: URL sanitizing, JSON round-trip). More
+belong there (model mapping, mock determinism); driver integration tests
+require a live DB and must be `#[ignore]`d.
 
 ## Architecture (decided — do not deviate without asking)
 
@@ -49,6 +52,7 @@ src/
     registry.rs   # DbType -> session factory (respects cargo features)
     runtime.rs    # tokio sidecar + bridge into GPUI tasks
     mock.rs       # deterministic mock (the original mock layer, ported from the web app)
+    storage.rs    # Stage-3 recent-connections store: connections.json + OS keyring secrets
   drivers/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
@@ -59,7 +63,7 @@ src/
     app.rs        # root entity DataBridge: connections, tabs, wizard state
     connect.rs    # connection wizard renders (impl DataBridge)
     sidebar.rs    # sidebar chrome
-    nav_tree.rs   # explorer tree
+    nav_tree.rs   # explorer tree (virtualized: flat row model + v_virtual_list + overlay Scrollbar)
     workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate)
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
@@ -148,7 +152,9 @@ the mock driver**:
 - `core/session.rs` — `DbSession` trait + cloneable `SessionHandle`.
 - `core/runtime.rs` — the tokio sidecar (`init` in `main`, `spawn` + oneshot).
 - `core/registry.rs` — `open(conn) -> SessionHandle`; dispatches the sqlx trio
-  behind cargo features, mock for everything else.
+  behind cargo features, mock for everything else. `--mock` (via `init` /
+  `is_mock`) forces the mock driver for every connection — the built-in demo
+  mode that needs no live database.
 - `drivers/` — `postgres.rs` / `mysql.rs` / `sqlite.rs`: lazily-connected pools
   (`ping` = connect + `SELECT 1`), batched per-schema introspection, `COUNT(*)` +
   paged `SELECT *` with dialect-quoted identifiers; row counts are not
@@ -157,8 +163,15 @@ the mock driver**:
   The wizard's Test Connection is a real `SessionHandle::ping()`.
 - `core/mock.rs` — `MockSession: DbSession`: deterministic rows (same
   (connection, schema, table, offset, limit) → same rows, md5-seeded),
-  simulated latency slept on the tokio side; also seeds the wizard's
-  connection list until Stage 3.
+  simulated latency slept on the tokio side; `--mock` runs the whole app on
+  it and seeds the wizard's connection list (`seed_connections`).
+- `core/storage.rs` — Stage-3 recent-connections store. `connections.json`
+  in the platform config dir (newest first, capped at 20); secrets —
+  fields-mode passwords and full URL-mode URLs — go to the OS keyring
+  (service "DataBridge", entry per connection id; the JSON keeps only a
+  password-stripped URL copy for display). Loaded into the wizard on
+  startup, remembered on every successful connect; best-effort everywhere —
+  a missing keyring just means typing the password again.
 - `ui/workspace.rs` — records grid (IDE-scale: `Size::Large` rows, cell font
   13.5) with pagination (PAGE = 50); the page loads through
   `SessionHandle::fetch_rows` with the stale-guarded `load_id`. Tabs are
@@ -173,7 +186,19 @@ the mock driver**:
 - `ui/app.rs` — root entity `DataBridge`: connection list, active connection,
   `session` + `schemas` (loaded asynchronously in `on_connected`),
   tab management, wizard state machine (`Phase::Choose → Form → Testing`).
-- `ui/connect.rs` / `ui/sidebar.rs` / `ui/nav_tree.rs` — render blocks of `DataBridge`.
+  Renders the shared full-window shell (`window-root`) that wraps both the
+  wizard and the explorer: one drop zone, the drag-over hint overlay and
+  the settings dialog on top.
+- `ui/connect.rs` — the wizard is also the landing zone for SQLite files:
+  OS drag & drop anywhere on the window connects immediately (the drop
+  zone lives on the shared `window-root` shell in `app.rs`; a drag-over
+  overlay plus standing hints — Choose phase and the file field — show
+  that it's allowed); the file-path field has a Browse… button (native
+  OS picker via `rfd`, run async off the UI thread). Dropped/picked
+  files become regular SQLite drafts, so `--mock` routes them to the
+  demo tree and the Stage-3 store remembers them like any other
+  connection.
+- `ui/sidebar.rs` / `ui/nav_tree.rs` — render blocks of `DataBridge`.
 - `ui/theme.rs` — near-black dark + clean light palettes (UI Bakery / DrawSQL
   inspired), sans chrome + mono data, radius/shadow tuned in `apply()`.
   Use `theme::palette(cx)`; do not hardcode colors except `DbType::brand_color()`
@@ -184,13 +209,9 @@ the mock driver**:
 
 ### Known deferred items (fix in stages 3–4)
 
-- `DbConnection.password` lives in memory only; Stage 3 moves it to the OS
-  keyring (never plaintext on disk).
 - sqlx is built without TLS features — plaintext connections (local/trusted
   networks). Add `tls-rustls` to the sqlx features when remote TLS hosts
   appear.
-- Connections are seeded in memory (`core::mock::seed_connections`), nothing is
-  persisted.
 - Settings (UI scale) are not persisted.
 - The schema tree loads eagerly via `list_schemas`; per-schema lazy loading
   (`list_tables`) arrives if eager trees prove slow on real databases.
@@ -208,6 +229,9 @@ the mock driver**:
   Wire real connect flow into the wizard (test connection = `ping()`). **Done.**
 - **Stage 3 — persistence.** `connections.json` + `settings.json` in the platform
   config dir; passwords via OS keyring (never plaintext on disk).
+  **Mostly done.** `core/storage.rs` covers connections (`connections.json` +
+  keyring, `--mock` demo flag, forget UI in the wizard). Remaining:
+  `settings.json` (UI scale).
 - **Stage 4 — Mongo + Redis** (`mongodb` crate; `redis` with `tokio-comp`).
 - **Stage 5 — query editor.** `execute(sql)`, result tabs, cancellation (reuse the
   stale-guard/load_id mechanism).
@@ -224,7 +248,9 @@ the mock driver**:
   `h_flex`/`v_flex`) over raw `gpui` building blocks.
 - `anyhow` is allowed only at the binary edge; `core` and drivers use `DbError`.
 - No new dependencies without justification. `async_trait` is pre-approved for
-  `DbSession` (dyn-compatible trait objects).
+  `DbSession` (dyn-compatible trait objects). Stage 3 sanctioned `serde` +
+  `keyring` (persistence, OS keyring secrets) and `rfd` (native file picker);
+  `uuid` gained the `v4` feature for stable connection ids.
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 
@@ -239,5 +265,13 @@ the mock driver**:
   utilities scale with it; hand-tuned `px()` values multiply by `palette.scale`.
 - Pin `gpui`/`gpui-component` to the versions in `Cargo.toml`; their APIs move fast
   (component lib is pre-1.0). Upgrades are deliberate, isolated changes.
+- **Pin absolute overlays with explicit insets (`top_0().left_0()`), keep
+  absolute `canvas` elements as the last child.** In gpui 0.2 / taffy 0.9 an
+  absolute child with auto insets that follows an in-flow `size_full` sibling
+  can resolve to its *static* position — right below that sibling, i.e.
+  outside the visible window. Observed during external file drag frames
+  (overlay/canvas at `y = window height`); pinning the insets removes the
+  static-position path entirely. All full-cover overlays in `app.rs` (drop
+  hint, settings backdrop, both watcher canvases) are pinned.
 - `/site` has its own ignore rules and lockfile (pnpm). The root `.gitignore` only
   lists `/target` — that is intentional.

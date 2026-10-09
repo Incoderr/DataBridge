@@ -1,7 +1,12 @@
-//! Connection wizard (splash + dialog). Port of the web app's `connectDialog.tsx`.
+//! Connection wizard (splash + dialog). Port of the web app's
+//! `connectDialog.tsx`. Also the landing zone for SQLite files: OS
+//! drag & drop (`on_drop::<ExternalPaths>`) and the native file picker
+//! (rfd) both end up in `open_sqlite_file`.
+
+use std::path::Path;
 
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Context, Div, IntoElement, ParentElement, SharedString, Styled, Window, div, px, rgb, svg};
+use gpui::{App, ClickEvent, Context, Div, ExternalPaths, IntoElement, ParentElement, SharedString, Styled, Window, div, px, rgb, svg};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
@@ -80,7 +85,7 @@ impl DataBridge {
         let p = theme::palette(cx);
         let desc = match self.wizard.phase {
             Phase::Choose => {
-                "Choose a database type to connect, or pick an existing connection below."
+                "Choose a database type to connect, pick an existing connection, or drop a SQLite file onto the window."
             }
             Phase::Form => "Configure connection properties. Click Test Connection to verify.",
             Phase::Testing => "Establishing connection…",
@@ -189,6 +194,23 @@ impl DataBridge {
                                     this.pick_type(db_type, window, cx);
                                 }))
                         })),
+                    )
+                    // Standing hint that drag & drop works, too.
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                Icon::new(IconName::File)
+                                    .with_size(Size::Size(px(13.)))
+                                    .text_color(p.muted_fg),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(p.muted_fg)
+                                    .child("…or drag & drop a SQLite file onto this window."),
+                            ),
                     ),
             )
             .child(
@@ -201,90 +223,131 @@ impl DataBridge {
                             .child("Existing connections"),
                     )
                     .child(
-                        v_flex().gap(px(6.)).children(
-                            self.connections
-                                .clone()
-                                .iter()
-                                .enumerate()
-                                .map(|(i, c)| {
-                                    let id = c.id.clone();
-                                    let conn = c.clone();
-                                    let status_color = match c.status {
-                                        ConnectionStatus::Connected => p.conn_ok,
-                                        ConnectionStatus::Error => p.conn_err,
-                                        ConnectionStatus::Disconnected => p.muted_fg,
-                                        ConnectionStatus::Connecting => p.primary,
-                                    };
-                                    h_flex()
-                                        .id(("existing", i))
-                                        .w_full()
-                                        .items_center()
-                                        .gap_3()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded(px(8.))
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(p.accent))
+                        v_flex()
+                            .gap(px(6.))
+                            .when(self.connections.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(p.muted_fg)
                                         .child(
-                                            div()
-                                                .size_2()
-                                                .flex_none()
-                                                .rounded_full()
-                                                .bg(status_color),
-                                        )
-                                        .child(
-                                            svg()
-                                                .path(c.db_type.brand_icon())
-                                                .size_4()
-                                                .flex_none()
-                                                .text_color(rgb(c.db_type.brand_color())),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_x_hidden()
-                                                .gap(px(2.))
-                                                .child(
-                                                    div()
-                                                        .w_full()
-                                                        .text_size(px(14.))
-                                                        .text_color(p.foreground)
-                                                        .child(c.name.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .w_full()
-                                                        .text_size(px(12.))
-                                                        .text_color(p.muted_fg)
-                                                        .child(format!(
-                                                            "{} · {}{} · {}",
-                                                            c.db_type.label(),
-                                                            c.host,
-                                                            if c.port > 0 {
-                                                                format!(":{}", c.port)
-                                                            } else {
-                                                                String::new()
-                                                            },
-                                                            c.database
-                                                        )),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .child(
-                                                    Icon::new(IconName::ArrowRight)
-                                                        .with_size(Size::Size(px(15.)))
-                                                        .text_color(p.muted_fg),
-                                                ),
-                                        )
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.start_existing(&id, window, cx);
-                                            let _ = &conn;
-}))
-                                }),
-                        ),
+                                            "No saved connections yet — create one above.",
+                                        ),
+                                )
+                            })
+                            .children(
+                                self.connections
+                                    .clone()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, c)| {
+                                        let id = c.id.clone();
+                                        let id_forget = c.id.clone();
+                                        let status_color = match c.status {
+                                            ConnectionStatus::Connected => p.conn_ok,
+                                            ConnectionStatus::Error => p.conn_err,
+                                            ConnectionStatus::Disconnected => p.muted_fg,
+                                            ConnectionStatus::Connecting => p.primary,
+                                        };
+                                        h_flex()
+                                            .id(("existing", i))
+                                            .w_full()
+                                            .items_center()
+                                            .gap_3()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(px(8.))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(p.accent))
+                                            .child(
+                                                div()
+                                                    .size_2()
+                                                    .flex_none()
+                                                    .rounded_full()
+                                                    .bg(status_color),
+                                            )
+                                            .child(
+                                                svg()
+                                                    .path(c.db_type.brand_icon())
+                                                    .size_4()
+                                                    .flex_none()
+                                                    .text_color(rgb(c.db_type.brand_color())),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .overflow_x_hidden()
+                                                    .gap(px(2.))
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .text_size(px(14.))
+                                                            .text_color(p.foreground)
+                                                            .child(c.name.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .text_size(px(12.))
+                                                            .text_color(p.muted_fg)
+                                                            .child(format!(
+                                                                "{} · {}{} · {}",
+                                                                c.db_type.label(),
+                                                                c.host,
+                                                                if c.port > 0 {
+                                                                    format!(":{}", c.port)
+                                                                } else {
+                                                                    String::new()
+                                                                },
+                                                                c.database
+                                                            )),
+                                                    ),
+                                            )
+                                            // Forget a saved connection (list +
+                                            // store + keyring); the row itself
+                                            // still opens the form.
+                                            .child(
+                                                div()
+                                                    .id(("existing-forget", i))
+                                                    .size(px(24.))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(4.))
+                                                    .cursor_pointer()
+                                                    .text_color(p.muted_fg)
+                                                    .hover(
+                                                        move |s| s
+                                                            .bg(p.tree_hover)
+                                                            .text_color(p.destructive),
+                                                    )
+                                                    .child(
+                                                        Icon::new(IconName::Delete)
+                                                            .with_size(Size::Size(px(13.))),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.forget_connection(&id_forget, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .child(
+                                                        Icon::new(IconName::ArrowRight)
+                                                            .with_size(Size::Size(px(15.)))
+                                                            .text_color(p.muted_fg),
+                                                    ),
+                                            )
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.start_existing(&id, window, cx);
+                                            }))
+                                    }),
+                            ),
                     ),
             )
     }
@@ -387,7 +450,7 @@ impl DataBridge {
             })
             .when(!url_mode, |this| {
                 this.when(is_embedded, |this| {
-                        this.child(field("File path", &d.database))
+                        this.child(file_field(&d.database, cx))
                     })
                     .when(!is_embedded, |this| {
                         this.child(
@@ -413,10 +476,7 @@ impl DataBridge {
                                         .child(field("User", &d.user)),
                                 )
                                 .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(field("Password", &d.password)),
+                                    div().flex_1().min_w_0().child(password_field(&d.password)),
                                 ),
                         )
                     })
@@ -562,6 +622,14 @@ impl DataBridge {
             window,
             cx,
         );
+        // Prefill the stored password (from the OS keyring) so a saved
+        // connection reconnects with a single Connect; `Draft::set` clears
+        // it for fresh drafts.
+        if !conn.password.is_empty() {
+            draft
+                .password
+                .update(cx, |s, cx| s.set_value(conn.password.clone(), window, cx));
+        }
         // A URL-created connection keeps its URL when re-edited.
         if let Some(url) = &conn.url {
             draft.url_mode = true;
@@ -628,6 +696,101 @@ impl DataBridge {
                     }
                 }
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ---------------- SQLite file opening (drop + file picker) ----------------
+
+    /// Entry point for files dragged in from the OS file manager. Only
+    /// SQLite databases are recognized; they connect immediately.
+    pub fn open_dropped_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wizard.testing {
+            return; // a connect is already in flight
+        }
+        let Some(path) = paths.paths().iter().find(|p| is_sqlite_path(p)) else {
+            // Unknown payload: hint in the wizard, stay quiet in the
+            // explorer (dropping a photo there shouldn't disturb anything).
+            if self.active_conn.is_none() {
+                self.wizard.error = Some(
+                    "Only SQLite database files can be dropped here (.db, .sqlite, .sqlite3, .db3)."
+                        .into(),
+                );
+                cx.notify();
+            }
+            return;
+        };
+        self.open_sqlite_file(path, window, cx);
+    }
+
+    /// Create a SQLite draft for `path`, then connect right away — the
+    /// form (with the path filled in) shows the error if the file turns
+    /// out not to be a database.
+    pub fn open_sqlite_file(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // Dropping a file while exploring replaces the current connection.
+        if self.active_conn.is_some() {
+            self.terminate(cx);
+        }
+        let path_str = path.to_string_lossy().to_string();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "sqlite".into());
+        let draft = Draft::new(DbType::Sqlite, window, cx);
+        draft
+            .database
+            .update(cx, |s, cx| s.set_value(path_str, window, cx));
+        draft.name.update(cx, |s, cx| s.set_value(name, window, cx));
+        self.wizard.draft = draft;
+        self.wizard.chosen_existing = None;
+        self.wizard.error = None;
+        self.wizard.phase = Phase::Form;
+        cx.notify();
+        self.run_test(true, window, cx);
+    }
+
+    /// The SQLite form's Browse… button: the native OS file picker. Async
+    /// (rfd runs the dialog off the UI thread); the picked path lands in
+    /// the draft's file-path field, the name is suggested when still empty.
+    pub fn browse_sqlite_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SQLite database", &["db", "sqlite", "sqlite3", "db3"])
+                .set_title("Open SQLite database")
+                .pick_file()
+                .await;
+            let Some(file) = file else {
+                return; // cancelled
+            };
+            let path = file.path().to_string_lossy().to_string();
+            let stem = file
+                .path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    this.wizard
+                        .draft
+                        .database
+                        .update(cx, |s, cx| s.set_value(path, window, cx));
+                    // Suggest a name for fresh drafts; never overwrite a
+                    // typed one.
+                    if this.wizard.draft.name.read(cx).value().is_empty() {
+                        this.wizard
+                            .draft
+                            .name
+                            .update(cx, |s, cx| s.set_value(stem, window, cx));
+                    }
+                    cx.notify();
+                })
             })
             .ok();
         })
@@ -723,6 +886,71 @@ fn field(
         .child(Input::new(state).large().h(px(38.)))
 }
 
+/// Like [`field`], but masked with an eye toggle — the value can be
+/// prefilled from the OS keyring and must not render in clear text.
+fn password_field(state: &gpui::Entity<gpui_component::input::InputState>) -> Div {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(12.))
+                .child("Password"),
+        )
+        .child(Input::new(state).large().h(px(38.)).mask_toggle())
+}
+
+/// The SQLite "File path" field: input plus a Browse… button opening the
+/// native OS file picker.
+fn file_field(
+    state: &gpui::Entity<gpui_component::input::InputState>,
+    cx: &mut Context<DataBridge>,
+) -> Div {
+    let p = theme::palette(cx);
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .child("File path"),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("browse-sqlite")
+                        .ghost()
+                        .small()
+                        .label("Browse…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.browse_sqlite_file(window, cx);
+                        })),
+                ),
+        )
+        .child(Input::new(state).large().h(px(38.)))
+        // Standing hint that dropping the file works, too.
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(p.muted_fg)
+                .child("…or drop the file anywhere on the window."),
+        )
+}
+
+/// The drop zone's gate: recognize SQLite database files by extension.
+fn is_sqlite_path(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "db" | "sqlite" | "sqlite3" | "db3"
+                )
+            })
+}
+
 /// One half of the wizard's Fields / URL mode switch.
 fn mode_btn(
     id: &'static str,
@@ -785,7 +1013,13 @@ impl Draft {
         let port = mk(&t.default_port().to_string(), window, cx);
         let database = mk(database, window, cx);
         let user = mk(user, window, cx);
-        let password = mk("", window, cx);
+        // The password is masked from the start (it can be prefilled from
+        // the OS keyring when re-editing a saved connection).
+        let password = cx.new(|cx| {
+            let mut s = gpui_component::input::InputState::new(window, cx);
+            s.set_masked(true, window, cx);
+            s
+        });
         password.update(cx, |s, cx| s.set_placeholder("••••••••", window, cx));
         Self {
             id: next_id(),
@@ -826,10 +1060,12 @@ impl Draft {
     }
 }
 
+/// Stable unique id for a new draft — unique across app launches, not
+/// just per session: persisted connections are upserted by id and their
+/// keyring entries are keyed by it, so a session counter would collide
+/// with a stored connection on the next run.
 fn next_id() -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(1);
-    format!("conn-new-{}", N.fetch_add(1, Ordering::Relaxed))
+    uuid::Uuid::new_v4().to_string()
 }
 
 // keep SharedString import used even if future edits drop call sites

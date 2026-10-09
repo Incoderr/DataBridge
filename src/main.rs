@@ -13,6 +13,29 @@ use ui::assets;
 use ui::theme;
 
 fn main() {
+    // CLI: `--mock` runs the built-in demo (seeded connections served by
+    // the deterministic mock driver, nothing persisted); without it the
+    // app remembers real connections (Stage 3) and connects for real.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "DataBridge — database explorer\n\n\
+             Usage: databridge [--mock]\n\n\
+             Options:\n  \
+             --mock  demo mode: seeded connections on the built-in mock driver,\n\
+             \x20         nothing is read from or written to the connection store."
+        );
+        return;
+    }
+    let unknown: Vec<&String> = args
+        .iter()
+        .filter(|a| !matches!(a.as_str(), "--mock"))
+        .collect();
+    for a in unknown {
+        eprintln!("DataBridge: unknown argument {a} (see --help)");
+    }
+    core::registry::init(args.iter().any(|a| a == "--mock"));
+
     let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
         include_bytes!("../assets/fonts/PublicSans-Regular.ttf")
             .as_slice()

@@ -1,0 +1,238 @@
+---
+import Icon from "./Icon.astro";
+
+const repo = "https://github.com/Incoderr/DataBridge";
+
+// What's already shipped — keep in sync with the app's real state.
+const now = [
+    {
+        icon: "database",
+        title: "PostgreSQL, MySQL, SQLite",
+        text: "Connect by URL or plain fields — the link is tested before you land in the data.",
+    },
+    {
+        icon: "table",
+        title: "A grid for millions of rows",
+        text: "Crisp pages of 50, color-coded types, full row in one click.",
+    },
+    {
+        icon: "chart",
+        title: "Structure at a glance",
+        text: "Schemas, tables, views and functions in one searchable tree.",
+    },
+    {
+        icon: "diagram",
+        title: "Schema diagrams",
+        text: "Foreign keys as an interactive ERD, one per schema.",
+    },
+    {
+        icon: "shield",
+        title: "Secrets stay secret",
+        text: "Passwords live in the OS keyring — never in plaintext on disk.",
+    },
+    {
+        icon: "play",
+        title: "Demo mode",
+        text: "The full app with mock data — no live database needed.",
+    },
+];
+
+// What's coming next.
+const next = [
+    {
+        icon: "plug",
+        title: "More databases — many more",
+        text: "MongoDB and Redis are the next two, not the last two. The driver layer is built to keep growing.",
+    },
+    {
+        icon: "terminal",
+        title: "Query editor",
+        text: "Run any SQL, results in tabs, long queries can be cancelled mid-flight.",
+    },
+    {
+        icon: "monitor",
+        title: "macOS and Linux",
+        text: "Cross-platform Rust underneath — Windows is only the first stop.",
+    },
+    {
+        icon: "lock",
+        title: "TLS connections",
+        text: "Encrypted links to remote hosts, right out of the box.",
+    },
+    {
+        icon: "sliders",
+        title: "Persistent settings",
+        text: "Preferences that survive restarts — starting with UI scale.",
+    },
+];
+---
+
+<section id="roadmap" class="roadmap">
+    <div class="container">
+        <div class="section-head">
+            <span class="badge">Roadmap</span>
+            <h2>What's done, what's next</h2>
+            <p>
+                More platforms, more databases, same speed. No vaporware —
+                just the honest state of things.
+            </p>
+        </div>
+
+        <div class="grid">
+            <div class="col col--now">
+                <div class="col__head">
+                    <span class="pill pill--now">Shipped</span>
+                    <h3>Already in the app</h3>
+                </div>
+                <ul>
+                    {now.map((i) => (
+                        <li>
+                            <span class="ico ico--now">
+                                <Icon name={i.icon} size={20} />
+                            </span>
+                            <div>
+                                <h4>{i.title}</h4>
+                                <p>{i.text}</p>
+                            </div>
+                        </li>
+                    ))}
+                </ul>
+            </div>
+
+            <div class="col col--next">
+                <div class="col__head">
+                    <span class="pill pill--next">On the way</span>
+                    <h3>Coming next</h3>
+                </div>
+                <ul>
+                    {next.map((i) => (
+                        <li>
+                            <span class="ico ico--next">
+                                <Icon name={i.icon} size={20} />
+                            </span>
+                            <div>
+                                <h4>{i.title}</h4>
+                                <p>{i.text}</p>
+                            </div>
+                        </li>
+                    ))}
+                </ul>
+            </div>
+        </div>
+
+        <p class="hint">
+            Missing something?
+            <a href={`${repo}/issues`} target="_blank" rel="noopener">Open an issue</a>
+            — good ideas jump the queue.
+        </p>
+    </div>
+</section>
+
+<style>
+    .roadmap {
+        padding: 72px 0 96px;
+    }
+    .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 32px;
+        margin-top: 64px;
+        align-items: start;
+    }
+    .col {
+        border-radius: 16px;
+        padding: 28px;
+    }
+    .col--now {
+        background: #fff;
+        border: 1px solid var(--line);
+    }
+    .col--next {
+        background: linear-gradient(180deg, #f7faff 0%, #eef4ff 100%);
+        border: 1px dashed #b9cdf7;
+    }
+    .col__head {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 26px;
+    }
+    .col__head h3 {
+        font-size: 17px;
+        font-weight: 700;
+    }
+    .pill {
+        flex: none;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 3px 10px;
+        border-radius: 999px;
+    }
+    .pill--now {
+        background: #dff7ea;
+        color: #16a05b;
+    }
+    .pill--next {
+        background: #dceaff;
+        color: var(--blue);
+    }
+    .col ul {
+        display: grid;
+        gap: 22px;
+    }
+    .col li {
+        display: flex;
+        gap: 14px;
+        align-items: flex-start;
+    }
+    .ico {
+        flex: none;
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        border-radius: 10px;
+        margin-top: 1px;
+    }
+    .ico--now {
+        background: #e3f6eb;
+        color: #16a05b;
+    }
+    .ico--next {
+        background: #e7efff;
+        color: #2563eb;
+    }
+    .col h4 {
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 4px;
+    }
+    .col li p {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+    }
+    .hint {
+        text-align: center;
+        margin-top: 40px;
+        font-size: 14px;
+        color: var(--muted);
+    }
+    .hint a {
+        color: var(--blue);
+        font-weight: 500;
+    }
+    .hint a:hover {
+        text-decoration: underline;
+    }
+    @media (max-width: 900px) {
+        .roadmap {
+            padding: 56px 0 72px;
+        }
+        .grid {
+            grid-template-columns: 1fr;
+            gap: 24px;
+            margin-top: 48px;
+        }
+    }
+</style>
