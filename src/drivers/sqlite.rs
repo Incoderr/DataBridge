@@ -11,16 +11,17 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
+use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
+use crate::core::model::is_select_like;
 use crate::core::model::{
-    ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping, Relation,
-    SchemaMeta, TableMeta, TableRef,
+    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
+    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
 };
 use crate::core::session::DbSession;
-use crate::drivers::util::dyn_cell;
+use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct SqliteSession {
     opts: SqliteConnectOptions,
@@ -219,6 +220,141 @@ impl DbSession for SqliteSession {
             elapsed_ms: t0.elapsed().as_millis() as u32,
         })
     }
+
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+        let pool = self.pool().await?;
+        let t0 = Instant::now();
+        if !is_select_like(sql) {
+            let res = sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map_err(|e| DbError::with_source("query failed", e))?;
+            return Ok(QueryPage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: res.rows_affected(),
+                truncated: false,
+                elapsed_ms: t0.elapsed().as_millis() as u32,
+            });
+        }
+        let rows = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DbError::with_source("query failed", e))?;
+        let columns: Vec<ColumnMeta> = rows
+            .first()
+            .map(|r| {
+                r.columns()
+                    .iter()
+                    .map(|c| ColumnMeta {
+                        name: c.name().to_string(),
+                        type_: c.type_info().to_string(),
+                        nullable: true,
+                        primary_key: false,
+                        auto_increment: false,
+                        has_default: false,
+                        kind: sqlite_kind(c.type_info().name()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let truncated = rows.len() > limit as usize;
+        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let mut r = Vec::with_capacity(row.len());
+            for i in 0..row.len() {
+                r.push(dyn_cell!(row, i));
+            }
+            out.push(r);
+        }
+        Ok(QueryPage {
+            columns,
+            rows: out,
+            rows_affected: 0,
+            truncated,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        })
+    }
+
+    async fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let ident = sqlite_ident(&table.name);
+        let sets = changes
+            .iter()
+            .map(|ch| format!("\"{}\" = ?", ch.column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let where_ = pk
+            .iter()
+            .map(|key| format!("\"{}\" = ?", key.column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("UPDATE {ident} SET {sets} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for ch in &changes {
+            q = bind_cell!(q, ch);
+        }
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to update the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let ident = sqlite_ident(&table.name);
+        let cols = values
+            .iter()
+            .map(|v| format!("\"{}\"", v.column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = vec!["?"; values.len()].join(", ");
+        let sql = format!("INSERT INTO {ident} ({cols}) VALUES ({marks})");
+        let mut q = sqlx::query(&sql);
+        for v in &values {
+            q = bind_cell!(q, v);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to insert the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        let ident = sqlite_ident(&table.name);
+        let where_ = pk
+            .iter()
+            .map(|key| format!("\"{}\" = ?", key.column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("DELETE FROM {ident} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to delete the row", e))?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// `PRAGMA table_info` per table: cid, name, type, notnull, dflt_value, pk.
@@ -244,18 +380,27 @@ async fn sqlite_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta
         let pk: i32 = row
             .try_get(5)
             .map_err(|e| DbError::with_source(format!("bad pk flag in {table}"), e))?;
+        let dflt: Option<String> = row.try_get(4).map_err(|e| {
+            DbError::with_source(format!("bad default value in {table}"), e)
+        })?;
         let declared = declared.unwrap_or_default();
         let label = if declared.is_empty() {
             "BLOB".to_string()
         } else {
             declared.clone()
         };
+        let kind = sqlite_kind(&declared);
+        // `INTEGER PRIMARY KEY` is the rowid alias: SQLite generates it
+        // on insert when omitted.
+        let auto_increment = pk > 0 && kind == ColumnKind::Int;
         out.push(ColumnMeta {
             name,
             type_: label,
             nullable: notnull == 0,
             primary_key: pk > 0,
-            kind: sqlite_kind(&declared),
+            auto_increment,
+            has_default: auto_increment || dflt.is_some(),
+            kind,
         });
     }
     Ok(out)

@@ -12,16 +12,17 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::Row;
+use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
+use crate::core::model::is_select_like;
 use crate::core::model::{
-    ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping, Relation,
-    SchemaMeta, TableMeta, TableRef,
+    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
+    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
 };
 use crate::core::session::DbSession;
-use crate::drivers::util::dyn_cell;
+use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct PostgresSession {
     opts: PgConnectOptions,
@@ -207,6 +208,160 @@ impl DbSession for PostgresSession {
             elapsed_ms: t0.elapsed().as_millis() as u32,
         })
     }
+
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+        let pool = self.pool().await?;
+        let t0 = Instant::now();
+        if !is_select_like(sql) {
+            let res = sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map_err(|e| DbError::with_source("query failed", e))?;
+            return Ok(QueryPage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: res.rows_affected(),
+                truncated: false,
+                elapsed_ms: t0.elapsed().as_millis() as u32,
+            });
+        }
+        let rows = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DbError::with_source("query failed", e))?;
+        let mut columns: Vec<ColumnMeta> = rows
+            .first()
+            .map(|r| {
+                r.columns()
+                    .iter()
+                    .map(|c| ColumnMeta {
+                        name: c.name().to_string(),
+                        type_: c.type_info().to_string(),
+                        nullable: true,
+                        primary_key: false,
+                        auto_increment: false,
+                        has_default: false,
+                        kind: pg_kind(c.type_info().name()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if columns.is_empty() && rows.is_empty() {
+            // `SELECT` with no rows still knows its column list through
+            // the statement metadata — fall back to a re-run via `fetch`
+            // is overkill; report an empty result set.
+            columns = Vec::new();
+        }
+        let truncated = rows.len() > limit as usize;
+        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let mut r = Vec::with_capacity(row.len());
+            for i in 0..row.len() {
+                r.push(dyn_cell!(row, i));
+            }
+            out.push(r);
+        }
+        Ok(QueryPage {
+            columns,
+            rows: out,
+            rows_affected: 0,
+            truncated,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        })
+    }
+
+    async fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let ident = pg_ident(&table.schema, &table.name);
+        let mut sets = String::new();
+        for (i, ch) in changes.iter().enumerate() {
+            if i > 0 {
+                sets.push_str(", ");
+            }
+            sets.push_str(&format!("\"{}\" = ${}", ch.column.replace('"', "\"\""), i + 1));
+        }
+        let mut where_ = String::new();
+        for (i, key) in pk.iter().enumerate() {
+            if i > 0 {
+                where_.push_str(" AND ");
+            }
+            where_.push_str(&format!(
+                "\"{}\" = ${}",
+                key.column.replace('"', "\"\""),
+                changes.len() + i + 1
+            ));
+        }
+        let sql = format!("UPDATE {ident} SET {sets} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for ch in &changes {
+            q = bind_cell!(q, ch);
+        }
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to update the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let ident = pg_ident(&table.schema, &table.name);
+        let cols = values
+            .iter()
+            .map(|v| format!("\"{}\"", v.column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = (1..=values.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO {ident} ({cols}) VALUES ({marks})");
+        let mut q = sqlx::query(&sql);
+        for v in &values {
+            q = bind_cell!(q, v);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to insert the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        let ident = pg_ident(&table.schema, &table.name);
+        let mut where_ = String::new();
+        for (i, key) in pk.iter().enumerate() {
+            if i > 0 {
+                where_.push_str(" AND ");
+            }
+            where_.push_str(&format!("\"{}\" = ${}", key.column.replace('"', "\"\""), i + 1));
+        }
+        let sql = format!("DELETE FROM {ident} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to delete the row", e))?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// Introspect one schema: relations with batched columns and primary keys.
@@ -223,18 +378,20 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
     .await
     .map_err(|e| DbError::with_source(format!("failed to list relations of {schema}"), e))?;
 
-    let cols: Vec<(String, String, String, String, Option<i32>, Option<i32>, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT table_name, column_name, udt_name, is_nullable, \
-                    character_maximum_length, numeric_precision, numeric_scale \
-             FROM information_schema.columns \
-             WHERE table_schema = $1 \
-             ORDER BY table_name, ordinal_position",
-        )
-        .bind(&schema)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))?;
+    let cols: Vec<
+        (String, String, String, String, Option<i32>, Option<i32>, Option<i32>, Option<String>, String),
+    > = sqlx::query_as(
+        "SELECT table_name, column_name, udt_name, is_nullable, \
+                character_maximum_length, numeric_precision, numeric_scale, \
+                column_default, is_identity::text \
+         FROM information_schema.columns \
+         WHERE table_schema = $1 \
+         ORDER BY table_name, ordinal_position",
+    )
+    .bind(&schema)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))?;
 
     let pks: Vec<(String, String)> = sqlx::query_as(
         "SELECT tc.table_name, kcu.column_name \
@@ -264,12 +421,18 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
 
     // Columns grouped per table, in ordinal order.
     let mut by_table: BTreeMap<String, Vec<ColumnMeta>> = BTreeMap::new();
-    for (t, c, udt, nullable, char_len, num_prec, num_scale) in cols {
+    for (t, c, udt, nullable, char_len, num_prec, num_scale, default, identity) in cols {
+        let is_identity = identity == "YES";
+        let is_serial = default
+            .as_deref()
+            .is_some_and(|d| d.starts_with("nextval("));
         by_table.entry(t).or_default().push(ColumnMeta {
             name: c,
             type_: type_label(&udt, char_len, num_prec, num_scale),
             nullable: nullable == "YES",
             primary_key: false,
+            auto_increment: is_identity || is_serial,
+            has_default: is_identity || default.is_some(),
             kind: pg_kind(&udt),
         });
     }
@@ -310,6 +473,8 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
                     type_: ret.clone(),
                     nullable: true,
                     primary_key: false,
+                    auto_increment: false,
+                    has_default: false,
                     kind: pg_kind(&ret),
                 }],
             })

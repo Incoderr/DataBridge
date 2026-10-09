@@ -65,3 +65,26 @@ macro_rules! dyn_cell {
     }};
 }
 pub(crate) use dyn_cell;
+
+/// Bind one typed cell onto any sqlx query. NULL binds as a typed
+/// `Option<T>::None` so PostgreSQL can infer the parameter type; the
+/// non-null variants bind by their own value type. A macro for the same
+/// reason as [`dyn_cell`]: `Encode`/`Type` bounds are proven per
+/// concrete database.
+macro_rules! bind_cell {
+    ($query:expr, $cell:expr) => {{
+        use $crate::core::model::{ColumnKind, Value};
+        match (&$cell.value, $cell.kind) {
+            (Value::Int(v), _) => $query.bind(*v),
+            (Value::Float(v), _) => $query.bind(*v),
+            (Value::Bool(v), _) => $query.bind(*v),
+            (Value::Str(s), _) => $query.bind(s.clone()),
+            (Value::Bytes(b), _) => $query.bind(b.clone()),
+            (Value::Null, ColumnKind::Int) => $query.bind(Option::<i64>::None),
+            (Value::Null, ColumnKind::Float) => $query.bind(Option::<f64>::None),
+            (Value::Null, ColumnKind::Bool) => $query.bind(Option::<bool>::None),
+            (Value::Null, _) => $query.bind(Option::<String>::None),
+        }
+    }};
+}
+pub(crate) use bind_cell;

@@ -23,6 +23,7 @@ use crate::core::session::SessionHandle;
 use crate::core::storage;
 use crate::ui::diagram::SchemaDiagram;
 use crate::ui::nav_tree::{SelectedPath, TreeRow};
+use crate::ui::query::QueryView;
 use crate::ui::theme;
 use crate::ui::workspace::{OpenTab, RecordsView, TabKind};
 
@@ -64,6 +65,7 @@ pub struct WizardState {
 pub enum WorkspaceView {
     Records(Entity<RecordsView>),
     Diagram(Entity<SchemaDiagram>),
+    Query(Entity<QueryView>),
 }
 
 pub struct DataBridge {
@@ -95,6 +97,8 @@ pub struct DataBridge {
     pub tree_scroll: VirtualListScrollHandle,
     /// Settings dialog visibility (interface scale chooser).
     pub show_settings: bool,
+    /// Counter for query tab ids (multiple SQL tabs per connection).
+    pub query_seq: u32,
     // visual state
     pub grid_view: bool,
     /// External files are dragged over the window right now — the
@@ -153,6 +157,7 @@ impl DataBridge {
             nav_rows: Vec::new(),
             tree_scroll: VirtualListScrollHandle::new(),
             show_settings: false,
+            query_seq: 0,
             grid_view: true,
             drag_over: false,
             wizard,
@@ -204,6 +209,23 @@ impl DataBridge {
         }
     }
 
+    /// Open a new SQL editor tab (Stage 5). Multiple tabs are allowed —
+    /// each gets its own editor state, like DataGrip consoles.
+    pub fn open_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query_seq += 1;
+        let Some(conn) = self.active_conn.clone() else {
+            return;
+        };
+        let id = format!("{}:__query__{}", conn.id, self.query_seq);
+        self.tabs.push(OpenTab {
+            id,
+            schema: conn.database.clone(),
+            kind: TabKind::Sql,
+        });
+        let ix = self.tabs.len() - 1;
+        self.set_active(ix, window, cx);
+    }
+
     pub fn set_active(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = Some(ix);
         let conn = self.active_conn.clone().expect("active connection");
@@ -243,6 +265,9 @@ impl DataBridge {
                     SchemaDiagram::new(conn, session, tab.schema.clone(), tables, cx)
                 }))
             }
+            TabKind::Sql => WorkspaceView::Query(cx.new(|cx| {
+                QueryView::new(conn, session, window, cx)
+            })),
         });
         cx.notify();
     }
@@ -313,6 +338,8 @@ impl DataBridge {
             Some(WorkspaceView::Diagram(d)) => {
                 d.update(cx, |v, cx| v.reload(cx));
             }
+            // The query tab re-runs via its own Run button.
+            Some(WorkspaceView::Query(_)) => {}
             None => {}
         }
     }
@@ -418,7 +445,8 @@ impl DataBridge {
             .and_then(|ix| self.tabs.get(ix))
             .and_then(|t| match &t.kind {
                 TabKind::Records(meta) => Some((t.schema.clone(), meta.name.clone())),
-                TabKind::Diagram => None,
+                // Diagram and query tabs highlight nothing.
+                TabKind::Diagram | TabKind::Sql => None,
             })
     }
 
@@ -439,6 +467,7 @@ impl DataBridge {
             let (label, icon) = match &tab.kind {
                 TabKind::Records(meta) => (meta.name.clone(), "icons/table.svg"),
                 TabKind::Diagram => (format!("{} · diagram", tab.schema), "icons/schema.svg"),
+                TabKind::Sql => (format!("query {}", ix + 1), "icons/schema.svg"),
             };
             bar = bar.child(
                 Tab::new()
@@ -485,6 +514,26 @@ impl DataBridge {
                     this.set_active(*ix, window, cx);
                 }
             }))
+            // New SQL editor tab — always available while connected.
+            .suffix(
+                div()
+                    .id("new-query")
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(p.tree_hover))
+                    .child(
+                        Icon::new(IconName::SquareTerminal)
+                            .with_size(Size::Size(px(14.)))
+                            .text_color(p.muted_fg),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_query_tab(window, cx);
+                    })),
+            )
             .suffix(
                 div()
                     .id("theme-toggle")
@@ -698,6 +747,7 @@ impl DataBridge {
                             .child(match self.view.clone() {
                                 Some(WorkspaceView::Records(v)) => v.into_any_element(),
                                 Some(WorkspaceView::Diagram(v)) => v.into_any_element(),
+                                Some(WorkspaceView::Query(v)) => v.into_any_element(),
                                 None => crate::ui::workspace::empty_state(cx).into_any_element(),
                             }),
                     ),
@@ -808,7 +858,10 @@ impl DataBridge {
                 }))
         };
 
-        // Click on the backdrop closes the dialog.
+        // Click on the backdrop closes the dialog. The backdrop and the
+        // card are SIBLINGS under a transparent layer so clicks inside
+        // the card never bubble into the backdrop (same pattern as the
+        // record editor modal in workspace.rs).
         let backdrop = div()
             .id("settings-backdrop")
             .absolute()
@@ -828,7 +881,13 @@ impl DataBridge {
             .absolute()
             .left_1_2()
             .top_1_2()
+            // Optical centering: pull the card back by half its size.
+            .mt(px(-170.))
+            .ml(px(-190.))
             .w(px(380.))
+            // BlockMouse: clicks over the card never count as backdrop
+            // clicks (see the record editor modal in workspace.rs).
+            .occlude()
             .bg(p.card)
             .border_1()
             .border_color(p.border)
@@ -880,6 +939,14 @@ impl DataBridge {
                     )),
             );
 
-        backdrop.child(card)
+        // Transparent event-passing layer: the backdrop handles outside
+        // clicks, the card sits on top as a sibling.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(backdrop)
+            .child(card)
     }
 }

@@ -4,16 +4,18 @@
 //! driver (dev/demo without a live DB) and seeds the wizard's connection
 //! list until Stage 3 adds persistence.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::error::DbError;
 use super::model::{
-    ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DbType, NodeKind, Page, Ping,
-    Relation, SchemaMeta, TableMeta, TableRef, Value,
+    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DbType, NodeKind, Page,
+    Ping, QueryPage, Relation, Row, SchemaMeta, TableMeta, TableRef, Value,
 };
+use super::model::is_select_like;
 use super::session::DbSession;
 
 // ---------- Seeds ----------
@@ -100,12 +102,21 @@ fn col(
     nullable: bool,
     primary_key: bool,
 ) -> ColumnMeta {
+    let name: String = name.into();
+    // Demo-data conventions: integer PKs are identity-like, and the
+    // `*_at` timestamps have DEFAULT now()-ish values — the editor shows
+    // them as auto/default instead of required.
+    let auto_increment = primary_key && kind == ColumnKind::Int;
+    let has_default =
+        auto_increment || (kind == ColumnKind::Date && name.ends_with("_at") && !nullable);
     ColumnMeta {
-        name: name.into(),
         type_: type_.into(),
         kind,
         nullable,
         primary_key,
+        name,
+        auto_increment,
+        has_default,
     }
 }
 
@@ -484,38 +495,60 @@ fn gen_value(c: &ColumnMeta, row_seed: i64) -> Value {
     }
 }
 
-/// Generates up to `limit` deterministic rows. Same (table, offset, limit)
-/// => same rows. The latency sleep lives in the session future below.
-fn page_for(t: &TableMeta, latency_ms: u32, offset: u64, limit: u64) -> Page {
-    let mut rows = Vec::new();
-    let mut i = 0u64;
-    while i < limit && offset + i < t.row_count {
-        let row_id = offset + i;
-        rows.push(t.columns.iter().map(|c| gen_value(c, row_id as i64)).collect());
-        i += 1;
-    }
-    Page {
-        truncated: t.row_count > limit,
-        elapsed_ms: latency_ms,
-        total: t.row_count,
-        rows,
-    }
-}
+// ---------- The overlay-aware page lives in the session impl below ----------
 
 // ---------- MockSession: the built-in demo driver ----------
 
+/// In-memory write overlay on top of the deterministic generator: the
+/// demo driver supports the simplified editor without a real database.
+/// Keyed by `schema.table` + the generator's `row_id`.
+#[derive(Default)]
+struct MockEdits {
+    /// (table, row_id) → the full replacement row.
+    updated: HashMap<(String, i64), Row>,
+    /// table → rows appended after the generated ones.
+    inserted: HashMap<String, Vec<Row>>,
+    /// (table, row_id) marked deleted.
+    deleted: HashSet<(String, i64)>,
+}
+
 pub struct MockSession {
     conn: DbConnection,
+    edits: Mutex<MockEdits>,
 }
 
 impl MockSession {
     pub fn new(conn: &DbConnection) -> Self {
-        Self { conn: conn.clone() }
+        Self {
+            conn: conn.clone(),
+            edits: Mutex::new(MockEdits::default()),
+        }
     }
 
     /// Simulated per-connection query latency (2..120 ms).
     fn latency_ms(&self) -> u32 {
         self.conn.latency_ms.clamp(2, 120)
+    }
+
+    /// The generated primary-key value of one row ("" when the table has
+    /// no PK — such tables are not editable through the mock).
+    fn pk_of(meta: &TableMeta, row_id: i64) -> String {
+        meta.columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| gen_value(c, row_id).display())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// Resolve the editor's pk cells to the generator's row_id.
+    fn row_id_by_pk(meta: &TableMeta, pk: &[CellChange]) -> Option<i64> {
+        let want = pk
+            .iter()
+            .map(|c| c.value.display())
+            .collect::<Vec<_>>()
+            .join("|");
+        (0..meta.row_count as i64).find(|&id| Self::pk_of(meta, id) == want)
     }
 }
 
@@ -570,6 +603,183 @@ impl DbSession for MockSession {
         };
         let ms = self.latency_ms();
         tokio::time::sleep(Duration::from_millis(ms as u64)).await;
-        Ok(page_for(&meta, ms, offset, limit))
+        let edits = self.edits.lock().unwrap();
+        Ok(mock_page(&edits, &meta, &table, ms, offset, limit))
+    }
+
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+        let ms = self.latency_ms();
+        tokio::time::sleep(Duration::from_millis(ms as u64)).await;
+        // The mock cannot really run SQL; it reports a plausible outcome
+        // so the editor flow is demoable end-to-end.
+        if is_select_like(sql) {
+            Ok(QueryPage {
+                columns: vec![ColumnMeta {
+                    name: "result".into(),
+                    type_: "text".into(),
+                    nullable: true,
+                    primary_key: false,
+                    auto_increment: false,
+                    has_default: false,
+                    kind: ColumnKind::Text,
+                }],
+                rows: vec![vec![Value::Str(
+                    "demo mode: statements are not executed — connect to a real database".into(),
+                )]],
+                rows_affected: 0,
+                truncated: limit == 0,
+                elapsed_ms: ms,
+            })
+        } else {
+            Ok(QueryPage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: 1,
+                truncated: false,
+                elapsed_ms: ms,
+            })
+        }
+    }
+
+    async fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> Result<u64, DbError> {
+        let Some(meta) = find_meta(&self.conn, &table.schema, &table.name) else {
+            return Err(DbError::new(format!(
+                "table {}.{} not found in this connection",
+                table.schema, table.name
+            )));
+        };
+        if pk.is_empty() {
+            return Err(DbError::new(
+                "this table has no primary key — edit it via SQL instead",
+            ));
+        }
+        let Some(row_id) = Self::row_id_by_pk(&meta, &pk) else {
+            return Err(DbError::new("row not found (primary key mismatch)"));
+        };
+        let key = format!("{}.{}", table.schema, table.name);
+        let mut edits = self.edits.lock().unwrap();
+        // Base: the overlay row if present, else the generated one.
+        let mut row: Row = edits
+            .updated
+            .get(&(key.clone(), row_id))
+            .cloned()
+            .unwrap_or_else(|| {
+                meta.columns
+                    .iter()
+                    .map(|c| gen_value(c, row_id))
+                    .collect()
+            });
+        for ch in &changes {
+            if let Some(ix) = meta.columns.iter().position(|c| c.name == ch.column) {
+                row[ix] = ch.value.clone();
+            }
+        }
+        edits.updated.insert((key, row_id), row);
+        Ok(1)
+    }
+
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError> {
+        let Some(meta) = find_meta(&self.conn, &table.schema, &table.name) else {
+            return Err(DbError::new(format!(
+                "table {}.{} not found in this connection",
+                table.schema, table.name
+            )));
+        };
+        // A full row aligned with the table's columns; missing ones are
+        // NULL (the generated demo data has no defaults to draw from).
+        let row: Row = meta
+            .columns
+            .iter()
+            .map(|c| {
+                values
+                    .iter()
+                    .find(|v| v.column == c.name)
+                    .map(|v| v.value.clone())
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        let key = format!("{}.{}", table.schema, table.name);
+        self.edits.lock().unwrap().inserted.entry(key).or_default().push(row);
+        Ok(1)
+    }
+
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
+        let Some(meta) = find_meta(&self.conn, &table.schema, &table.name) else {
+            return Err(DbError::new(format!(
+                "table {}.{} not found in this connection",
+                table.schema, table.name
+            )));
+        };
+        if pk.is_empty() {
+            return Err(DbError::new(
+                "this table has no primary key — delete it via SQL instead",
+            ));
+        }
+        let Some(row_id) = Self::row_id_by_pk(&meta, &pk) else {
+            return Err(DbError::new("row not found (primary key mismatch)"));
+        };
+        let key = format!("{}.{}", table.schema, table.name);
+        let mut edits = self.edits.lock().unwrap();
+        edits.updated.remove(&(key.clone(), row_id));
+        edits.deleted.insert((key, row_id));
+        Ok(1)
+    }
+}
+
+/// The overlay-aware page builder: generated rows minus deleted, with
+/// updates applied, plus the session's inserted rows appended at the end.
+fn mock_page(
+    edits: &MockEdits,
+    t: &TableMeta,
+    table: &TableRef,
+    latency_ms: u32,
+    offset: u64,
+    limit: u64,
+) -> Page {
+    let key = format!("{}.{}", table.schema, table.name);
+    let deleted_here = edits.deleted.iter().filter(|e| e.0 == key).count() as u64;
+    let inserted = edits.inserted.get(&key).map(|v| v.len() as u64).unwrap_or(0);
+    let gen_count = t.row_count.saturating_sub(deleted_here);
+    let total = gen_count + inserted;
+
+    let mut rows = Vec::new();
+    let mut i = 0u64;
+    while i < limit && offset + i < total {
+        let virtual_ix = offset + i;
+        let row: Row = if virtual_ix < gen_count {
+            // Map the virtual index onto the next non-deleted row_id.
+            let mut seen = 0u64;
+            let mut row_id = 0i64;
+            for id in 0..t.row_count as i64 {
+                if !edits.deleted.contains(&(key.clone(), id)) {
+                    if seen == virtual_ix {
+                        row_id = id;
+                        break;
+                    }
+                    seen += 1;
+                }
+            }
+            edits
+                .updated
+                .get(&(key.clone(), row_id))
+                .cloned()
+                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(c, row_id)).collect())
+        } else {
+            let ins = edits.inserted.get(&key).unwrap();
+            ins[(virtual_ix - gen_count) as usize].clone()
+        };
+        rows.push(row);
+        i += 1;
+    }
+    Page {
+        truncated: total > limit,
+        elapsed_ms: latency_ms,
+        total,
+        rows,
     }
 }

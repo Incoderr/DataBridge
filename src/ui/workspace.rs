@@ -8,13 +8,15 @@ use gpui::{
     FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Render, Stateful, Styled, Subscription, Window, div, px, svg,
 };
-use gpui_component::{h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputState};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
-use gpui_component::{Icon, IconName, Sizable, Size};
+use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{
-    group_digits, status_line, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, Row,
-    TableMeta, TableRef, Value,
+    group_digits, parse_cell, status_line, CellChange, ColumnKind, ColumnMeta, ConnectionStatus,
+    DbConnection, Row, TableMeta, TableRef, Value,
 };
 use crate::core::session::SessionHandle;
 use crate::ui::theme;
@@ -27,6 +29,8 @@ pub enum TabKind {
     Records(Arc<TableMeta>),
     /// The Supabase-style relationships canvas for the whole schema.
     Diagram,
+    /// The SQL editor (Stage 5).
+    Sql,
 }
 
 #[derive(Clone)]
@@ -340,6 +344,29 @@ fn cell_value(v: Option<&Value>, c: &ColumnMeta, p: &theme::Palette, selected: b
         .into_any_element()
 }
 
+// ---------------- Simplified record editor ----------------
+
+/// Which write the modal is performing.
+enum EditorMode {
+    /// New row: every column editable, empty inputs.
+    Insert,
+    /// Update the selected row: only changed cells are sent.
+    Update { row: Row, row_no: u64 },
+    /// Delete confirmation for the selected row.
+    Delete { row: Row, row_no: u64 },
+}
+
+struct EditorState {
+    mode: EditorMode,
+    /// One input per table column (prefilled for updates).
+    inputs: Vec<Entity<InputState>>,
+    /// Which inputs render read-only (PK / binary on update).
+    locked: Vec<bool>,
+    error: Option<String>,
+    saving: bool,
+    save_id: u64,
+}
+
 // ---------------- RecordsView: chrome around the table ----------------
 
 pub struct RecordsView {
@@ -362,6 +389,8 @@ pub struct RecordsView {
     last_sel: Option<usize>,
     /// Last width reported for the table area (drives column stretching).
     last_table_w: f32,
+    /// The simplified record editor modal, when open.
+    editor: Option<EditorState>,
     _obs: Subscription,
 }
 
@@ -407,6 +436,7 @@ impl RecordsView {
             sel,
             last_sel: None,
             last_table_w: 0.0,
+            editor: None,
             _obs: obs,
         }
     }
@@ -429,8 +459,554 @@ impl RecordsView {
         self.state.update(cx, |s, cx| s.delegate_mut().load(cx));
     }
 
-    pub fn export_csv(&mut self, cx: &mut Context<Self>) {
-        let st = self.state.read(cx);
+    /// The selected row's full data (from the current page).
+    fn selected_row(&self, cx: &App) -> Option<(usize, Row)> {
+        let ix = self.state.read(cx).selected_row()?;
+        let row = self.state.read(cx).delegate().rows.get(ix)?.clone();
+        Some((ix, row))
+    }
+
+    /// True when the table has at least one primary-key column — update
+    /// and delete need a stable row identity.
+    fn has_pk(&self) -> bool {
+        self.table.columns.iter().any(|c| c.primary_key)
+    }
+
+    /// The pk cells of a row, in column order — the row's identity for
+    /// UPDATE/DELETE.
+    fn pk_cells(&self, row: &Row) -> Vec<CellChange> {
+        self.table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .filter_map(|(i, c)| {
+                row.get(i).map(|v| CellChange::new(c.name.clone(), c.kind, v.clone()))
+            })
+            .collect()
+    }
+
+    /// Open the simplified editor for a new row.
+    fn open_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let inputs = self
+            .table
+            .columns
+            .iter()
+            .map(|c| {
+                let col = c.clone();
+                cx.new(|cx| {
+                    let mut s = InputState::new(window, cx);
+                    let hint = if col.auto_increment {
+                        "auto"
+                    } else if col.has_default {
+                        "default"
+                    } else if !col.nullable {
+                        "required"
+                    } else {
+                        "null"
+                    };
+                    if hint != "null" {
+                        s.set_placeholder(hint, window, cx);
+                    }
+                    s
+                })
+            })
+            .collect();
+        // Identity columns are database-generated on insert.
+        let locked = self
+            .table
+            .columns
+            .iter()
+            .map(|c| c.auto_increment || c.kind == ColumnKind::Binary)
+            .collect();
+        self.editor = Some(EditorState {
+            mode: EditorMode::Insert,
+            inputs,
+            locked,
+            error: None,
+            saving: false,
+            save_id: 0,
+        });
+        cx.notify();
+    }
+
+    /// Open the simplified editor on the selected row.
+    fn open_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((ix, row)) = self.selected_row(cx) else {
+            return;
+        };
+        let row_no = self.state.read(cx).delegate().page * PAGE + ix as u64 + 1;
+        let inputs = self
+            .table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let raw = row.get(i).map(|v| v.edit_string()).unwrap_or_default();
+                let hint = if c.nullable { "" } else { "required" };
+                cx.new(|cx| {
+                    let mut s = InputState::new(window, cx);
+                    if !hint.is_empty() {
+                        s.set_placeholder("required", window, cx);
+                    }
+                    s.set_value(raw, window, cx);
+                    s
+                })
+            })
+            .collect();
+        // Identity is fixed on update; binary columns are not editable.
+        let locked = self
+            .table
+            .columns
+            .iter()
+            .map(|c| c.primary_key || c.kind == ColumnKind::Binary)
+            .collect();
+        self.editor = Some(EditorState {
+            mode: EditorMode::Update { row, row_no },
+            inputs,
+            locked,
+            error: None,
+            saving: false,
+            save_id: 0,
+        });
+        cx.notify();
+    }
+
+    /// Open the delete confirmation for the selected row.
+    fn open_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((ix, row)) = self.selected_row(cx) else {
+            return;
+        };
+        let row_no = self.state.read(cx).delegate().page * PAGE + ix as u64 + 1;
+        self.editor = Some(EditorState {
+            mode: EditorMode::Delete { row, row_no },
+            inputs: Vec::new(),
+            locked: Vec::new(),
+            error: None,
+            saving: false,
+            save_id: 0,
+        });
+        cx.notify();
+    }
+
+    fn close_editor(&mut self, cx: &mut Context<Self>) {
+        self.editor = None;
+        cx.notify();
+    }
+
+    /// Collect + validate the modal's inputs into typed cells. For
+    /// updates only the changed columns come back; for inserts the
+    /// provided ones (empty-and-nullable columns fall back to defaults).
+    fn collect_changes(&self, editor: &EditorState, cx: &App) -> Result<Vec<CellChange>, String> {
+        let original: Option<&Row> = match &editor.mode {
+            EditorMode::Update { row, .. } => Some(row),
+            _ => None,
+        };
+        let mut changes = Vec::new();
+        for (i, c) in self.table.columns.iter().enumerate() {
+            if c.primary_key && original.is_some() {
+                continue; // pk is fixed on update
+            }
+            if c.kind == ColumnKind::Binary {
+                continue; // not editable
+            }
+            let raw = editor.inputs[i].read(cx).value().to_string();
+            // Insert: empty inputs fall back to what the database would do
+            // itself — identity (auto_increment), DEFAULT values, or NULL.
+            // Only genuinely required columns must be filled.
+            if original.is_none()
+                && raw.trim().is_empty()
+                && (c.nullable || c.auto_increment || c.has_default)
+            {
+                continue;
+            }
+            let value = parse_cell(c, &raw)?;
+            let unchanged = original.is_some_and(|row| {
+                row.get(i).is_some_and(|old| *old == value)
+            });
+            if !unchanged {
+                changes.push(CellChange::new(c.name.clone(), c.kind, value));
+            }
+        }
+        Ok(changes)
+    }
+
+    /// Save the modal: INSERT or UPDATE through the session, then reload
+    /// the page (stale-guarded by `save_id`). Immutable reads happen
+    /// first, the mutation of the editor state last — keeps the borrow
+    /// checker happy.
+    fn save_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // ---- immutable phase: validate + collect ----
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let changes = match self.collect_changes(editor, cx) {
+            Ok(c) => c,
+            Err(e) => {
+                self.editor.as_mut().map(|ed| ed.error = Some(e));
+                cx.notify();
+                return;
+            }
+        };
+        let (table, pk, is_update) = match &editor.mode {
+            EditorMode::Insert => {
+                if changes.is_empty() {
+                    self.editor.as_mut().map(|ed| ed.error = Some("fill at least one column".into()));
+                    cx.notify();
+                    return;
+                }
+                (TableRef::of(&self.table), Vec::new(), false)
+            }
+            EditorMode::Update { row, .. } => {
+                if changes.is_empty() {
+                    self.close_editor(cx);
+                    return; // nothing changed
+                }
+                (TableRef::of(&self.table), self.pk_cells(row), true)
+            }
+            EditorMode::Delete { .. } => return,
+        };
+        let session = self.state.read(cx).delegate().session.clone();
+
+        // ---- mutation phase: flag the in-flight save ----
+        let id = self
+            .editor
+            .as_mut()
+            .map(|ed| {
+                ed.saving = true;
+                ed.save_id += 1;
+                ed.error = None;
+                ed.save_id
+            })
+            .unwrap_or(0);
+        cx.notify();
+
+        let rx = if is_update {
+            session.update_row(table, pk, changes)
+        } else {
+            session.insert_row(table, changes)
+        };
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = rx.await;
+            cx.update(|_window, cx| {
+                view.update(cx, |v, cx| {
+                    let Some(editor) = v.editor.as_mut() else {
+                        return;
+                    };
+                    if editor.save_id != id {
+                        return; // a newer save superseded this one
+                    }
+                    editor.saving = false;
+                    match result {
+                        Ok(Ok(_)) => {
+                            v.editor = None;
+                            v.reload(cx);
+                        }
+                        Ok(Err(e)) => editor.error = Some(e.message().to_string()),
+                        Err(_) => editor.error = Some("save was cancelled".into()),
+                    }
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Delete the confirmed row through the session, then reload.
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // ---- immutable phase ----
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let EditorMode::Delete { ref row, .. } = editor.mode else {
+            return;
+        };
+        let pk = self.pk_cells(row);
+        if pk.is_empty() {
+            self.editor.as_mut().map(|ed| ed.error = Some("this table has no primary key".into()));
+            cx.notify();
+            return;
+        }
+        let table = TableRef::of(&self.table);
+        let session = self.state.read(cx).delegate().session.clone();
+
+        // ---- mutation phase ----
+        let id = self
+            .editor
+            .as_mut()
+            .map(|ed| {
+                ed.saving = true;
+                ed.save_id += 1;
+                ed.error = None;
+                ed.save_id
+            })
+            .unwrap_or(0);
+        cx.notify();
+
+        let rx = session.delete_row(table, pk);
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = rx.await;
+            cx.update(|_window, cx| {
+                view.update(cx, |v, cx| {
+                    let Some(editor) = v.editor.as_mut() else {
+                        return;
+                    };
+                    if editor.save_id != id {
+                        return;
+                    }
+                    editor.saving = false;
+                    match result {
+                        Ok(Ok(_)) => {
+                            v.editor = None;
+                            v.reload(cx);
+                        }
+                        Ok(Err(e)) => editor.error = Some(e.message().to_string()),
+                        Err(_) => editor.error = Some("delete was cancelled".into()),
+                    }
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The simplified record editor modal (insert / update / delete).
+    /// Rendered as an overlay on top of the grid — pinned insets per the
+    /// absolute-overlay gotcha in AGENTS.md.
+    fn render_editor(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = theme::palette(cx);
+        let Some(editor) = self.editor.as_ref() else {
+            return div().into_any_element();
+        };
+        let saving = editor.saving;
+        let (title, sub): (String, String) = match &editor.mode {
+            EditorMode::Insert => (
+                format!("New row · {}", self.table.name),
+                "Fill the values you want to insert; empty nullable columns fall back to their defaults.".into(),
+            ),
+            EditorMode::Update { row_no, .. } => (
+                format!("Edit row {row_no} · {}", self.table.name),
+                "Change the values and save; only the changed columns are written.".into(),
+            ),
+            EditorMode::Delete { row_no, .. } => (
+                format!("Delete row {row_no} · {}", self.table.name),
+                "This permanently removes the row from the database.".into(),
+            ),
+        };
+        let is_delete = matches!(editor.mode, EditorMode::Delete { .. });
+        let is_update = matches!(editor.mode, EditorMode::Update { .. });
+
+        // The fields form (not rendered for the delete confirmation).
+        let fields = if is_delete {
+            v_flex().into_any_element()
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .px_4()
+                .py_2()
+                .gap(px(10.))
+                .children(
+                    self.table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let locked = editor.locked.get(i).copied().unwrap_or(false);
+                            h_flex()
+                                .id(("f", i))
+                                .items_center()
+                                .gap(px(10.))
+                                .child(
+                                    v_flex()
+                                        .w(px(170.))
+                                        .flex_none()
+                                        .gap(px(2.))
+                                        .child(
+                                            h_flex()
+                                                .gap(px(4.))
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(12.5))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(p.foreground)
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .child(c.name.clone()),
+                                                )
+                                                .when(c.primary_key, |t| t.child(
+                                                    div()
+                                                        .px(px(3.))
+                                                        .rounded(px(2.))
+                                                        .text_size(px(10.))
+                                                        .bg(p.primary.opacity(0.2))
+                                                        .text_color(p.primary)
+                                                        .child("PK"),
+                                                ))
+                                                .when(c.nullable, |t| t.child(
+                                                    div()
+                                                        .text_size(px(10.))
+                                                        .text_color(p.muted_fg)
+                                                        .child("null?"),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .font_family(theme::MONO_FONT)
+                                                .text_color(theme::kind_color(&c.kind, &p))
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(c.type_.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            Input::new(&editor.inputs[i])
+                                                .large()
+                                                .h(px(38.))
+                                                .disabled(locked),
+                                        ),
+                                )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        };
+
+        // Backdrop click cancels (never while a save is in flight). The
+        // backdrop and the card are SIBLINGS under a transparent layer:
+        // clicks inside the card must never bubble into the backdrop.
+        let backdrop = div()
+            .id("editor-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(gpui::black().opacity(0.35))
+            .cursor_pointer()
+            .when(!saving, |t| {
+                t.on_click(cx.listener(|this, _, _, cx| this.close_editor(cx)))
+            });
+
+        let card = v_flex()
+            .id("record-editor")
+            .absolute()
+            .top_1_2()
+            .left_1_2()
+            // Rough optical centering: pull the card back by half its size.
+            .mt(px(-300.))
+            .ml(px(-320.))
+            .w(px(640.))
+            // BlockMouse: clicks over the card never count as backdrop
+            // clicks — the card's hitbox cuts the backdrop out of the
+            // hover set (see `Hitbox::is_hovered` / `hit_test`).
+            .occlude()
+            .max_h(px(640.))
+            .bg(p.card)
+            .border_1()
+            .border_color(p.border)
+            .rounded(px(10.))
+            .shadow_lg()
+            .overflow_hidden()
+            // header
+            .child(
+                v_flex()
+                    .flex_none()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.muted_fg)
+                            .child(sub),
+                    ),
+            )
+            .child(fields)
+            // footer
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.5))
+                            .text_color(p.conn_err)
+                            .truncate()
+                            .when_some(editor.error.clone(), |t, e| t.child(e)),
+                    )
+                    .child(
+                        Button::new("editor-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_editor(cx))),
+                    )
+                    .child(if is_delete {
+                        Button::new("editor-confirm")
+                            .danger()
+                            .label(if saving { "Deleting…" } else { "Delete row" })
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_delete(window, cx);
+                            }))
+                            .into_any_element()
+                    } else {
+                        Button::new("editor-save")
+                            .primary()
+                            .label(if saving {
+                                "Saving…".to_string()
+                            } else if is_update {
+                                "Save changes".to_string()
+                            } else {
+                                "Insert row".to_string()
+                            })
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_editor(window, cx);
+                            }))
+                            .into_any_element()
+                    }),
+            );
+
+        // Transparent event-passing layer (no id → no hitbox of its own):
+        // the backdrop handles outside clicks, the card sits on top.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(backdrop)
+            .child(card)
+            .into_any_element()
+    }
+
+    pub fn export_csv(&mut self, cx: &mut Context<Self>) {        let st = self.state.read(cx);
         let d = st.delegate();
         let header = self
             .table
@@ -515,6 +1091,9 @@ impl Render for RecordsView {
         let elapsed = d.elapsed_ms;
         let page_count = if total == 0 { 1 } else { (total + PAGE - 1) / PAGE };
         let error = d.error.clone();
+        let has_pk = self.has_pk();
+        let sel_some = self.state.read(cx).selected_row().is_some();
+        let editor_open = self.editor.is_some();
 
         let toolbar = h_flex()
             .h(px(36.))
@@ -565,6 +1144,35 @@ impl Render for RecordsView {
                 }),
             ))
             .child(sep(&p))
+            // Simplified editor: insert / edit / delete the selected row.
+            .child(icon_btn(
+                "row-insert",
+                32.,
+                svg().path("icons/plus.svg").size_3p5().text_color(p.foreground),
+                !editor_open,
+                hover,
+                None,
+                cx.listener(|this, _, window, cx| this.open_insert(window, cx)),
+            ))
+            .child(icon_btn(
+                "row-edit",
+                32.,
+                svg().path("icons/pencil.svg").size_3p5().text_color(if sel_some { p.primary } else { p.muted_fg }),
+                sel_some && has_pk && !editor_open,
+                hover,
+                None,
+                cx.listener(|this, _, window, cx| this.open_update(window, cx)),
+            ))
+            .child(icon_btn(
+                "row-delete",
+                32.,
+                svg().path("icons/trash-2.svg").size_3p5().text_color(if sel_some { p.conn_err } else { p.muted_fg }),
+                sel_some && has_pk && !editor_open,
+                hover,
+                None,
+                cx.listener(|this, _, _, cx| this.open_delete(cx)),
+            ))
+            .child(sep(&p))
             .child(icon_btn(
                 "view-data",
                 32.,
@@ -581,7 +1189,15 @@ impl Render for RecordsView {
                 true,
                 hover,
                 None,
-                cx.listener(|_, _, _, _| {}),
+                cx.listener(|this, _, window, cx| {
+                    // Open a SQL editor tab for this connection (the
+                    // placeholder button used to be a no-op).
+                    if let Some(app) = this.app.upgrade() {
+                        app.update(cx, |app, cx| {
+                            app.open_query_tab(window, cx);
+                        });
+                    }
+                }),
             ))
             .child(sep(&p))
             .child(icon_btn(
@@ -936,6 +1552,7 @@ impl Render for RecordsView {
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .relative()
             .when(self.resizing_detail, |this| this.cursor_row_resize())
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
                 if this.resizing_detail && !e.dragging() {
@@ -952,6 +1569,7 @@ impl Render for RecordsView {
             }))
             // Window-level safety net: any left-button release anywhere ends
             // the detail resize (covers releases over other apps / title bar).
+            // Pinned insets — see the absolute-overlay gotcha in AGENTS.md.
             .child(
                 canvas(
                     |_, _, _| {},
@@ -974,6 +1592,8 @@ impl Render for RecordsView {
                     },
                 )
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full(),
             )
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
@@ -1009,6 +1629,8 @@ impl Render for RecordsView {
             .when(self.show_detail, |this| this.child(detail_splitter))
             .child(detail)
             .child(status_bar)
+            // The record editor modal, on top of everything.
+            .when(self.editor.is_some(), |this| this.child(self.render_editor(cx)))
     }
 }
 

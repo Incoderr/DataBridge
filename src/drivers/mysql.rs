@@ -11,16 +11,17 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
-use sqlx::Row;
+use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
+use crate::core::model::is_select_like;
 use crate::core::model::{
-    ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping, Relation,
-    SchemaMeta, TableMeta, TableRef,
+    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
+    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
 };
 use crate::core::session::DbSession;
-use crate::drivers::util::dyn_cell;
+use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct MySqlSession {
     opts: MySqlConnectOptions,
@@ -183,6 +184,144 @@ impl DbSession for MySqlSession {
             elapsed_ms: t0.elapsed().as_millis() as u32,
         })
     }
+
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+        let pool = self.pool().await?;
+        let t0 = Instant::now();
+        if !is_select_like(sql) {
+            let res = sqlx::query(sql)
+                .execute(pool)
+                .await
+                .map_err(|e| DbError::with_source("query failed", e))?;
+            return Ok(QueryPage {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                rows_affected: res.rows_affected(),
+                truncated: false,
+                elapsed_ms: t0.elapsed().as_millis() as u32,
+            });
+        }
+        let rows = sqlx::query(sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DbError::with_source("query failed", e))?;
+        let columns: Vec<ColumnMeta> = rows
+            .first()
+            .map(|r| {
+                r.columns()
+                    .iter()
+                    .map(|c| {
+                        let t = c.type_info().name().to_lowercase();
+                        ColumnMeta {
+                            name: c.name().to_string(),
+                            type_: c.type_info().to_string(),
+                            nullable: true,
+                            primary_key: false,
+                            auto_increment: false,
+                            has_default: false,
+                            kind: mysql_kind(&t, &t),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let truncated = rows.len() > limit as usize;
+        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.into_iter().take(limit as usize) {
+            let mut r = Vec::with_capacity(row.len());
+            for i in 0..row.len() {
+                r.push(dyn_cell!(row, i));
+            }
+            out.push(r);
+        }
+        Ok(QueryPage {
+            columns,
+            rows: out,
+            rows_affected: 0,
+            truncated,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        })
+    }
+
+    async fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        let ident = mysql_ident(&table.schema, &table.name);
+        let sets = changes
+            .iter()
+            .map(|ch| format!("`{}` = ?", ch.column.replace('`', "``")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let where_ = pk
+            .iter()
+            .map(|key| format!("`{}` = ?", key.column.replace('`', "``")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("UPDATE {ident} SET {sets} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for ch in &changes {
+            q = bind_cell!(q, ch);
+        }
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to update the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        if values.is_empty() {
+            return Ok(0);
+        }
+        let ident = mysql_ident(&table.schema, &table.name);
+        let cols = values
+            .iter()
+            .map(|v| format!("`{}`", v.column.replace('`', "``")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = vec!["?"; values.len()].join(", ");
+        let sql = format!("INSERT INTO {ident} ({cols}) VALUES ({marks})");
+        let mut q = sqlx::query(&sql);
+        for v in &values {
+            q = bind_cell!(q, v);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to insert the row", e))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
+        let pool = self.pool().await?;
+        let ident = mysql_ident(&table.schema, &table.name);
+        let where_ = pk
+            .iter()
+            .map(|key| format!("`{}` = ?", key.column.replace('`', "``")))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("DELETE FROM {ident} WHERE {where_}");
+        let mut q = sqlx::query(&sql);
+        for key in &pk {
+            q = bind_cell!(q, key);
+        }
+        let res = q
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to delete the row", e))?;
+        Ok(res.rows_affected())
+    }
 }
 
 /// Introspect one database: tables/views with batched columns and keys.
@@ -197,12 +336,14 @@ async fn schema_meta(pool: &MySqlPool, schema: String) -> Result<SchemaMeta, DbE
     .await
     .map_err(|e| DbError::with_source(format!("failed to list tables of {schema}"), e))?;
 
-    let cols: Vec<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT table_name, column_name, column_type, data_type, is_nullable \
-         FROM information_schema.columns \
-         WHERE table_schema = ? \
-         ORDER BY table_name, ordinal_position",
-    )
+    let cols: Vec<(String, String, String, String, String, Option<String>, String)> =
+        sqlx::query_as(
+            "SELECT table_name, column_name, column_type, data_type, is_nullable, \
+                    column_default, extra \
+             FROM information_schema.columns \
+             WHERE table_schema = ? \
+             ORDER BY table_name, ordinal_position",
+        )
     .bind(&schema)
     .fetch_all(pool)
     .await
@@ -235,12 +376,15 @@ async fn schema_meta(pool: &MySqlPool, schema: String) -> Result<SchemaMeta, DbE
     let pk_set: HashSet<(String, String)> = pks.into_iter().collect();
 
     let mut by_table: BTreeMap<String, Vec<ColumnMeta>> = BTreeMap::new();
-    for (t, c, column_type, data_type, nullable) in cols {
+    for (t, c, column_type, data_type, nullable, default, extra) in cols {
+        let auto_increment = extra.to_ascii_lowercase().contains("auto_increment");
         by_table.entry(t).or_default().push(ColumnMeta {
             name: c,
             type_: column_type.clone(),
             nullable: nullable == "YES",
             primary_key: false,
+            auto_increment,
+            has_default: auto_increment || default.is_some(),
             kind: mysql_kind(&column_type, &data_type),
         });
     }
@@ -280,6 +424,8 @@ async fn schema_meta(pool: &MySqlPool, schema: String) -> Result<SchemaMeta, DbE
                     type_: ret.clone(),
                     nullable: true,
                     primary_key: false,
+                    auto_increment: false,
+                    has_default: false,
                     kind: mysql_kind(&ret, &ret),
                 }],
             })

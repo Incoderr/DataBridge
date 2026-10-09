@@ -64,7 +64,8 @@ src/
     connect.rs    # connection wizard renders (impl DataBridge)
     sidebar.rs    # sidebar chrome
     nav_tree.rs   # explorer tree (virtualized: flat row model + v_virtual_list + overlay Scrollbar)
-    workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate)
+    workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
+    query.rs      # SQL editor tab (Stage 5): code-editor input, run button, results grid
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
     assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-component-assets
@@ -119,9 +120,20 @@ pub trait DbSession: Send + Sync {
     async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError>;
     // later: async fn list_tables(&self, schema: &str) -> Result<Vec<TableMeta>, DbError>
     //        (lazy per-schema trees when eager loading proves expensive)
-    // stage 5: async fn execute(&self, sql: &str, limit: u64) -> Result<Page, DbError>;
+    // stage 5 (done): one SQL statement per call.
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError>;
+    // simplified editor: typed writes (CellChange carries the kind so NULL binds typed).
+    async fn update_row(&self, table: TableRef, pk: Vec<CellChange>, changes: Vec<CellChange>) -> Result<u64, DbError>;
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError>;
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError>;
 }
 ```
+
+The write methods have default `Err` bodies — a driver that cannot mutate
+reports "does not support …" instead of panicking. `QueryPage = { columns,
+rows, rows_affected, truncated, elapsed_ms }`: SELECT-like statements
+(`is_select_like` first-keyword sniff) return columns+rows, everything else
+reports `rows_affected`.
 
 `TableRef = { schema, name, kind }` identifies a result set; `Page =
 { rows, total, truncated, elapsed_ms }` is one fetched page; `Ping = { status,
@@ -199,6 +211,18 @@ the mock driver**:
   demo tree and the Stage-3 store remembers them like any other
   connection.
 - `ui/sidebar.rs` / `ui/nav_tree.rs` — render blocks of `DataBridge`.
+- `ui/query.rs` — the SQL editor tab (Stage 5): a `QueryView` entity with a
+  tree-sitter-highlighted `InputState::code_editor("sql")` (needs the
+  `tree-sitter-languages` feature of gpui-component), a Run button
+  (stale-guarded by `run_id`), a dynamic results grid and a status line
+  (rows / affected / elapsed). Opened from the tab bar's terminal icon or
+  the records toolbar's SQL button; multiple tabs per connection.
+- `ui/workspace.rs` (records grid) — the simplified record editor on top of
+  the grid: a modal (`render_editor`) with one typed input per column
+  (`parse_cell` validates by `ColumnKind`; PK/binary locked on update),
+  driving `insert_row` / `update_row` (changed columns only) /
+  `delete_row` through the session, stale-guarded by `save_id`. Toolbar:
+  plus / pencil / trash icons after the run/stop/reload group.
 - `ui/theme.rs` — near-black dark + clean light palettes (UI Bakery / DrawSQL
   inspired), sans chrome + mono data, radius/shadow tuned in `apply()`.
   Use `theme::palette(cx)`; do not hardcode colors except `DbType::brand_color()`
@@ -234,7 +258,11 @@ the mock driver**:
   `settings.json` (UI scale).
 - **Stage 4 — Mongo + Redis** (`mongodb` crate; `redis` with `tokio-comp`).
 - **Stage 5 — query editor.** `execute(sql)`, result tabs, cancellation (reuse the
-  stale-guard/load_id mechanism).
+  stale-guard/load_id mechanism). **Mostly done.** `execute` + the simplified
+  record editor (`update_row`/`insert_row`/`delete_row`) land on all drivers
+  and the mock; `QueryView` renders the editor tab with highlighting.
+  Remaining niceties: result tabs inside one query view, cancellation,
+  Ctrl+Enter keybinding.
 
 ## Conventions
 
@@ -273,5 +301,12 @@ the mock driver**:
   (overlay/canvas at `y = window height`); pinning the insets removes the
   static-position path entirely. All full-cover overlays in `app.rs` (drop
   hint, settings backdrop, both watcher canvases) are pinned.
+- **Modal cards need `.occlude()` (BlockMouse hitbox).** Click listeners fire
+  on `hitbox.is_hovered`, and a backdrop's hitbox covers the whole window —
+  sibling layout alone does not stop clicks over the card from reaching the
+  backdrop. The card's BlockMouse hitbox cuts the backdrop (and everything
+  behind it) out of the hover set. See `render_editor` in `workspace.rs` and
+  `render_settings_dialog` in `app.rs`: backdrop + card are siblings under a
+  transparent layer, the card occludes.
 - `/site` has its own ignore rules and lockfile (pnpm). The root `.gitignore` only
   lists `/target` — that is intentional.

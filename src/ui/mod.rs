@@ -6,6 +6,7 @@ pub mod assets;
 pub mod connect;
 pub mod diagram;
 pub mod nav_tree;
+pub mod query;
 pub mod settings;
 pub mod sidebar;
 pub mod theme;

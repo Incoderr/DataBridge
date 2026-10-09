@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use crate::core::error::DbError;
-use crate::core::model::{Page, Ping, Relation, SchemaMeta, TableRef};
+use crate::core::model::{
+    CellChange, Page, Ping, QueryPage, Relation, SchemaMeta, TableRef,
+};
 
 #[async_trait]
 pub trait DbSession: Send + Sync {
@@ -29,6 +31,39 @@ pub trait DbSession: Send + Sync {
     /// One page of rows of a table/view/routine, ordered by the table's
     /// columns.
     async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError>;
+
+    /// Stage 5: run arbitrary SQL. Result sets come back as columns+rows
+    /// (capped by `limit`); mutations report `rows_affected`.
+    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+        let _ = (sql, limit);
+        Err(DbError::new("this driver does not support arbitrary SQL"))
+    }
+
+    /// Simplified editor: update one row identified by its primary key
+    /// cells. `changes` carries only the columns that differ.
+    async fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> Result<u64, DbError> {
+        let _ = (table, pk, changes);
+        Err(DbError::new("this driver does not support row editing"))
+    }
+
+    /// Simplified editor: insert one row (`values` may cover a subset of
+    /// the table's columns).
+    async fn insert_row(&self, table: TableRef, values: Vec<CellChange>)
+        -> Result<u64, DbError> {
+        let _ = (table, values);
+        Err(DbError::new("this driver does not support row insertion"))
+    }
+
+    /// Simplified editor: delete one row identified by its primary key.
+    async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
+        let _ = (table, pk);
+        Err(DbError::new("this driver does not support row deletion"))
+    }
 }
 
 /// Cloneable UI-side handle. Every call is spawned onto the sidecar runtime
@@ -71,5 +106,43 @@ impl SessionHandle {
     ) -> oneshot::Receiver<Result<Page, DbError>> {
         let session = self.0.clone();
         crate::core::runtime::spawn(async move { session.fetch_rows(table, offset, limit).await })
+    }
+
+    /// Stage 5: run arbitrary SQL (the query editor).
+    pub fn execute(
+        &self,
+        sql: String,
+        limit: u64,
+    ) -> oneshot::Receiver<Result<QueryPage, DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.execute(&sql, limit).await })
+    }
+
+    pub fn update_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        changes: Vec<CellChange>,
+    ) -> oneshot::Receiver<Result<u64, DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.update_row(table, pk, changes).await })
+    }
+
+    pub fn insert_row(
+        &self,
+        table: TableRef,
+        values: Vec<CellChange>,
+    ) -> oneshot::Receiver<Result<u64, DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.insert_row(table, values).await })
+    }
+
+    pub fn delete_row(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+    ) -> oneshot::Receiver<Result<u64, DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.delete_row(table, pk).await })
     }
 }
