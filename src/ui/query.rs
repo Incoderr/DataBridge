@@ -4,8 +4,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
-    div, px,
+    App, Context, Div, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
+    WeakEntity, Window, div, px,
 };
 
 use gpui_component::button::{Button, ButtonVariants};
@@ -14,13 +14,22 @@ use gpui_component::input::InputState;
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
-use crate::core::model::{group_digits, DbConnection, QueryPage, Row};
+use crate::core::model::{first_keyword, group_digits, DbConnection, QueryPage, Row};
 use crate::core::session::SessionHandle;
+use crate::ui::app::DataBridge;
 use crate::ui::theme;
 
 /// Rows kept in the result grid from one statement (like the web
 /// version's `QUERY_LIMIT`).
 pub const RESULT_LIMIT: u64 = 500;
+
+/// First-keyword sniff for statements that change the schema tree.
+fn is_ddl(sql: &str) -> bool {
+    matches!(
+        first_keyword(sql).as_str(),
+        "create" | "drop" | "alter" | "rename"
+    )
+}
 
 // ---------------- Delegate: dynamic result columns ----------------
 
@@ -136,6 +145,8 @@ pub struct QueryView {
     #[allow(dead_code)]
     conn: DbConnection,
     session: SessionHandle,
+    /// The root entity — successful DDL reloads its schema tree.
+    app: WeakEntity<DataBridge>,
     editor: Entity<InputState>,
     /// Rebuilt after every run; `None` until the first statement.
     table: Option<Entity<TableState<QueryDelegate>>>,
@@ -150,17 +161,24 @@ impl QueryView {
     pub fn new(
         conn: DbConnection,
         session: SessionHandle,
+        seed: Option<String>,
+        app: WeakEntity<DataBridge>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
-            InputState::new(window, cx)
+            let mut s = InputState::new(window, cx)
                 .code_editor("sql")
-                .placeholder("SELECT * FROM table_name LIMIT 50;")
+                .placeholder("SELECT * FROM table_name LIMIT 50;");
+            if let Some(seed) = seed {
+                s.set_value(seed, window, cx);
+            }
+            s
         });
         Self {
             conn,
             session,
+            app,
             editor,
             table: None,
             running: false,
@@ -184,6 +202,7 @@ impl QueryView {
         self.error = None;
         self.run_id += 1;
         let id = self.run_id;
+        let ddl = is_ddl(&sql);
         cx.notify();
         let rx = self.session.execute(sql, RESULT_LIMIT);
         cx.spawn_in(window, async move |this, cx| {
@@ -195,7 +214,13 @@ impl QueryView {
                     }
                     q.running = false;
                     match result {
-                        Ok(Ok(page)) => q.apply_result(page, window, cx),
+                        Ok(Ok(page)) => {
+                            q.apply_result(page, window, cx);
+                            // New / dropped / altered objects: refresh the tree.
+                            if ddl {
+                                q.app.update(cx, |app, cx| app.reload_schemas(cx)).ok();
+                            }
+                        }
                         Ok(Err(e)) => q.error = Some(e.message().to_string()),
                         Err(_) => {}
                     }

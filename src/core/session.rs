@@ -64,6 +64,14 @@ pub trait DbSession: Send + Sync {
         let _ = (table, pk);
         Err(DbError::new("this driver does not support row deletion"))
     }
+
+    /// Tree context menu: drop a table or view (`table.kind` picks the
+    /// statement, see `NodeKind::drop_keyword`). `table` comes from
+    /// introspection; drivers quote it per dialect.
+    async fn drop_table(&self, table: TableRef) -> Result<(), DbError> {
+        let _ = table;
+        Err(DbError::new("this driver does not support dropping tables"))
+    }
 }
 
 /// Cloneable UI-side handle. Every call is spawned onto the sidecar runtime
@@ -144,5 +152,10 @@ impl SessionHandle {
     ) -> oneshot::Receiver<Result<u64, DbError>> {
         let session = self.0.clone();
         crate::core::runtime::spawn(async move { session.delete_row(table, pk).await })
+    }
+
+    pub fn drop_table(&self, table: TableRef) -> oneshot::Receiver<Result<(), DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.drop_table(table).await })
     }
 }

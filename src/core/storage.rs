@@ -9,6 +9,7 @@
 //! password again", never a crash.
 
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -16,7 +17,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{ConnectionStatus, DbConnection, DbType};
+use super::model::{ConnectionStatus, DbConnection, DbType, TargetKey};
 
 /// File name inside the platform config dir.
 const FILE: &str = "connections.json";
@@ -116,6 +117,20 @@ pub fn load_connections() -> Vec<DbConnection> {
         return Vec::new();
     };
     list.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+    // Self-heal stores written before target dedupe: keep the newest entry
+    // per target, drop the rest together with their keyring secrets.
+    let mut seen = HashSet::new();
+    let (list, dupes): (Vec<_>, Vec<_>) =
+        list.into_iter().partition(|c| seen.insert(stored_key(c)));
+    if !dupes.is_empty() {
+        for d in &dupes {
+            delete_secret(&d.id, "");
+            delete_secret(&d.id, URL_SUFFIX);
+        }
+        if let Err(e) = write_list(&path, &list) {
+            eprintln!("DataBridge: cannot save connections: {e}");
+        }
+    }
     list.into_iter()
         .map(|c| {
             // URL mode: the keyring holds the full URL (credentials and
@@ -142,16 +157,24 @@ pub fn load_connections() -> Vec<DbConnection> {
         .collect()
 }
 
-/// Remember a connection that just connected: upsert by id, stamp
-/// `last_used`, keep the list newest-first and capped at [`MAX_RECENT`].
-/// The password / full URL go to the keyring only — never the JSON.
+/// Remember a connection that just connected: upsert by id *and* by
+/// target ([`TargetKey`] — re-connecting the same server under a new id
+/// replaces the old entry), stamp `last_used`, keep the list newest-first
+/// and capped at [`MAX_RECENT`]. The password / full URL go to the keyring
+/// only — never the JSON.
 pub fn remember_connection(conn: &DbConnection) {
     let Some(path) = connections_path() else {
         return;
     };
-    let mut list: Vec<StoredConnection> = read_list(&path);
+    let key = conn.target_key();
     // This connection goes first; everyone else keeps its own timestamp.
-    list.retain(|c| c.id != conn.id);
+    let (dupes, mut list): (Vec<StoredConnection>, Vec<StoredConnection>) = read_list(&path)
+        .into_iter()
+        .partition(|c| c.id == conn.id || stored_key(c) == key);
+    for d in dupes.iter().filter(|d| d.id != conn.id) {
+        delete_secret(&d.id, "");
+        delete_secret(&d.id, URL_SUFFIX);
+    }
     list.insert(
         0,
         StoredConnection {
@@ -193,6 +216,12 @@ pub fn forget_connection(id: &str) {
 }
 
 // ---------- helpers ----------
+
+/// The dedupe key of a stored entry (its URL is password-stripped, which
+/// [`TargetKey`] ignores anyway).
+fn stored_key(c: &StoredConnection) -> TargetKey {
+    TargetKey::build(c.db_type, c.url.as_deref(), &c.host, c.port, &c.database, &c.user)
+}
 
 /// `postgres://u:s3cret@h/db?sslmode=…` → `postgres://u@h/db?sslmode=…` —
 /// the display copy kept in the JSON; the original stays in the keyring.
@@ -275,5 +304,36 @@ mod tests {
         assert_eq!(back.id, c.id);
         assert_eq!(back.db_type, DbType::PostgreSql);
         assert_eq!(back.last_used, c.last_used);
+    }
+
+    #[test]
+    fn stored_entry_dedupes_against_live_connection() {
+        // Same server, different ids; the store only has the stripped URL.
+        let url = "postgres://alice:s3cret@host.io:5432/db";
+        let live = DbConnection {
+            id: "new-id".into(),
+            name: "again".into(),
+            db_type: DbType::PostgreSql,
+            host: String::new(),
+            port: 5432,
+            database: String::new(),
+            user: String::new(),
+            password: String::new(),
+            url: Some(url.into()),
+            status: ConnectionStatus::Disconnected,
+            latency_ms: 0,
+        };
+        let stored = StoredConnection {
+            id: "old-id".into(),
+            name: "first".into(),
+            db_type: DbType::PostgreSql,
+            host: String::new(),
+            port: 5432,
+            database: String::new(),
+            user: String::new(),
+            url: Some(strip_url_password(url)),
+            last_used: 0,
+        };
+        assert_eq!(stored_key(&stored), live.target_key());
     }
 }

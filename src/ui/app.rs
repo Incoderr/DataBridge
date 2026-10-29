@@ -1,6 +1,6 @@
 //! Root application view: connection state, tab management, layout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::prelude::*;
@@ -17,7 +17,9 @@ use gpui_component::{
 };
 
 use crate::core::mock;
-use crate::core::model::{ConnectionStatus, DbConnection, DbType, SchemaMeta, TableMeta};
+use crate::core::model::{
+    ConnectionStatus, DbConnection, DbType, NodeKind, SchemaMeta, TableMeta, TableRef,
+};
 use crate::core::registry;
 use crate::core::session::SessionHandle;
 use crate::core::storage;
@@ -56,6 +58,15 @@ pub struct WizardState {
     pub error: Option<String>,
     pub testing: bool,
     pub chosen_existing: Option<String>,
+}
+
+/// A drop confirmation: the object, whether the DROP is in flight, and
+/// the driver's error if it failed (shown in the dialog).
+pub struct PendingDrop {
+    pub schema: String,
+    pub meta: Arc<TableMeta>,
+    pub running: bool,
+    pub error: Option<String>,
 }
 
 /// The workspace view of the active tab: the records grid or the schema
@@ -99,6 +110,16 @@ pub struct DataBridge {
     pub show_settings: bool,
     /// Counter for query tab ids (multiple SQL tabs per connection).
     pub query_seq: u32,
+    /// Stale guard of the schema-tree loads (connect + DDL reloads).
+    pub schemas_id: u64,
+    /// Live SQL editors by tab id. Records/diagram views remount on every
+    /// tab switch (web-app parity); a query tab must not — that would drop
+    /// the typed statement and its results.
+    pub query_views: HashMap<String, Entity<QueryView>>,
+    /// The tree context menu's "Drop table…" awaiting confirmation.
+    pub pending_drop: Option<PendingDrop>,
+    /// Stale guard of drop requests (a new request / cancel supersedes).
+    pub drop_id: u64,
     // visual state
     pub grid_view: bool,
     /// External files are dragged over the window right now — the
@@ -158,6 +179,10 @@ impl DataBridge {
             tree_scroll: VirtualListScrollHandle::new(),
             show_settings: false,
             query_seq: 0,
+            schemas_id: 0,
+            query_views: HashMap::new(),
+            pending_drop: None,
+            drop_id: 0,
             grid_view: true,
             drag_over: false,
             wizard,
@@ -212,6 +237,45 @@ impl DataBridge {
     /// Open a new SQL editor tab (Stage 5). Multiple tabs are allowed —
     /// each gets its own editor state, like DataGrip consoles.
     pub fn open_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_query_tab_with(None, window, cx);
+    }
+
+    /// "New table": a SQL tab seeded with a dialect-specific `CREATE TABLE`
+    /// template for `schema`. Running it reloads the tree (see `QueryView`).
+    pub fn open_create_table(&mut self, schema: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(t) = self.active_conn.as_ref().map(|c| c.db_type) else {
+            return;
+        };
+        if let Some(sql) = create_table_template(t, schema) {
+            self.open_query_tab_with(Some(sql), window, cx);
+        }
+    }
+
+    /// Whether the active connection speaks SQL DDL (offers "New table").
+    pub fn can_create_tables(&self) -> bool {
+        self.active_conn
+            .as_ref()
+            .is_some_and(|c| create_table_template(c.db_type, "").is_some())
+    }
+
+    /// The schema a "New table" without an explicit target goes to: the
+    /// connection's database (MySQL), `public` (PostgreSQL), else the first.
+    pub fn default_schema(&self) -> Option<String> {
+        let db = self.active_conn.as_ref().map(|c| c.database.as_str()).unwrap_or("");
+        self.schemas
+            .iter()
+            .find(|s| s.name == db)
+            .or_else(|| self.schemas.iter().find(|s| s.name == "public"))
+            .or_else(|| self.schemas.first())
+            .map(|s| s.name.clone())
+    }
+
+    fn open_query_tab_with(
+        &mut self,
+        seed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.query_seq += 1;
         let Some(conn) = self.active_conn.clone() else {
             return;
@@ -220,7 +284,7 @@ impl DataBridge {
         self.tabs.push(OpenTab {
             id,
             schema: conn.database.clone(),
-            kind: TabKind::Sql,
+            kind: TabKind::Sql(seed),
         });
         let ix = self.tabs.len() - 1;
         self.set_active(ix, window, cx);
@@ -265,9 +329,16 @@ impl DataBridge {
                     SchemaDiagram::new(conn, session, tab.schema.clone(), tables, cx)
                 }))
             }
-            TabKind::Sql => WorkspaceView::Query(cx.new(|cx| {
-                QueryView::new(conn, session, window, cx)
-            })),
+            TabKind::Sql(seed) => {
+                let view = self
+                    .query_views
+                    .entry(tab.id.clone())
+                    .or_insert_with(|| {
+                        cx.new(|cx| QueryView::new(conn, session, seed.clone(), app, window, cx))
+                    })
+                    .clone();
+                WorkspaceView::Query(view)
+            }
         });
         cx.notify();
     }
@@ -276,10 +347,11 @@ impl DataBridge {
         if ix >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(ix);
-        self.view = None;
+        let closed = self.tabs.remove(ix);
+        self.query_views.remove(&closed.id);
         match self.active_tab {
             Some(a) if a == ix => {
+                self.view = None;
                 if self.tabs.is_empty() {
                     self.active_tab = None;
                 } else {
@@ -323,8 +395,10 @@ impl DataBridge {
         }
         self.active_conn = None;
         self.session = None;
+        self.schemas_id += 1;
         self.schemas.clear();
         self.tabs.clear();
+        self.query_views.clear();
         self.active_tab = None;
         self.view = None;
         cx.notify();
@@ -366,8 +440,11 @@ impl DataBridge {
             }
         };
         // Recents first: the just-used connection moves to the top of the
-        // wizard's list; outside demo mode it is persisted (JSON + keyring).
-        self.connections.retain(|c| c.id != conn.id);
+        // wizard's list, replacing older entries of the same target; outside
+        // demo mode it is persisted (JSON + keyring).
+        let key = conn.target_key();
+        self.connections
+            .retain(|c| c.id != conn.id && c.target_key() != key);
         self.connections.insert(0, conn.clone());
         if !self.mock {
             storage::remember_connection(&conn);
@@ -376,6 +453,7 @@ impl DataBridge {
         self.session = Some(session.clone());
         self.schemas.clear();
         self.tabs.clear();
+        self.query_views.clear();
         self.active_tab = None;
         self.view = None;
         self.query.clear();
@@ -386,11 +464,16 @@ impl DataBridge {
         self.wizard.phase = Phase::Choose;
         self.wizard.error = None;
 
+        self.schemas_id += 1;
+        let load = self.schemas_id;
         let rx = session.list_schemas();
         cx.spawn(async move |this, cx| {
             match rx.await {
                 Ok(Ok(schemas)) => {
                     this.update(cx, |this, cx| {
+                        if this.schemas_id != load {
+                            return; // disconnected / superseded meanwhile
+                        }
                         this.schemas = schemas;
                         this.expanded = Self::initial_expanded(&this.schemas);
                         cx.notify();
@@ -410,6 +493,131 @@ impl DataBridge {
         })
         .detach();
 
+        cx.notify();
+    }
+
+    /// Re-introspect the active connection after DDL ran in a query tab
+    /// (new / dropped / altered tables). Keeps the user's expansion state;
+    /// schemas that appear for the first time open like on connect.
+    /// Errors keep the current tree — the query tab already reported them.
+    pub fn reload_schemas(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        self.schemas_id += 1;
+        let load = self.schemas_id;
+        let rx = session.list_schemas();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(schemas)) = rx.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if this.schemas_id != load {
+                    return; // superseded / disconnected
+                }
+                let fresh: Vec<SchemaMeta> = schemas
+                    .iter()
+                    .filter(|s| !this.schemas.iter().any(|o| o.name == s.name))
+                    .cloned()
+                    .collect();
+                this.expanded.extend(Self::initial_expanded(&fresh));
+                this.schemas = schemas;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Tree context menu → confirmation dialog for dropping `meta`.
+    pub fn ask_drop(&mut self, schema: &str, meta: Arc<TableMeta>, cx: &mut Context<Self>) {
+        self.drop_id += 1;
+        self.pending_drop = Some(PendingDrop {
+            schema: schema.to_string(),
+            meta,
+            running: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub fn cancel_drop(&mut self, cx: &mut Context<Self>) {
+        self.drop_id += 1; // a DROP still in flight no longer touches the UI
+        self.pending_drop = None;
+        cx.notify();
+    }
+
+    /// Run the confirmed DROP through the session (stale-guarded by
+    /// `drop_id`). Success closes the object's tabs and reloads the tree;
+    /// failure keeps the dialog open with the driver's message.
+    pub fn confirm_drop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Some(pending) = self.pending_drop.as_mut() else {
+            return;
+        };
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        pending.error = None;
+        let table = TableRef::of(&pending.meta);
+        self.drop_id += 1;
+        let id = self.drop_id;
+        cx.notify();
+        let rx = session.drop_table(table.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rx.await;
+            cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    if this.drop_id != id {
+                        return; // cancelled / superseded
+                    }
+                    match result {
+                        Ok(Ok(())) => {
+                            this.pending_drop = None;
+                            this.close_tabs_of(&table, window, cx);
+                            this.reload_schemas(cx);
+                        }
+                        Ok(Err(e)) => {
+                            if let Some(p) = this.pending_drop.as_mut() {
+                                p.running = false;
+                                p.error = Some(e.message().to_string());
+                            }
+                        }
+                        Err(_) => this.pending_drop = None,
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Close every records tab showing `table` (it was just dropped).
+    fn close_tabs_of(&mut self, table: &TableRef, window: &mut Window, cx: &mut Context<Self>) {
+        let shows = |t: &OpenTab| {
+            matches!(&t.kind, TabKind::Records(m) if m.schema == table.schema && m.name == table.name)
+        };
+        let active_id = self.active_tab.map(|i| self.tabs[i].id.clone());
+        let active_closed = self
+            .active_tab
+            .is_some_and(|i| shows(&self.tabs[i]));
+        self.tabs.retain(|t| !shows(t));
+        if active_closed {
+            self.view = None;
+            self.active_tab = None;
+            if !self.tabs.is_empty() {
+                let last = self.tabs.len() - 1;
+                self.set_active(last, window, cx);
+            }
+        } else {
+            // The active tab survived; its index may have shifted.
+            self.active_tab = active_id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        }
         cx.notify();
     }
 
@@ -446,7 +654,7 @@ impl DataBridge {
             .and_then(|t| match &t.kind {
                 TabKind::Records(meta) => Some((t.schema.clone(), meta.name.clone())),
                 // Diagram and query tabs highlight nothing.
-                TabKind::Diagram | TabKind::Sql => None,
+                TabKind::Diagram | TabKind::Sql(_) => None,
             })
     }
 
@@ -467,7 +675,7 @@ impl DataBridge {
             let (label, icon) = match &tab.kind {
                 TabKind::Records(meta) => (meta.name.clone(), "icons/table.svg"),
                 TabKind::Diagram => (format!("{} · diagram", tab.schema), "icons/schema.svg"),
-                TabKind::Sql => (format!("query {}", ix + 1), "icons/schema.svg"),
+                TabKind::Sql(_) => (format!("query {}", ix + 1), "icons/schema.svg"),
             };
             bar = bar.child(
                 Tab::new()
@@ -606,6 +814,9 @@ impl Render for DataBridge {
             .child(content)
             .when(show_settings, |this| {
                 this.child(self.render_settings_dialog(cx))
+            })
+            .when(self.pending_drop.is_some(), |this| {
+                this.child(self.render_drop_dialog(cx))
             })
             .when(drag_over, |this| this.child(self.render_drop_hint(cx)))
             .child(
@@ -748,7 +959,7 @@ impl DataBridge {
                                 Some(WorkspaceView::Records(v)) => v.into_any_element(),
                                 Some(WorkspaceView::Diagram(v)) => v.into_any_element(),
                                 Some(WorkspaceView::Query(v)) => v.into_any_element(),
-                                None => crate::ui::workspace::empty_state(cx).into_any_element(),
+                                None => self.render_empty_state(cx).into_any_element(),
                             }),
                     ),
             )
@@ -811,6 +1022,127 @@ impl DataBridge {
 
 /// Settings dialog: interface scale (font / UI size) chooser.
 impl DataBridge {
+    /// "Drop table?" confirmation — same backdrop + occluding-card pattern
+    /// as the settings dialog.
+    fn render_drop_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::FontWeight;
+        use gpui_component::button::{Button, ButtonVariants};
+        use gpui_component::Disableable;
+        let p = theme::palette(cx);
+        let Some(pending) = self.pending_drop.as_ref() else {
+            return div();
+        };
+        let what = if pending.meta.kind == NodeKind::View {
+            "view"
+        } else {
+            "table"
+        };
+        let name = format!("{}.{}", pending.schema, pending.meta.name);
+        let running = pending.running;
+        let error = pending.error.clone();
+
+        let backdrop = div()
+            .id("drop-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(gpui::black().opacity(0.35))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.pending_drop.as_ref().is_some_and(|p| p.running) {
+                    this.cancel_drop(cx);
+                }
+            }));
+
+        let card = v_flex()
+            .id("drop-dialog")
+            .absolute()
+            .left_1_2()
+            .top_1_2()
+            .mt(px(-90.))
+            .ml(px(-210.))
+            .w(px(420.))
+            .occlude()
+            .bg(p.card)
+            .border_1()
+            .border_color(p.border)
+            .rounded(px(10.))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .with_size(Size::Size(px(16.)))
+                                    .text_color(p.destructive),
+                            )
+                            .child(format!("Drop {what}?")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(p.muted_fg)
+                            .child(format!(
+                                "{name} and all of its data will be permanently deleted. This cannot be undone."
+                            )),
+                    )
+                    .when_some(error, |this, e| {
+                        this.child(
+                            div()
+                                .px_2()
+                                .py(px(6.))
+                                .rounded(px(4.))
+                                .bg(p.conn_err.opacity(0.1))
+                                .text_size(px(12.5))
+                                .text_color(p.conn_err)
+                                .child(e),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .child(
+                        Button::new("drop-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_drop(cx))),
+                    )
+                    .child(
+                        Button::new("drop-confirm")
+                            .danger()
+                            .label(if running { "Dropping…" } else { "Drop" })
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_drop(window, cx)
+                            })),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(backdrop)
+            .child(card)
+    }
+
     fn render_settings_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui::{ClickEvent, FontWeight};
         let p = theme::palette(cx);
@@ -949,4 +1281,37 @@ impl DataBridge {
             .child(backdrop)
             .child(card)
     }
+}
+
+/// The "New table" starter statement per SQL dialect; `None` for stores
+/// without SQL DDL. The schema name comes from introspection and is quoted
+/// per dialect; the user edits the text before running it.
+fn create_table_template(t: DbType, schema: &str) -> Option<String> {
+    let sql = match t {
+        DbType::Sqlite => "CREATE TABLE new_table (\n    \
+             id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             name TEXT NOT NULL,\n    \
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n);"
+            .to_string(),
+        DbType::PostgreSql => format!(
+            "CREATE TABLE \"{}\".new_table (\n    \
+             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    \
+             name TEXT NOT NULL,\n    \
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now()\n);",
+            schema.replace('"', "\"\"")
+        ),
+        DbType::MySql | DbType::MariaDb => format!(
+            "CREATE TABLE `{}`.new_table (\n    \
+             id BIGINT AUTO_INCREMENT PRIMARY KEY,\n    \
+             name VARCHAR(255) NOT NULL,\n    \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\n);",
+            schema.replace('`', "``")
+        ),
+        DbType::MongoDb
+        | DbType::Redis
+        | DbType::ClickHouse
+        | DbType::Cassandra
+        | DbType::ScyllaDb => return None,
+    };
+    Some(sql)
 }

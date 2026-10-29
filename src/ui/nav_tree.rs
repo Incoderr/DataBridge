@@ -17,9 +17,10 @@ use gpui::{
 };
 use gpui_component::input::Input;
 use gpui_component::scroll::Scrollbar;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_component::{h_flex, v_flex, v_virtual_list, Icon, IconName, Sizable, Size};
 
-use crate::core::model::{group_digits, ConnectionStatus, DbType, TableMeta};
+use crate::core::model::{group_digits, ConnectionStatus, DbType, NodeKind, TableMeta};
 use crate::ui::app::DataBridge;
 use crate::ui::theme;
 
@@ -77,6 +78,8 @@ pub enum TreeRow {
     },
     /// The per-schema entry to the relationships diagram.
     Diagram { schema: String },
+    /// The per-schema "New table" entry (SQL stores only).
+    NewTable { schema: String },
     /// Empty-state / no-match note. Lines render single-line truncated at
     /// a fixed line height, so the height is exactly `note_height(len)`.
     Note { lines: Vec<String> },
@@ -88,7 +91,7 @@ impl TreeRow {
     fn height(&self) -> f32 {
         match self {
             Self::Parent { .. } | Self::Leaf { .. } => ROW_H,
-            Self::Diagram { .. } => DIAGRAM_H,
+            Self::Diagram { .. } | Self::NewTable { .. } => DIAGRAM_H,
             Self::Note { lines } => note_height(lines.len()),
         }
     }
@@ -338,6 +341,7 @@ impl DataBridge {
         let q = self.query.trim().to_lowercase();
         let schemas = &self.schemas;
         let expanded = &self.expanded;
+        let can_create = self.can_create_tables();
 
         let mut rows: Vec<TreeRow> = Vec::new();
 
@@ -433,6 +437,11 @@ impl DataBridge {
             rows.push(TreeRow::Diagram {
                 schema: sch.name.clone(),
             });
+            if can_create {
+                rows.push(TreeRow::NewTable {
+                    schema: sch.name.clone(),
+                });
+            }
 
             // Tables group (shown when not filtering or non-empty)
             if q.is_empty() || !tables.is_empty() {
@@ -553,19 +562,58 @@ fn render_tree_row(row: &TreeRow, p: &theme::Palette, cx: &mut Context<DataBridg
             schema,
             icon,
             selected,
-        } => leaf_row(
-            *depth,
-            meta.clone(),
-            schema,
-            // On the selected row the icon shares the selection's
-            // foreground so the type-colored glyph stays visible.
-            render_icon_recolored(icon, selected.then(|| p.primary_fg)),
-            *selected,
-            p,
-            cx,
-        )
-        .into_any_element(),
+        } => {
+            let row = leaf_row(
+                *depth,
+                meta.clone(),
+                schema,
+                // On the selected row the icon shares the selection's
+                // foreground so the type-colored glyph stays visible.
+                render_icon_recolored(icon, selected.then(|| p.primary_fg)),
+                *selected,
+                p,
+                cx,
+            );
+            // Right-click menu for droppable objects (tables, views).
+            if meta.kind.drop_keyword().is_none() {
+                return row.into_any_element();
+            }
+            let app = cx.entity().downgrade();
+            let schema = schema.clone();
+            let meta = meta.clone();
+            row.context_menu(move |menu, _, _| {
+                let (open_app, drop_app) = (app.clone(), app.clone());
+                let (open_schema, drop_schema) = (schema.clone(), schema.clone());
+                let (open_meta, drop_meta) = (meta.clone(), meta.clone());
+                let drop_label = if meta.kind == NodeKind::View {
+                    "Drop view…"
+                } else {
+                    "Drop table…"
+                };
+                menu.item(PopupMenuItem::new("Open").icon(IconName::ArrowRight).on_click(
+                    move |_, window, cx| {
+                        open_app
+                            .update(cx, |this, cx| {
+                                this.open_tab(&open_schema, open_meta.clone(), window, cx)
+                            })
+                            .ok();
+                    },
+                ))
+                .separator()
+                .item(PopupMenuItem::new(drop_label).icon(IconName::Delete).on_click(
+                    move |_, _, cx| {
+                        drop_app
+                            .update(cx, |this, cx| {
+                                this.ask_drop(&drop_schema, drop_meta.clone(), cx)
+                            })
+                            .ok();
+                    },
+                ))
+            })
+            .into_any_element()
+        }
         TreeRow::Diagram { schema } => diagram_row(schema, p, cx).into_any_element(),
+        TreeRow::NewTable { schema } => new_table_row(schema, p, cx).into_any_element(),
         TreeRow::Note { lines } => note_row(lines, p).into_any_element(),
     }
 }
@@ -734,6 +782,37 @@ fn diagram_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -
         .child(div().min_w_0().truncate().child("Schema diagram"))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_diagram(&schema, window, cx);
+        }))
+}
+
+/// The per-schema "New table" entry: a SQL tab with a `CREATE TABLE`
+/// template. Same metrics as `diagram_row`.
+fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -> Stateful<Div> {
+    let schema = schema.to_string();
+    div()
+        .id(ElementId::Name(SharedString::from(format!("nt:{schema}"))))
+        .h(px(DIAGRAM_H))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .mx(px(4.))
+        .rounded(px(4.))
+        .pr_2()
+        .pl(px(2. * 16. + 6.))
+        .text_size(px(12.))
+        .cursor_pointer()
+        .text_color(p.muted_fg)
+        .hover(move |s| s.bg(p.tree_hover))
+        .child(div().w(px(16.)).h_full().flex_none())
+        .child(
+            Icon::new(IconName::Plus)
+                .with_size(Size::Size(px(14.)))
+                .flex_none()
+                .text_color(p.primary.opacity(0.7)),
+        )
+        .child(div().min_w_0().truncate().child("New table"))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_create_table(&schema, window, cx);
         }))
 }
 

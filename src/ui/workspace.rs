@@ -6,10 +6,12 @@ use gpui::prelude::*;
 use gpui::{
     canvas, AnyElement, App, ClickEvent, ClipboardItem, Context, DispatchPhase, Div, Entity,
     FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Render, Stateful, Styled, Subscription, Window, div, px, svg,
+    Corner, ParentElement, Render, SharedString, Stateful, Styled, Subscription, Window, div, px,
+    svg,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
@@ -29,8 +31,9 @@ pub enum TabKind {
     Records(Arc<TableMeta>),
     /// The Supabase-style relationships canvas for the whole schema.
     Diagram,
-    /// The SQL editor (Stage 5).
-    Sql,
+    /// The SQL editor (Stage 5), optionally seeded with starter text
+    /// (the "New table" template).
+    Sql(Option<String>),
 }
 
 #[derive(Clone)]
@@ -356,8 +359,23 @@ enum EditorMode {
     Delete { row: Row, row_no: u64 },
 }
 
+/// Choices for one foreign-key column of the editor: values of the
+/// referenced column, labelled with the target's first text column.
+struct FkLookup {
+    target: String,
+    loading: bool,
+    error: Option<String>,
+    /// (value to put into the input, menu label).
+    options: Arc<Vec<(SharedString, SharedString)>>,
+}
+
+/// How many referenced rows the FK picker offers.
+const FK_OPTIONS: u64 = 200;
+
 struct EditorState {
     mode: EditorMode,
+    /// Per column: the FK picker when the column is a foreign key.
+    fk: Vec<Option<FkLookup>>,
     /// One input per table column (prefilled for updates).
     inputs: Vec<Entity<InputState>>,
     /// Which inputs render read-only (PK / binary on update).
@@ -391,6 +409,8 @@ pub struct RecordsView {
     last_table_w: f32,
     /// The simplified record editor modal, when open.
     editor: Option<EditorState>,
+    /// Stale guard of the editor's FK lookups (bumped per open / close).
+    fk_gen: u64,
     _obs: Subscription,
 }
 
@@ -437,6 +457,7 @@ impl RecordsView {
             last_sel: None,
             last_table_w: 0.0,
             editor: None,
+            fk_gen: 0,
             _obs: obs,
         }
     }
@@ -526,7 +547,9 @@ impl RecordsView {
             error: None,
             saving: false,
             save_id: 0,
+            fk: Vec::new(),
         });
+        self.load_fk_options(cx);
         cx.notify();
     }
 
@@ -568,7 +591,9 @@ impl RecordsView {
             error: None,
             saving: false,
             save_id: 0,
+            fk: Vec::new(),
         });
+        self.load_fk_options(cx);
         cx.notify();
     }
 
@@ -585,12 +610,125 @@ impl RecordsView {
             error: None,
             saving: false,
             save_id: 0,
+            fk: Vec::new(),
         });
         cx.notify();
     }
 
     fn close_editor(&mut self, cx: &mut Context<Self>) {
         self.editor = None;
+        self.fk_gen += 1;
+        cx.notify();
+    }
+
+    /// FK picker data for the open editor: this table's FK edges
+    /// (`list_relations`), then up to [`FK_OPTIONS`] rows of each referenced
+    /// table. Targets resolve through the app's schema tree; every step is
+    /// stale-guarded by `fk_gen`.
+    fn load_fk_options(&mut self, cx: &mut Context<Self>) {
+        self.fk_gen += 1;
+        let fk_load = self.fk_gen;
+        let session = self.state.read(cx).delegate().session.clone();
+        let rx = session.list_relations(&self.schema);
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(relations)) = rx.await else {
+                return; // no picker — the plain inputs still work
+            };
+            this.update(cx, |v, cx| v.start_fk_lookups(fk_load, relations, session, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn start_fk_lookups(
+        &mut self,
+        fk_load: u64,
+        relations: Vec<crate::core::model::Relation>,
+        session: SessionHandle,
+        cx: &mut Context<Self>,
+    ) {
+        if fk_load != self.fk_gen {
+            return;
+        }
+        let schema = self.schema.clone();
+        let schemas = match self.app.upgrade() {
+            Some(app) => app.read(cx).schemas.clone(),
+            None => return,
+        };
+        let Some(sch) = schemas.iter().find(|s| s.name == schema) else {
+            return;
+        };
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        editor.fk = (0..self.table.columns.len()).map(|_| None).collect();
+        for rel in relations.iter().filter(|r| r.from_table == self.table.name) {
+            let Some(col_ix) = self.table.columns.iter().position(|c| c.name == rel.from_column)
+            else {
+                continue;
+            };
+            if editor.fk[col_ix].is_some() {
+                continue; // first edge wins for multi-FK columns
+            }
+            let Some(target) = sch.tables.iter().find(|t| t.name == rel.to_table).cloned() else {
+                continue;
+            };
+            let Some(to_ix) = target.columns.iter().position(|c| c.name == rel.to_column) else {
+                continue;
+            };
+            // Label: the target's first text column other than the key.
+            let label_ix = target
+                .columns
+                .iter()
+                .enumerate()
+                .position(|(i, c)| i != to_ix && c.kind == ColumnKind::Text);
+            editor.fk[col_ix] = Some(FkLookup {
+                target: target.name.clone(),
+                loading: true,
+                error: None,
+                options: Arc::new(Vec::new()),
+            });
+            let rx = session.fetch_rows(TableRef::of(&target), 0, FK_OPTIONS);
+            cx.spawn(async move |this, cx| {
+                let result = rx.await;
+                this.update(cx, |v, cx| {
+                    if fk_load != v.fk_gen {
+                        return;
+                    }
+                    let Some(fk) = v
+                        .editor
+                        .as_mut()
+                        .and_then(|e| e.fk.get_mut(col_ix))
+                        .and_then(|f| f.as_mut())
+                    else {
+                        return;
+                    };
+                    fk.loading = false;
+                    match result {
+                        Ok(Ok(page)) => {
+                            let options = page
+                                .rows
+                                .iter()
+                                .filter_map(|row| {
+                                    let value = row.get(to_ix)?.edit_string();
+                                    let label = match label_ix.and_then(|i| row.get(i)) {
+                                        Some(l) => format!("{value} — {}", l.display()),
+                                        None => value.clone(),
+                                    };
+                                    Some((value.into(), label.into()))
+                                })
+                                .collect();
+                            fk.options = Arc::new(options);
+                        }
+                        Ok(Err(e)) => fk.error = Some(e.message().to_string()),
+                        Err(_) => {}
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -818,6 +956,38 @@ impl RecordsView {
                         .enumerate()
                         .map(|(i, c)| {
                             let locked = editor.locked.get(i).copied().unwrap_or(false);
+                            let fk = editor.fk.get(i).and_then(|f| f.as_ref());
+                            let fk_hint = fk.map(|f| {
+                                if f.error.is_some() {
+                                    format!("→ {} (unavailable)", f.target)
+                                } else {
+                                    format!("→ {}", f.target)
+                                }
+                            });
+                            let picker = fk.filter(|_| !locked).map(|f| {
+                                let options = f.options.clone();
+                                let input = editor.inputs[i].clone();
+                                Button::new(("fk-pick", i))
+                                    .ghost()
+                                    .icon(IconName::ChevronDown)
+                                    .loading(f.loading)
+                                    .disabled(f.loading || options.is_empty())
+                                    .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
+                                        let mut menu = menu.scrollable(true).max_h(px(320.));
+                                        for (value, label) in options.iter() {
+                                            let input = input.clone();
+                                            let value = value.clone();
+                                            menu = menu.item(PopupMenuItem::new(label.clone()).on_click(
+                                                move |_, window, cx| {
+                                                    input.update(cx, |s, cx| {
+                                                        s.set_value(value.clone(), window, cx)
+                                                    });
+                                                },
+                                            ));
+                                        }
+                                        menu
+                                    })
+                            });
                             h_flex()
                                 .id(("f", i))
                                 .items_center()
@@ -864,7 +1034,17 @@ impl RecordsView {
                                                 .min_w_0()
                                                 .truncate()
                                                 .child(c.type_.clone()),
-                                        ),
+                                        )
+                                        .when_some(fk_hint, |t, hint| {
+                                            t.child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(p.primary)
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(hint),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -877,6 +1057,7 @@ impl RecordsView {
                                                 .disabled(locked),
                                         ),
                                 )
+                                .when_some(picker, |t, picker| t.child(picker))
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -1643,36 +1824,74 @@ fn sep(p: &theme::Palette) -> gpui::Div {
         .bg(p.toolbar_border)
 }
 
-/// The "no open data view" placeholder shown when all tabs are closed.
-pub fn empty_state(cx: &App) -> impl IntoElement {
-    let p = theme::palette(cx);
-    div()
-        .id("empty")
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .child(
-            v_flex()
-                .items_center()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .text_size(px(46.))
-                        .text_color(p.muted_fg.opacity(0.7))
-                        .child("▦"),
-                )
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .text_color(p.foreground)
-                        .child("No open data view"),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.5))
-                        .text_color(p.muted_fg)
-                        .child("Select a table in the explorer on the left to open its records here."),
-                ),
-        )
+impl crate::ui::app::DataBridge {
+    /// The "no open data view" placeholder shown when all tabs are closed.
+    /// Also the way into an empty database: "New SQL query" and, for SQL
+    /// stores, "New table" (a seeded `CREATE TABLE` tab).
+    pub fn render_empty_state(
+        &mut self,
+        cx: &mut Context<crate::ui::app::DataBridge>,
+    ) -> impl IntoElement {
+        let p = theme::palette(cx);
+        let new_table_schema = self
+            .can_create_tables()
+            .then(|| self.default_schema())
+            .flatten();
+        div()
+            .id("empty")
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .text_size(px(46.))
+                            .text_color(p.muted_fg.opacity(0.7))
+                            .child("▦"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .text_color(p.foreground)
+                            .child("No open data view"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .text_color(p.muted_fg)
+                            .child("Select a table in the explorer on the left to open its records here."),
+                    )
+                    .child(
+                        h_flex()
+                            .mt_2()
+                            .gap_2()
+                            .when_some(new_table_schema, |this, schema| {
+                                this.child(
+                                    Button::new("empty-new-table")
+                                        .primary()
+                                        .small()
+                                        .icon(IconName::Plus)
+                                        .label("New table")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_create_table(&schema, window, cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("empty-new-query")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::SquareTerminal)
+                                    .label("New SQL query")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_query_tab(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
 }

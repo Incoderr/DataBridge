@@ -126,6 +126,8 @@ pub trait DbSession: Send + Sync {
     async fn update_row(&self, table: TableRef, pk: Vec<CellChange>, changes: Vec<CellChange>) -> Result<u64, DbError>;
     async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError>;
     async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError>;
+    // tree context menu: DROP TABLE / DROP VIEW (`NodeKind::drop_keyword`).
+    async fn drop_table(&self, table: TableRef) -> Result<(), DbError>;
 }
 ```
 
@@ -147,98 +149,76 @@ cloneable `SessionHandle` (all calls go through `core::registry::open`).
 default = ["postgres", "mysql", "sqlite"]
 ```
 
-`mongo` and `redis` are declared only when implemented (stage 4). The mock is
+`mongo` and `redis` cargo features are declared only when implemented
+(stage 4); their `DbType` variants already exist as stubs (see below). The mock is
 always available; `cargo check --no-default-features` must always pass
 (mock-only demo build).
 
 ## Current state (read this first)
 
-The UI is complete and polished **on top of the session contract, served by
-the mock driver**:
+Module-level detail lives in each file's `//!` doc — this section keeps
+only what works, what is a stub, and the non-obvious behaviors.
 
-- `core/model.rs` — domain types (`DbConnection` with an optional `url` for
-  URL-mode connections, `Arc<TableMeta>`, `Page`, `Ping`, `TableRef`,
-  `SchemaMeta`) plus the `status_line` / `group_digits` helpers and
-  `parse_db_url` (display-oriented URL parsing; the drivers re-parse URLs
-  natively with sqlx, preserving query options like `sslmode`).
-- `core/session.rs` — `DbSession` trait + cloneable `SessionHandle`.
-- `core/runtime.rs` — the tokio sidecar (`init` in `main`, `spawn` + oneshot).
-- `core/registry.rs` — `open(conn) -> SessionHandle`; dispatches the sqlx trio
-  behind cargo features, mock for everything else. `--mock` (via `init` /
-  `is_mock`) forces the mock driver for every connection — the built-in demo
-  mode that needs no live database.
-- `drivers/` — `postgres.rs` / `mysql.rs` / `sqlite.rs`: lazily-connected pools
-  (`ping` = connect + `SELECT 1`), batched per-schema introspection, `COUNT(*)` +
-  paged `SELECT *` with dialect-quoted identifiers; row counts are not
-  introspected (real totals arrive on the first page load). `drivers/util.rs`
-  holds the shared `dyn_cell!` decode ladder (runtime-typed cells → `Value`).
-  The wizard's Test Connection is a real `SessionHandle::ping()`.
-- `core/mock.rs` — `MockSession: DbSession`: deterministic rows (same
-  (connection, schema, table, offset, limit) → same rows, md5-seeded),
-  simulated latency slept on the tokio side; `--mock` runs the whole app on
-  it and seeds the wizard's connection list (`seed_connections`).
-- `core/storage.rs` — Stage-3 recent-connections store. `connections.json`
-  in the platform config dir (newest first, capped at 20); secrets —
-  fields-mode passwords and full URL-mode URLs — go to the OS keyring
-  (service "DataBridge", entry per connection id; the JSON keeps only a
-  password-stripped URL copy for display). Loaded into the wizard on
-  startup, remembered on every successful connect; best-effort everywhere —
-  a missing keyring just means typing the password again.
-- `ui/workspace.rs` — records grid (IDE-scale: `Size::Large` rows, cell font
-  13.5) with pagination (PAGE = 50); the page loads through
-  `SessionHandle::fetch_rows` with the stale-guarded `load_id`. Tabs are
-  `TabKind::Records(Arc<TableMeta>) | TabKind::Diagram`; `app.rs` holds the
-  active one in a `WorkspaceView` enum (records grid or diagram).
-- `ui/diagram.rs` — the schema relationships view (Supabase-style ERD):
-  draggable table cards with colored types and PK/FK badges, FK edges as
-  bezier paths (`PathBuilder` + `window.paint_path`), background-pan,
-  wheel-zoom anchored at the cursor, fit-to-view, relations loaded via
-  `SessionHandle::list_relations` (stale-guarded). Opened from the tree's
-  per-schema "Schema diagram" row.
-- `ui/app.rs` — root entity `DataBridge`: connection list, active connection,
-  `session` + `schemas` (loaded asynchronously in `on_connected`),
-  tab management, wizard state machine (`Phase::Choose → Form → Testing`).
-  Renders the shared full-window shell (`window-root`) that wraps both the
-  wizard and the explorer: one drop zone, the drag-over hint overlay and
-  the settings dialog on top.
-- `ui/connect.rs` — the wizard is also the landing zone for SQLite files:
-  OS drag & drop anywhere on the window connects immediately (the drop
-  zone lives on the shared `window-root` shell in `app.rs`; a drag-over
-  overlay plus standing hints — Choose phase and the file field — show
-  that it's allowed); the file-path field has a Browse… button (native
-  OS picker via `rfd`, run async off the UI thread). Dropped/picked
-  files become regular SQLite drafts, so `--mock` routes them to the
-  demo tree and the Stage-3 store remembers them like any other
-  connection.
-- `ui/sidebar.rs` / `ui/nav_tree.rs` — render blocks of `DataBridge`.
-- `ui/query.rs` — the SQL editor tab (Stage 5): a `QueryView` entity with a
-  tree-sitter-highlighted `InputState::code_editor("sql")` (needs the
-  `tree-sitter-languages` feature of gpui-component), a Run button
-  (stale-guarded by `run_id`), a dynamic results grid and a status line
-  (rows / affected / elapsed). Opened from the tab bar's terminal icon or
-  the records toolbar's SQL button; multiple tabs per connection.
-- `ui/workspace.rs` (records grid) — the simplified record editor on top of
-  the grid: a modal (`render_editor`) with one typed input per column
-  (`parse_cell` validates by `ColumnKind`; PK/binary locked on update),
-  driving `insert_row` / `update_row` (changed columns only) /
-  `delete_row` through the session, stale-guarded by `save_id`. Toolbar:
-  plus / pencil / trash icons after the run/stop/reload group.
-- `ui/theme.rs` — near-black dark + clean light palettes (UI Bakery / DrawSQL
-  inspired), sans chrome + mono data, radius/shadow tuned in `apply()`.
-  Use `theme::palette(cx)`; do not hardcode colors except `DbType::brand_color()`
-  (simple-icons brand colors) and grid type tokens (`kind_color`).
-- `ui/settings.rs` — UI scale only, process-global, not persisted.
-- `ui/assets.rs` — `AssetSource`; brand glyphs at `brand/*.svg`, extra lucide icons at
-  `icons/*.svg`, then falls back to `gpui_component_assets`.
+**Works for real (sqlx):** PostgreSQL, MySQL, MariaDB (served by the MySQL
+driver — same wire protocol, `mariadb://` URLs accepted), SQLite. TLS via
+rustls (`sslmode`/`ssl-mode` default to *prefer*). Lazy pools; `ping` =
+connect + `SELECT 1` (the wizard's Test Connection); batched introspection
+(SQLite: one `pragma_table_info` join); `COUNT(*)` + paged `SELECT *` with
+dialect-quoted identifiers; row counts arrive with the first page.
 
-### Known deferred items (fix in stages 3–4)
+**Stubs:** MongoDB, Redis, ClickHouse, Cassandra, ScyllaDB exist in
+`DbType` (brand icons, ports, URL placeholders) but have no driver.
+`registry::open` returns a "not supported in this build" error for them
+(and for drivers compiled out) — never the mock: fake demo tables must not
+pass for the user's database. `registry::is_supported` mirrors that: the
+wizard's Choose screen lists every type and dims the unsupported ones. Only `--mock` serves every type from
+`core/mock.rs` (deterministic md5-seeded rows, simulated latency, seeded
+wizard list).
 
-- sqlx is built without TLS features — plaintext connections (local/trusted
-  networks). Add `tls-rustls` to the sqlx features when remote TLS hosts
-  appear.
+**Behaviors worth knowing:**
+- Recents (`core/storage.rs`): `connections.json` in the platform config
+  dir, newest first, capped at 20; passwords / full URLs only in the OS
+  keyring (service "DataBridge"). Deduplicated by `model::TargetKey` —
+  the same target under a new id replaces the old entry and its secrets;
+  old duplicates self-heal on load.
+- Wizard (`ui/connect.rs`): SQLite files connect via OS drag & drop
+  (drop zone on the shared `window-root` shell in `app.rs`), Browse…
+  (`rfd`), or New… (save dialog → empty file → connect; existing files
+  are never truncated).
+- Tabs: `TabKind::{Records, Diagram, Sql(seed)}`. Records/diagram views
+  remount on every switch (web-app parity); SQL tabs are cached in
+  `DataBridge::query_views`, so text and results survive switching.
+- SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
+  `run_id`. `model::is_select_like` (first keyword after comments, plus
+  DML `RETURNING`) picks fetch vs execute. "New table" (tree row per
+  schema + the empty workspace) seeds a dialect `CREATE TABLE`; DDL runs
+  reload the tree via `DataBridge::reload_schemas` (stale-guarded by
+  `schemas_id`).
+- Tree context menu (`ui/nav_tree.rs`, gpui-component `context_menu`):
+  Open / Drop table… on tables and views → confirmation dialog
+  (`render_drop_dialog`, stale-guarded by `drop_id`); success closes the
+  object's tabs and reloads the tree. The mock records drops per session.
+- Record editor (`ui/workspace.rs`, `render_editor`): typed inputs per
+  column (`parse_cell`), `insert_row` / `update_row` (changed columns
+  only) / `delete_row`, stale-guarded by `save_id`. FK columns get a
+  "→ target" hint and a picker (up to 200 referenced values, labelled by
+  the target's first text column) via `list_relations` + `fetch_rows`,
+  stale-guarded by `fk_gen`.
+- SQLite `auto`: only the rowid alias counts — the sole PK column
+  declared exactly `INTEGER` in a rowid table (`mark_rowid_alias`);
+  `INT PRIMARY KEY` must be supplied.
+- Diagram (`ui/diagram.rs`): Supabase-style ERD, bezier FK edges,
+  pan/zoom/fit, relations via `list_relations`.
+- Theme (`ui/theme.rs`): use `theme::palette(cx)`; no hardcoded colors
+  except `DbType::brand_color()` and grid type tokens (`kind_color`).
+  Brand glyphs must be registered in `ui/assets.rs` (`brand/*.svg`).
+
+### Known deferred items
+
 - Settings (UI scale) are not persisted.
 - The schema tree loads eagerly via `list_schemas`; per-schema lazy loading
   (`list_tables`) arrives if eager trees prove slow on real databases.
+- No SSH tunnels; no query cancellation / Ctrl+Enter yet.
 
 ## Roadmap
 

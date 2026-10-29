@@ -21,10 +21,12 @@ gpui-component-assets = "0.5.1"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
-sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "chrono", "json", "uuid"] }
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "tls-rustls", "chrono", "json", "uuid"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-keyring = "3"
+# The v3 keyring needs an explicit platform store — without a feature
+# every Entry::new() fails and all secrets are silently lost.
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 rfd = "0.15"

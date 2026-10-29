@@ -23,6 +23,24 @@ pub fn is_mock() -> bool {
     MOCK_MODE.get().copied().unwrap_or(false)
 }
 
+/// Whether `open` can serve this type: always in `--mock`, otherwise only
+/// when its driver is compiled in. The wizard dims the rest.
+pub fn is_supported(t: DbType) -> bool {
+    if is_mock() {
+        return true;
+    }
+    match t {
+        DbType::PostgreSql => cfg!(feature = "postgres"),
+        DbType::MySql | DbType::MariaDb => cfg!(feature = "mysql"),
+        DbType::Sqlite => cfg!(feature = "sqlite"),
+        DbType::MongoDb
+        | DbType::Redis
+        | DbType::ClickHouse
+        | DbType::Cassandra
+        | DbType::ScyllaDb => false,
+    }
+}
+
 /// Open a session for a connection. Cheap: real pools connect lazily on
 /// the first session call (the wizard's Test Connection is that call).
 pub fn open(conn: &DbConnection) -> Result<SessionHandle, DbError> {
@@ -33,13 +51,23 @@ pub fn open(conn: &DbConnection) -> Result<SessionHandle, DbError> {
         match conn.db_type {
             #[cfg(feature = "postgres")]
             DbType::PostgreSql => Arc::new(crate::drivers::postgres::PostgresSession::new(conn)),
+            // MariaDB speaks the MySQL wire protocol (and sqlx accepts
+            // `mariadb://` URLs), so the MySQL driver serves both.
             #[cfg(feature = "mysql")]
-            DbType::MySql => Arc::new(crate::drivers::mysql::MySqlSession::new(conn)),
+            DbType::MySql | DbType::MariaDb => {
+                Arc::new(crate::drivers::mysql::MySqlSession::new(conn))
+            }
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => Arc::new(crate::drivers::sqlite::SqliteSession::new(conn)),
-            // MongoDB and Redis land in Stage 4; anything unhandled stays
-            // on the deterministic mock.
-            _ => Arc::new(MockSession::new(conn)),
+            // No driver for this type (Stage 4 types, or a build without
+            // the feature): fail loudly. Falling back to the mock would show
+            // fake demo tables as if they were the user's database.
+            t => {
+                return Err(DbError::new(format!(
+                    "{} is not supported in this build yet — run with --mock for a demo.",
+                    t.label()
+                )));
+            }
         }
     };
     Ok(SessionHandle::new(session))

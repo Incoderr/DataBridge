@@ -1,7 +1,8 @@
 //! Connection wizard (splash + dialog). Port of the web app's
 //! `connectDialog.tsx`. Also the landing zone for SQLite files: OS
 //! drag & drop (`on_drop::<ExternalPaths>`) and the native file picker
-//! (rfd) both end up in `open_sqlite_file`.
+//! (rfd) both end up in `open_sqlite_file`. New SQLite databases are
+//! created from a native save dialog (`create_sqlite_file`).
 
 use std::path::Path;
 
@@ -129,13 +130,87 @@ impl DataBridge {
 
     fn wizard_choose(&mut self, cx: &mut Context<Self>) -> Div {
         let p = theme::palette(cx);
+        // Every known type; ones without a driver in this build are shown
+        // dimmed and inert (they connect only in `--mock`).
         let types = [
             DbType::PostgreSql,
             DbType::MySql,
+            DbType::MariaDb,
             DbType::Sqlite,
             DbType::MongoDb,
             DbType::Redis,
+            DbType::ClickHouse,
+            DbType::Cassandra,
+            DbType::ScyllaDb,
         ];
+        const PER_ROW: usize = 5;
+        let card = |i: usize, t: DbType, cx: &mut Context<Self>| {
+            let supported = registry::is_supported(t);
+            div()
+                .id(("type", i))
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(6.))
+                .p_3()
+                .border_1()
+                .border_color(p.border)
+                .rounded(px(8.))
+                .child(
+                    svg()
+                        .path(t.brand_icon())
+                        .size(px(26.))
+                        .flex_none()
+                        .text_color(rgb(t.brand_color())),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(14.))
+                        .text_color(p.foreground)
+                        .child(t.label()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(p.muted_fg)
+                        .child(if !supported {
+                            "coming soon".to_string()
+                        } else if t.default_port() > 0 {
+                            format!("port {}", t.default_port())
+                        } else {
+                            "embedded file".to_string()
+                        }),
+                )
+                .when(!supported, |this| this.opacity(0.4).cursor_not_allowed())
+                .when(supported, |this| {
+                    this.cursor_pointer()
+                        .hover(move |s| s.border_color(p.primary.opacity(0.7)).bg(p.accent))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_type(t, window, cx);
+                        }))
+                })
+        };
+        let rows: Vec<Div> = types
+            .chunks(PER_ROW)
+            .enumerate()
+            .map(|(r, chunk)| {
+                let mut row = h_flex().gap_2();
+                for (j, t) in chunk.iter().enumerate() {
+                    row = row.child(card(r * PER_ROW + j, *t, cx));
+                }
+                // Pad the last row so its cards keep the same width.
+                for _ in chunk.len()..PER_ROW {
+                    row = row.child(div().flex_1().min_w_0());
+                }
+                row
+            })
+            .collect();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -152,49 +227,7 @@ impl DataBridge {
                             .text_color(p.muted_fg)
                             .child("Database type"),
                     )
-                    .child(
-                        h_flex().gap_2().children(types.iter().enumerate().map(|(i, t)| {
-                            let db_type = *t;
-                            div()
-                                .id(("type", i))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .items_start()
-                                .gap(px(6.))
-                                .p_3()
-                                .border_1()
-                                .border_color(p.border)
-                                .rounded(px(8.))
-                                .cursor_pointer()
-                                .hover(move |s| s.border_color(p.primary.opacity(0.7)).bg(p.accent))
-                                .child(
-                                    svg()
-                                        .path(t.brand_icon())
-                                        .size(px(26.))
-                                        .flex_none()
-                                        .text_color(rgb(t.brand_color())),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .text_color(p.foreground)
-                                        .child(t.label()),
-                                )
-                                .child(
-                                    div().text_size(px(12.)).text_color(p.muted_fg).child(
-                                        if t.default_port() > 0 {
-                                            format!("port {}", t.default_port())
-                                        } else {
-                                            "embedded file".to_string()
-                                        },
-                                    ),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.pick_type(db_type, window, cx);
-                                }))
-                        })),
-                    )
+                    .children(rows)
                     // Standing hint that drag & drop works, too.
                     .child(
                         h_flex()
@@ -209,12 +242,26 @@ impl DataBridge {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(p.muted_fg)
-                                    .child("…or drag & drop a SQLite file onto this window."),
+                                    .child("…or drag & drop a SQLite file onto this window, or"),
+                            )
+                            .child(
+                                div()
+                                    .id("create-sqlite")
+                                    .text_size(px(12.))
+                                    .text_color(p.primary)
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .child("create a new SQLite database")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_sqlite_file(window, cx);
+                                    })),
                             ),
                     ),
             )
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_h_0()
                     .gap_2()
                     .child(
                         div()
@@ -224,6 +271,10 @@ impl DataBridge {
                     )
                     .child(
                         v_flex()
+                            .id("existing-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
                             .gap(px(6.))
                             .when(self.connections.is_empty(), |this| {
                                 this.child(
@@ -637,6 +688,7 @@ impl DataBridge {
                 .url
                 .update(cx, |s, cx| s.set_value(url.clone(), window, cx));
         }
+        self.wizard.draft = draft;
         self.wizard.chosen_existing = Some(id.to_string());
         self.wizard.error = None;
         self.wizard.phase = Phase::Form;
@@ -797,6 +849,61 @@ impl DataBridge {
         .detach();
     }
 
+    /// "Create a new SQLite database": native save dialog, then an empty
+    /// file at the picked path — a zero-byte file is a valid, empty SQLite
+    /// database (the header is written on the first write) — and the usual
+    /// `open_sqlite_file` connect. Existing files are never truncated.
+    pub fn create_sqlite_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wizard.testing {
+            return; // a connect is already in flight
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("SQLite database", &["db", "sqlite", "sqlite3", "db3"])
+                .set_title("Create SQLite database")
+                .set_file_name("database.db")
+                .save_file()
+                .await;
+            let Some(file) = file else {
+                return; // cancelled
+            };
+            let mut path = file.path().to_path_buf();
+            if path.extension().is_none() {
+                path.set_extension("db");
+            }
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            cx.update(|window, cx| {
+                this.update(cx, |this, cx| match created {
+                    Ok(_) => this.open_sqlite_file(&path, window, cx),
+                    Err(e) => {
+                        // Errors render in the form only: land on a SQLite one.
+                        if this.wizard.phase != Phase::Form
+                            || this.wizard.draft.db_type != DbType::Sqlite
+                        {
+                            this.wizard.draft = Draft::new(DbType::Sqlite, window, cx);
+                            this.wizard.chosen_existing = None;
+                            this.wizard.phase = Phase::Form;
+                        }
+                        this.wizard.error = Some(if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!(
+                                "{} already exists — open it with Browse… instead.",
+                                path.display()
+                            )
+                        } else {
+                            format!("Could not create {}: {e}", path.display())
+                        });
+                        cx.notify();
+                    }
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn validate_draft(&self, cx: &App) -> Result<DbConnection, String> {
         let d = &self.wizard.draft;
         let val = |e: &gpui::Entity<gpui_component::input::InputState>| {
@@ -918,6 +1025,15 @@ fn file_field(
                 )
                 .child(div().flex_1())
                 .child(
+                    Button::new("new-sqlite")
+                        .ghost()
+                        .small()
+                        .label("New…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.create_sqlite_file(window, cx);
+                        })),
+                )
+                .child(
                     Button::new("browse-sqlite")
                         .ghost()
                         .small()
@@ -1007,6 +1123,10 @@ impl Draft {
             DbType::Sqlite => "sqlite:///path/to/file.db",
             DbType::MongoDb => "mongodb://user:password@localhost:27017/database",
             DbType::Redis => "redis://localhost:6379",
+            DbType::MariaDb => "mariadb://user:password@localhost:3306/database",
+            DbType::ClickHouse => "clickhouse://user:password@localhost:9000/database",
+            DbType::Cassandra => "cassandra://user:password@localhost:9042/keyspace",
+            DbType::ScyllaDb => "scylla://user:password@localhost:9042/keyspace",
         };
         url.update(cx, |s, cx| s.set_placeholder(url_placeholder, window, cx));
         let host = mk(host, window, cx);

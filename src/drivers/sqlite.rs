@@ -107,22 +107,42 @@ impl DbSession for SqliteSession {
 
     async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, DbError> {
         let pool = self.pool().await?;
-        let rels: Vec<(String, String)> = sqlx::query_as(
-            "SELECT name, type FROM sqlite_schema \
-             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' \
-             ORDER BY name",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| DbError::with_source("failed to list SQLite objects", e))?;
+        // One round trip for every object and its columns: the
+        // `pragma_table_info` table-valued function joined per object
+        // (instead of one `PRAGMA table_info` query per table).
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            i32,
+            Option<String>,
+            i32,
+        )> = sqlx::query_as(
+                "SELECT m.name, m.type, m.sql, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk \
+                 FROM sqlite_schema AS m, pragma_table_info(m.name) AS p \
+                 WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' \
+                 ORDER BY m.name, p.cid",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DbError::with_source("failed to list SQLite objects", e))?;
 
         let mut tables: Vec<Arc<TableMeta>> = Vec::new();
         let mut views: Vec<Arc<TableMeta>> = Vec::new();
-        for (name, ty) in rels {
-            let columns = sqlite_columns(pool, &name).await?;
-            let is_view = ty == "view";
+        // (name, is_view, rowid table, columns) of the object being collected.
+        let mut current: Option<(String, bool, bool, Vec<ColumnMeta>)> = None;
+        let mut flush = |obj: Option<(String, bool, bool, Vec<ColumnMeta>)>| {
+            let Some((name, is_view, has_rowid, mut columns)) = obj else {
+                return;
+            };
+            if !is_view && has_rowid {
+                mark_rowid_alias(&mut columns);
+            }
             let meta = Arc::new(TableMeta {
-                name: name.clone(),
+                name,
                 schema: "main".into(),
                 kind: if is_view { NodeKind::View } else { NodeKind::Table },
                 row_count: 0,
@@ -133,7 +153,21 @@ impl DbSession for SqliteSession {
             } else {
                 tables.push(meta);
             }
+        };
+        for (obj, ty, sql, col, declared, notnull, dflt, pk) in rows {
+            if current.as_ref().is_none_or(|(name, ..)| name != &obj) {
+                flush(current.take());
+                let has_rowid = !sql
+                    .unwrap_or_default()
+                    .to_ascii_uppercase()
+                    .contains("WITHOUT ROWID");
+                current = Some((obj, ty == "view", has_rowid, Vec::new()));
+            }
+            if let Some((.., columns)) = current.as_mut() {
+                columns.push(column_meta(col, declared, notnull, dflt, pk));
+            }
         }
+        flush(current.take());
         Ok(vec![SchemaMeta {
             name: "main".into(),
             tables,
@@ -147,48 +181,31 @@ impl DbSession for SqliteSession {
         if schema != "main" {
             return Ok(Vec::new());
         }
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_schema \
-             WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
+        // One round trip: `pragma_foreign_key_list` joined per table. A bare
+        // `REFERENCES t` (no column) has a NULL `to` — it means t's primary
+        // key, resolved here with a correlated `pragma_table_info`.
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT m.name, f.\"table\", f.\"from\", \
+                    COALESCE(f.\"to\", (SELECT p.name FROM pragma_table_info(f.\"table\") AS p \
+                                         WHERE p.pk = 1)) \
+             FROM sqlite_schema AS m, pragma_foreign_key_list(m.name) AS f \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             ORDER BY m.name, f.id, f.seq",
         )
         .fetch_all(pool)
         .await
-        .map_err(|e| DbError::with_source("failed to list SQLite objects", e))?;
-        let mut out = Vec::new();
-        for t in tables {
-            // PRAGMA takes no bound parameters: the table name comes from
-            // our own introspection and is quoted with embedded quotes doubled.
-            let rows = sqlx::query(&format!(
-                "PRAGMA foreign_key_list({})",
-                sqlite_ident(&t)
-            ))
-            .fetch_all(pool)
-            .await
-            .map_err(|e| {
-                DbError::with_source(format!("failed to read foreign keys of {t}"), e)
-            })?;
-            for row in rows {
-                // columns: id, seq, table, from, to, on_update, on_delete, match
-                let to_table: String = row
-                    .try_get(2)
-                    .map_err(|e| DbError::with_source(format!("bad FK row in {t}"), e))?;
-                let from_col: String = row
-                    .try_get(3)
-                    .map_err(|e| DbError::with_source(format!("bad FK row in {t}"), e))?;
-                let to_col: Option<String> = row
-                    .try_get(4)
-                    .map_err(|e| DbError::with_source(format!("bad FK row in {t}"), e))?;
-                if let Some(to_col) = to_col {
-                    out.push(Relation {
-                        from_table: t.clone(),
-                        from_column: from_col,
-                        to_table,
-                        to_column: to_col,
-                    });
-                }
-            }
-        }
-        Ok(out)
+        .map_err(|e| DbError::with_source("failed to read SQLite foreign keys", e))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(from_table, to_table, from_column, to_column)| {
+                Some(Relation {
+                    from_table,
+                    from_column,
+                    to_table,
+                    to_column: to_column?,
+                })
+            })
+            .collect())
     }
 
     async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
@@ -355,53 +372,83 @@ impl DbSession for SqliteSession {
             .map_err(|e| DbError::with_source("failed to delete the row", e))?;
         Ok(res.rows_affected())
     }
+
+    async fn drop_table(&self, table: TableRef) -> Result<(), DbError> {
+        let Some(keyword) = table.kind.drop_keyword() else {
+            return Err(DbError::new(format!("{} cannot be dropped from here", table.name)));
+        };
+        let pool = self.pool().await?;
+        let sql = format!("DROP {keyword} {}", sqlite_ident(&table.name));
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source(format!("failed to drop {}", table.name), e))?;
+        Ok(())
+    }
 }
 
 /// `PRAGMA table_info` per table: cid, name, type, notnull, dflt_value, pk.
-async fn sqlite_columns(pool: &SqlitePool, table: &str) -> Result<Vec<ColumnMeta>, DbError> {
-    let rows = sqlx::query(&format!(
-        "PRAGMA table_info({})",
-        sqlite_ident(table)
-    ))
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to read columns of {table}"), e))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let name: String = row
-            .try_get(1)
-            .map_err(|e| DbError::with_source(format!("bad column name in {table}"), e))?;
-        let declared: Option<String> = row.try_get(2).map_err(|e| {
-            DbError::with_source(format!("bad column type in {table}"), e)
-        })?;
-        let notnull: i32 = row
-            .try_get(3)
-            .map_err(|e| DbError::with_source(format!("bad notnull flag in {table}"), e))?;
-        let pk: i32 = row
-            .try_get(5)
-            .map_err(|e| DbError::with_source(format!("bad pk flag in {table}"), e))?;
-        let dflt: Option<String> = row.try_get(4).map_err(|e| {
-            DbError::with_source(format!("bad default value in {table}"), e)
-        })?;
-        let declared = declared.unwrap_or_default();
-        let label = if declared.is_empty() {
-            "BLOB".to_string()
-        } else {
-            declared.clone()
-        };
-        let kind = sqlite_kind(&declared);
-        // `INTEGER PRIMARY KEY` is the rowid alias: SQLite generates it
-        // on insert when omitted.
-        let auto_increment = pk > 0 && kind == ColumnKind::Int;
-        out.push(ColumnMeta {
-            name,
-            type_: label,
-            nullable: notnull == 0,
-            primary_key: pk > 0,
-            auto_increment,
-            has_default: auto_increment || dflt.is_some(),
-            kind,
-        });
+/// One `pragma_table_info` row → [`ColumnMeta`].
+fn column_meta(
+    name: String,
+    declared: Option<String>,
+    notnull: i32,
+    dflt: Option<String>,
+    pk: i32,
+) -> ColumnMeta {
+    let declared = declared.unwrap_or_default();
+    let label = if declared.is_empty() {
+        "BLOB".to_string()
+    } else {
+        declared.clone()
+    };
+    let kind = sqlite_kind(&declared);
+    ColumnMeta {
+        name,
+        type_: label,
+        nullable: notnull == 0,
+        primary_key: pk > 0,
+        // Set afterwards by `mark_rowid_alias` — it needs the whole table.
+        auto_increment: false,
+        has_default: dflt.is_some(),
+        kind,
     }
-    Ok(out)
+}
+
+/// SQLite generates a value on insert only for the rowid alias: a table's
+/// *sole* primary-key column declared exactly `INTEGER` (not `INT`,
+/// `BIGINT`, …) in a rowid table. Every other `PRIMARY KEY` must be given.
+fn mark_rowid_alias(columns: &mut [ColumnMeta]) {
+    let mut pks = columns.iter_mut().filter(|c| c.primary_key);
+    let (Some(only), None) = (pks.next(), pks.next()) else {
+        return;
+    };
+    if only.type_.trim().eq_ignore_ascii_case("integer") {
+        only.auto_increment = true;
+        only.has_default = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, declared: &str, pk: i32) -> ColumnMeta {
+        column_meta(name.into(), Some(declared.into()), 1, None, pk)
+    }
+
+    #[test]
+    fn only_sole_integer_pk_is_rowid_alias() {
+        let mut int_pk = vec![col("CategoryID", "INT", 1), col("name", "TEXT", 0)];
+        mark_rowid_alias(&mut int_pk);
+        assert!(!int_pk[0].auto_increment);
+
+        let mut integer_pk = vec![col("id", "INTEGER", 1)];
+        mark_rowid_alias(&mut integer_pk);
+        assert!(integer_pk[0].auto_increment);
+
+        let mut composite = vec![col("a", "INTEGER", 1), col("b", "INTEGER", 2)];
+        mark_rowid_alias(&mut composite);
+        assert!(composite.iter().all(|c| !c.auto_increment));
+    }
 }

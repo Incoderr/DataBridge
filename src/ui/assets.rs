@@ -18,6 +18,22 @@ static BRAND_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../assets/icons/mongodb.svg"),
     ),
     ("brand/redis.svg", include_bytes!("../../assets/icons/redis.svg")),
+    (
+        "brand/mariadb.svg",
+        include_bytes!("../../assets/icons/mariadb.svg"),
+    ),
+    (
+        "brand/clickhouse.svg",
+        include_bytes!("../../assets/icons/clickhouse.svg"),
+    ),
+    (
+        "brand/apachecassandra.svg",
+        include_bytes!("../../assets/icons/apachecassandra.svg"),
+    ),
+    (
+        "brand/scylladb.svg",
+        include_bytes!("../../assets/icons/scylladb.svg"),
+    ),
 ];
 
 /// Extra Lucide glyphs missing from the bundled gpui-component icon set.

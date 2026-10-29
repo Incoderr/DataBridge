@@ -353,6 +353,13 @@ fn tree_for(conn: &DbConnection) -> Option<&'static ConnectionTree> {
             DbType::Sqlite => trees().iter().find(|t| t.connection_id == "sqlite-local"),
             DbType::MongoDb => trees().iter().find(|t| t.connection_id == "unauth-mongo"),
             DbType::Redis => trees().iter().find(|t| t.connection_id == "staging-pg"),
+            // Stage-4 placeholders borrow the closest demo tree.
+            DbType::MariaDb | DbType::ClickHouse => {
+                trees().iter().find(|t| t.connection_id == "mysql-analytics")
+            }
+            DbType::Cassandra | DbType::ScyllaDb => {
+                trees().iter().find(|t| t.connection_id == "unauth-mongo")
+            }
         })
 }
 
@@ -510,6 +517,8 @@ struct MockEdits {
     inserted: HashMap<String, Vec<Row>>,
     /// (table, row_id) marked deleted.
     deleted: HashSet<(String, i64)>,
+    /// (schema, name) of dropped tables / views — hidden from the tree.
+    dropped: HashSet<(String, String)>,
 }
 
 pub struct MockSession {
@@ -564,9 +573,16 @@ impl DbSession for MockSession {
     }
 
     async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, DbError> {
-        Ok(tree_for(&self.conn)
+        let mut schemas = tree_for(&self.conn)
             .map(|t| t.schemas.clone())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let edits = self.edits.lock().unwrap();
+        for sch in &mut schemas {
+            let gone = |t: &Arc<TableMeta>| edits.dropped.contains(&(sch.name.clone(), t.name.clone()));
+            sch.tables.retain(|t| !gone(t));
+            sch.views.retain(|t| !gone(t));
+        }
+        Ok(schemas)
     }
 
     async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, DbError> {
@@ -728,6 +744,25 @@ impl DbSession for MockSession {
         edits.updated.remove(&(key.clone(), row_id));
         edits.deleted.insert((key, row_id));
         Ok(1)
+    }
+
+    async fn drop_table(&self, table: TableRef) -> Result<(), DbError> {
+        if table.kind.drop_keyword().is_none()
+            || find_meta(&self.conn, &table.schema, &table.name).is_none()
+        {
+            return Err(DbError::new(format!(
+                "{}.{} cannot be dropped",
+                table.schema, table.name
+            )));
+        }
+        // Demo latency, like every other mock call.
+        tokio::time::sleep(Duration::from_millis(self.conn.latency_ms.max(40) as u64)).await;
+        self.edits
+            .lock()
+            .unwrap()
+            .dropped
+            .insert((table.schema, table.name));
+        Ok(())
     }
 }
 

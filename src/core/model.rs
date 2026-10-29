@@ -20,13 +20,19 @@ pub enum ConnectionStatus {
     Connecting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DbType {
     PostgreSql,
     MySql,
     Sqlite,
     MongoDb,
     Redis,
+    /// Stage-4 placeholders: listed on the wizard's Choose screen and
+    /// served by the deterministic mock until their drivers land.
+    MariaDb,
+    ClickHouse,
+    Cassandra,
+    ScyllaDb,
 }
 
 impl DbType {
@@ -37,6 +43,10 @@ impl DbType {
             DbType::Sqlite => "SQLite",
             DbType::MongoDb => "MongoDB",
             DbType::Redis => "Redis",
+            DbType::MariaDb => "MariaDB",
+            DbType::ClickHouse => "ClickHouse",
+            DbType::Cassandra => "Cassandra",
+            DbType::ScyllaDb => "ScyllaDB",
         }
     }
 
@@ -48,6 +58,10 @@ impl DbType {
             DbType::Sqlite => 0x003B57,
             DbType::MongoDb => 0x47A248,
             DbType::Redis => 0xFF4438,
+            DbType::MariaDb => 0x003545,
+            DbType::ClickHouse => 0xFFCC01,
+            DbType::Cassandra => 0x1287B1,
+            DbType::ScyllaDb => 0x6CD5E7,
         }
     }
 
@@ -59,6 +73,10 @@ impl DbType {
             DbType::Sqlite => "brand/sqlite.svg",
             DbType::MongoDb => "brand/mongodb.svg",
             DbType::Redis => "brand/redis.svg",
+            DbType::MariaDb => "brand/mariadb.svg",
+            DbType::ClickHouse => "brand/clickhouse.svg",
+            DbType::Cassandra => "brand/apachecassandra.svg",
+            DbType::ScyllaDb => "brand/scylladb.svg",
         }
     }
 
@@ -69,6 +87,11 @@ impl DbType {
             DbType::Sqlite => 0,
             DbType::MongoDb => 27017,
             DbType::Redis => 6379,
+            // ClickHouse native protocol; the HTTP interface is 8123.
+            DbType::MariaDb => 3306,
+            DbType::ClickHouse => 9000,
+            DbType::Cassandra => 9042,
+            DbType::ScyllaDb => 9042,
         }
     }
 }
@@ -91,6 +114,84 @@ pub struct DbConnection {
     pub status: ConnectionStatus,
     /// how many ms the (mock) ping took
     pub latency_ms: u32,
+}
+
+/// Connection-target identity: two recents entries describe the same
+/// connection when their targets match (ids, names and credentials are
+/// irrelevant). URL mode parses the URL — so the same server matches
+/// with or without a password — while structured-fields mode compares
+/// the fields. This is the dedupe key of the recents list: repeated
+/// connects of one server must reuse its entry, not stack duplicates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TargetKey {
+    pub db_type: DbType,
+    /// URL scheme when the connection was created in URL mode, e.g.
+    /// `postgres`; `None` for structured-fields connections.
+    pub scheme: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+}
+
+impl TargetKey {
+    /// Build from raw parts — either an in-memory [`DbConnection`] or
+    /// its stored JSON copy (whose `url` is password-stripped). A URL
+    /// overrides the structured fields; a port missing from the URL
+    /// falls back to the passed-in one (already normalized by the
+    /// wizard's validation).
+    pub fn build(
+        db_type: DbType,
+        url: Option<&str>,
+        host: &str,
+        port: u16,
+        database: &str,
+        user: &str,
+    ) -> Self {
+        let Some(url) = url else {
+            return Self {
+                db_type,
+                scheme: None,
+                host: host.into(),
+                port,
+                database: database.into(),
+                user: user.into(),
+            };
+        };
+        let scheme = url.split_once("://").map(|(s, _)| s.to_string());
+        match parse_db_url(url) {
+            Some(x) => Self {
+                db_type,
+                scheme,
+                host: x.host,
+                port: if x.port > 0 { x.port } else { port },
+                database: x.database,
+                user: x.user,
+            },
+            None => Self {
+                db_type,
+                scheme,
+                host: host.into(),
+                port,
+                database: database.into(),
+                user: user.into(),
+            },
+        }
+    }
+}
+
+impl DbConnection {
+    /// The dedupe key of this connection (see [`TargetKey`]).
+    pub fn target_key(&self) -> TargetKey {
+        TargetKey::build(
+            self.db_type,
+            self.url.as_deref(),
+            &self.host,
+            self.port,
+            &self.database,
+            &self.user,
+        )
+    }
 }
 
 /// Display-oriented parse of `scheme://[user[:password]@]host[:port][/db][?…]`.
@@ -149,6 +250,18 @@ pub enum NodeKind {
     View,
     Function,
     Procedure,
+}
+
+impl NodeKind {
+    /// The `DROP <keyword>` for objects the tree's context menu can drop;
+    /// `None` for everything else (routines stay out of reach).
+    pub fn drop_keyword(self) -> Option<&'static str> {
+        match self {
+            NodeKind::Table => Some("TABLE"),
+            NodeKind::View => Some("VIEW"),
+            _ => None,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -293,18 +406,40 @@ impl CellChange {
     }
 }
 
-/// First-keyword sniff for the query editor: SELECT-like statements go
+/// The statement's first keyword, lowercased — leading whitespace, `(`
+/// and SQL comments (`-- …`, `/* … */`) skipped. Empty when there is none.
+pub fn first_keyword(sql: &str) -> String {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    rest.chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Statement sniff for the query editor: row-returning statements go
 /// through the fetch path (result rows), everything else through the
-/// execute path (rows affected). Multi-statement strings are not
-/// supported by design — one editor run is one statement.
+/// execute path (rows affected). Row-returning = a reading first keyword,
+/// or a DML statement with a `RETURNING` clause. Multi-statement strings
+/// are not supported by design — one editor run is one statement.
 pub fn is_select_like(sql: &str) -> bool {
-    let head: String = sql
-        .trim_start()
-        .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
-        .to_ascii_lowercase();
-    ["select", "with", "show", "explain", "table"]
-        .iter()
-        .any(|kw| head.starts_with(kw))
+    match first_keyword(sql).as_str() {
+        "select" | "with" | "show" | "explain" | "table" | "values" | "pragma" | "describe"
+        | "desc" => true,
+        "insert" | "update" | "delete" | "replace" => sql
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|w| w.eq_ignore_ascii_case("returning")),
+        _ => false,
+    }
 }
 
 /// Parse the simplified editor's input for one column into a typed
@@ -402,4 +537,25 @@ pub fn group_digits(n: u64) -> String {
         out.push(*b as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_keyword_skips_comments_and_parens() {
+        assert_eq!(first_keyword("  -- note\n/* x */ (SELECT 1)"), "select");
+        assert_eq!(first_keyword("/* unterminated"), "");
+    }
+
+    #[test]
+    fn select_like_sniff() {
+        assert!(is_select_like("PRAGMA table_info(t)"));
+        assert!(is_select_like("VALUES (1), (2)"));
+        assert!(is_select_like("insert into t(a) values (1) RETURNING id"));
+        assert!(!is_select_like("insert into t(returning_flag) values (1)"));
+        assert!(!is_select_like("CREATE TABLE t (id int)"));
+        assert!(!is_select_like("tablespace_thing"));
+    }
 }

@@ -362,6 +362,19 @@ impl DbSession for PostgresSession {
             .map_err(|e| DbError::with_source("failed to delete the row", e))?;
         Ok(res.rows_affected())
     }
+
+    async fn drop_table(&self, table: TableRef) -> Result<(), DbError> {
+        let Some(keyword) = table.kind.drop_keyword() else {
+            return Err(DbError::new(format!("{} cannot be dropped from here", table.name)));
+        };
+        let pool = self.pool().await?;
+        let sql = format!("DROP {keyword} {}", pg_ident(&table.schema, &table.name));
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .map_err(|e| DbError::with_source(format!("failed to drop {}", table.name), e))?;
+        Ok(())
+    }
 }
 
 /// Introspect one schema: relations with batched columns and primary keys.
