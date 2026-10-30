@@ -1,23 +1,31 @@
 //! SQL editor tab (Stage 5): a syntax-highlighted code editor on top, the
 //! results grid below. One Run per statement — SELECT-like statements go
-//! through the fetch path, everything else reports affected rows.
+//! through the fetch path, everything else reports affected rows. The
+//! editor autocompletes tables, columns and keywords and shows the
+//! predicted next step as ghost text (`ui/completion.rs`, Tab accepts);
+//! Enter after `(` indents, Ctrl+wheel zooms the editor font.
+
+use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Div, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
-    WeakEntity, Window, div, px,
+    App, Context, DispatchPhase, Div, Entity, IntoElement, ParentElement, Render,
+    ScrollWheelEvent, Styled, Subscription, WeakEntity, Window, canvas, div, px, relative,
 };
 
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::Input;
-use gpui_component::input::InputState;
+use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{first_keyword, group_digits, DbConnection, QueryPage, Row};
 use crate::core::session::SessionHandle;
 use crate::ui::app::DataBridge;
-use crate::ui::theme;
+use crate::ui::completion::SqlCompletions;
+use crate::ui::{settings, theme};
+
+/// One indentation level in the SQL editor.
+const INDENT: &str = "    ";
 
 /// Rows kept in the result grid from one statement (like the web
 /// version's `QUERY_LIMIT`).
@@ -85,14 +93,14 @@ impl TableDelegate for QueryDelegate {
     ) -> impl IntoElement {
         let p = theme::palette(cx);
         if col_ix == 0 {
-            return div().text_size(px(11.)).text_color(p.muted_fg).child("#");
+            return div().text_size(theme::scaled(theme::TEXT_XS)).text_color(p.muted_fg).child("#");
         }
         let c_name = self.names[col_ix].clone();
         div()
             .w_full()
             .min_w_0()
             .truncate()
-            .text_size(px(11.))
+            .text_size(theme::scaled(theme::TEXT_XS))
             .font_family(theme::MONO_FONT)
             .text_color(p.muted_fg)
             .child(c_name)
@@ -109,7 +117,7 @@ impl TableDelegate for QueryDelegate {
         if col_ix == 0 {
             return div()
                 .font_family(theme::MONO_FONT)
-                .text_size(px(11.))
+                .text_size(theme::scaled(theme::TEXT_XS))
                 .text_color(p.muted_fg)
                 .child((row_ix + 1).to_string())
                 .into_any_element();
@@ -122,7 +130,7 @@ impl TableDelegate for QueryDelegate {
             .unwrap_or_else(|| "null".into());
         div()
             .font_family(theme::MONO_FONT)
-            .text_size(px(13.5))
+            .text_size(theme::scaled(theme::TEXT_MD))
             .text_color(p.muted_fg)
             .min_w_0()
             .truncate()
@@ -135,6 +143,8 @@ impl TableDelegate for QueryDelegate {
 
 /// What the last run produced — drives the status line.
 struct RunSummary {
+    /// The statement returned a result set (SELECT-like), even if empty.
+    has_columns: bool,
     rows: usize,
     affected: u64,
     truncated: bool,
@@ -155,6 +165,7 @@ pub struct QueryView {
     error: Option<String>,
     last: Option<RunSummary>,
     _obs: Option<Subscription>,
+    _enter: Subscription,
 }
 
 impl QueryView {
@@ -169,11 +180,27 @@ impl QueryView {
         let editor = cx.new(|cx| {
             let mut s = InputState::new(window, cx)
                 .code_editor("sql")
+                .tab_size(TabSize {
+                    tab_size: INDENT.len(),
+                    hard_tabs: false,
+                })
                 .placeholder("SELECT * FROM table_name LIMIT 50;");
             if let Some(seed) = seed {
                 s.set_value(seed, window, cx);
             }
+            // Attached after the seed: `set_value` fires the completion
+            // trigger, and the provider reads `DataBridge`, which is being
+            // updated while this view is created.
+            s.lsp.completion_provider = Some(Rc::new(SqlCompletions {
+                app: app.clone(),
+                dialect: conn.db_type,
+            }));
             s
+        });
+        let enter = cx.subscribe_in(&editor, window, |_, state, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                state.update(cx, |s, cx| indent_after_open_paren(s, window, cx));
+            }
         });
         Self {
             conn,
@@ -186,6 +213,7 @@ impl QueryView {
             error: None,
             last: None,
             _obs: None,
+            _enter: enter,
         }
     }
 
@@ -235,12 +263,20 @@ impl QueryView {
 
     fn apply_result(&mut self, page: QueryPage, window: &mut Window, cx: &mut Context<Self>) {
         self.last = Some(RunSummary {
+            has_columns: !page.columns.is_empty(),
             rows: page.rows.len(),
             affected: page.rows_affected,
             truncated: page.truncated,
             elapsed_ms: page.elapsed_ms,
         });
         self.error = None;
+        if page.columns.is_empty() {
+            // DDL / DML without RETURNING: the toolbar status is the whole
+            // result — no grid, the editor keeps the full height.
+            self.table = None;
+            self._obs = None;
+            return;
+        }
         let delegate = QueryDelegate::new(&page);
         let state = cx.new(|cx| {
             TableState::new(delegate, window, cx)
@@ -249,6 +285,7 @@ impl QueryView {
                 .col_resizable(true)
         });
         self._obs = Some(cx.observe(&state, |_, _, cx| cx.notify()));
+        settle_stripes(&state, window, cx);
         self.table = Some(state);
     }
 }
@@ -259,15 +296,10 @@ impl Render for QueryView {
 
         let status: String = match (&self.last, self.running) {
             (_, true) => "running…".into(),
-            (
-                Some(RunSummary {
-                    rows,
-                    affected,
-                    truncated,
-                    elapsed_ms,
-                }),
-                _,
-            ) if *affected > 0 => format!("{affected} row(s) affected · {elapsed_ms} ms"),
+            (Some(RunSummary { affected, elapsed_ms, .. }), _) if *affected > 0 => format!("{affected} row(s) affected · {elapsed_ms} ms"),
+            (Some(RunSummary { has_columns: false, elapsed_ms, .. }), _) => {
+                format!("statement executed · {elapsed_ms} ms")
+            }
             (Some(RunSummary { rows, truncated, elapsed_ms, .. }), _) => format!(
                 "{} rows{} · {elapsed_ms} ms",
                 group_digits(*rows as u64),
@@ -277,7 +309,7 @@ impl Render for QueryView {
         };
 
         let toolbar = h_flex()
-            .h(px(38.))
+            .h(theme::scaled(38.))
             .flex_none()
             .items_center()
             .gap_2()
@@ -297,7 +329,7 @@ impl Render for QueryView {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(if self.error.is_some() {
                         p.conn_err
                     } else {
@@ -312,7 +344,7 @@ impl Render for QueryView {
             .child(div().flex_1())
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme::scaled(theme::TEXT_XS))
                     .text_color(p.muted_fg)
                     .child(format!("limit {} rows", RESULT_LIMIT)),
             );
@@ -320,29 +352,59 @@ impl Render for QueryView {
         // The editor pane: fixed share of the view; the code-editor input
         // scrolls internally. The Input widget's own `h_full` (not Styled's
         // `.h`) is what makes a multi-line editor actually grow.
+        let has_results = self.table.is_some();
         let editor_pane = v_flex()
-            .h(px(220.))
-            .flex_none()
-            .min_h_0()
-            .border_b_1()
+            .flex_1()
+            .min_h(theme::scaled(120.))
+            .when(has_results, |this| this.border_b_1())
             .border_color(p.toolbar_border)
             .bg(p.card)
             .p_2()
-            .child(Input::new(&self.editor).h_full());
+            .relative()
+            .child(
+                Input::new(&self.editor)
+                    .h_full()
+                    .text_size(theme::scaled(settings::editor_font_size(cx)))
+                    .line_height(relative(1.45)),
+            )
+            // Ctrl+wheel zoom: captured before the editor scrolls itself.
+            // Pinned, last child (see AGENTS.md gotchas); no hitbox, so the
+            // editor keeps every other mouse event.
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    |bounds, _, window, _| {
+                        window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture
+                                || !e.modifiers.secondary()
+                                || !bounds.contains(&e.position)
+                            {
+                                return;
+                            }
+                            let dy = e.delta.pixel_delta(px(16.)).y;
+                            if dy != px(0.) {
+                                let step = if dy > px(0.) { 1. } else { -1. };
+                                settings::bump_editor_font_size(step, cx);
+                                window.refresh();
+                            }
+                            cx.stop_propagation();
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
 
-        let results: Div = match &self.table {
-            Some(state) => div()
+        // Only result sets get a grid; until then the editor is full height.
+        let results: Option<Div> = self.table.as_ref().map(|state| {
+            div()
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .child(Table::new(state).stripe(true).bordered(false).with_size(Size::Large)),
-            None => div().flex_1().min_h_0().flex().items_center().justify_center().child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(p.muted_fg)
-                    .child("Run a statement to see its results here."),
-            ),
-        };
+                .child(Table::new(state).stripe(true).bordered(false).with_size(Size::Large))
+        });
 
         v_flex()
             .flex_1()
@@ -350,7 +412,7 @@ impl Render for QueryView {
             .min_h_0()
             .child(toolbar)
             .child(editor_pane)
-            .child(results)
+            .children(results)
             .when_some(self.error.clone(), |this, e| {
                 this.child(
                     h_flex()
@@ -365,7 +427,7 @@ impl Render for QueryView {
                         .border_color(p.conn_err.opacity(0.4))
                         .bg(p.conn_err.opacity(0.1))
                         .text_color(p.conn_err)
-                        .text_size(px(13.))
+                        .text_size(theme::scaled(theme::TEXT_MD))
                         .child(
                             Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(15.))),
                         )
@@ -373,4 +435,56 @@ impl Render for QueryView {
                 )
             })
     }
+}
+
+/// JetBrains-style Enter after `(`: one level deeper than the opening
+/// line; when the cursor sits right before `)`, the paren moves to its own
+/// line at the outer level. Runs after the editor inserted the newline and
+/// the copied indent.
+fn indent_after_open_paren(s: &mut InputState, window: &mut Window, cx: &mut Context<InputState>) {
+    let text = s.value();
+    let cursor = s.cursor();
+    let Some(nl) = text[..cursor].rfind('\n') else {
+        return;
+    };
+    let base = text[nl + 1..cursor].to_string();
+    if !base.chars().all(|c| c == ' ' || c == '\t') {
+        return;
+    }
+    let prev_line_start = text[..nl].rfind('\n').map_or(0, |i| i + 1);
+    if !text[prev_line_start..nl].trim_end().ends_with('(') {
+        return;
+    }
+    let closes = text[cursor..].trim_start_matches([' ', '\t']).starts_with(')');
+    let pos = s.cursor_position();
+    if closes {
+        s.insert(format!("{INDENT}\n{base}"), window, cx);
+        s.set_cursor_position(
+            Position {
+                line: pos.line,
+                character: pos.character + INDENT.len() as u32,
+            },
+            window,
+            cx,
+        );
+    } else {
+        s.insert(INDENT, window, cx);
+    }
+}
+
+/// gpui-component sizes the stripe filler rows from the table's bounds of
+/// the *previous* frame, so a freshly created table paints without them
+/// until something else repaints it. Repaint once more two frames later —
+/// the first of them may still be the table's very first paint.
+pub fn settle_stripes<D: TableDelegate>(
+    state: &Entity<TableState<D>>,
+    window: &mut Window,
+    _: &mut App,
+) {
+    let state = state.downgrade();
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |_, cx| {
+            state.update(cx, |_, cx| cx.notify()).ok();
+        });
+    });
 }

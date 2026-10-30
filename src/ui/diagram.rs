@@ -370,7 +370,7 @@ impl Render for SchemaDiagram {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
                     .min_w_0()
                     .truncate()
@@ -385,7 +385,7 @@ impl Render for SchemaDiagram {
             .when_some(self.error.clone(), |this, e| {
                 this.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.conn_err)
                         .truncate()
                         .child(format!("— {e}")),
@@ -394,7 +394,7 @@ impl Render for SchemaDiagram {
             .when(self.loading, |this| {
                 this.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
                         .child("loading…"),
                 )
@@ -414,7 +414,7 @@ impl Render for SchemaDiagram {
                     .w(px(40.))
                     .flex_none()
                     .text_center()
-                    .text_size(px(12.))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
                     .child(format!("{:.0}%", self.zoom * 100.)),
             )

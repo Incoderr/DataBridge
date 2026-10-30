@@ -11,7 +11,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
@@ -63,6 +63,19 @@ pub struct RecordsDelegate {
     /// `TableState` on every render). The crate's own selection overlay paints
     /// OVER the cell contents, so we draw the solid background in `render_tr`.
     sel: Rc<Cell<Option<usize>>>,
+    /// The owning view — the row context menu dispatches into it.
+    view: Option<gpui::WeakEntity<RecordsView>>,
+}
+
+/// What a row context-menu entry asks `RecordsView` to do.
+#[derive(Clone, Copy)]
+enum RowAction {
+    Edit,
+    Duplicate,
+    Insert,
+    CopyTsv,
+    CopyJson,
+    Delete,
 }
 
 fn column_min_width(c: &ColumnMeta) -> f32 {
@@ -103,6 +116,7 @@ impl RecordsDelegate {
             page: 0,
             total,
             elapsed_ms: 0,
+            view: None,
             load_id: 0,
             sel,
         }
@@ -232,6 +246,57 @@ impl TableDelegate for RecordsDelegate {
             .when(self.sel.get() == Some(row_ix), |this| this.bg(p.table_selected))
     }
 
+    /// Right-click on a row: edit / duplicate / copy / delete. Writes that
+    /// need a stable identity (edit, delete) are disabled without a PK.
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let Some(view) = self.view.clone() else {
+            return menu;
+        };
+        if row_ix >= self.rows.len() {
+            return menu;
+        }
+        let has_pk = self.table.columns.iter().any(|c| c.primary_key);
+        let item = |label: &'static str, icon: Icon, enabled: bool, action: RowAction| {
+            let view = view.clone();
+            PopupMenuItem::new(label)
+                .icon(icon)
+                .disabled(!enabled)
+                .on_click(move |_, window, cx| {
+                    view.update(cx, |v, cx| v.row_action(row_ix, action, window, cx))
+                        .ok();
+                })
+        };
+        menu.item(item(
+            "Edit row…",
+            Icon::empty().path("icons/pencil.svg"),
+            has_pk,
+            RowAction::Edit,
+        ))
+        .item(item("Duplicate row…", Icon::new(IconName::Copy), true, RowAction::Duplicate))
+        .item(item("New row…", Icon::new(IconName::Plus), true, RowAction::Insert))
+        .separator()
+        .item(item("Copy row", Icon::new(IconName::Copy), true, RowAction::CopyTsv))
+        .item(item(
+            "Copy row as JSON",
+            Icon::new(IconName::Copy),
+            true,
+            RowAction::CopyJson,
+        ))
+        .separator()
+        .item(item(
+            "Delete row…",
+            Icon::new(IconName::Delete),
+            has_pk,
+            RowAction::Delete,
+        ))
+    }
+
     fn render_th(
         &mut self,
         col_ix: usize,
@@ -241,7 +306,7 @@ impl TableDelegate for RecordsDelegate {
         let p = theme::palette(cx);
         if col_ix == 0 {
             return div()
-                .text_size(px(11.))
+                .text_size(theme::scaled(theme::TEXT_XS))
                 .text_color(p.muted_fg)
                 .child("#")
                 .into_any_element();
@@ -262,7 +327,7 @@ impl TableDelegate for RecordsDelegate {
                     div()
                         .px(px(3.))
                         .rounded(px(2.))
-                        .text_size(px(10.))
+                        .text_size(theme::scaled(theme::TEXT_XS))
                         .bg(p.primary.opacity(0.2))
                         .text_color(p.primary)
                         .child("PK"),
@@ -272,7 +337,7 @@ impl TableDelegate for RecordsDelegate {
                 div()
                     .flex_shrink_0()
                     .font_family(theme::MONO_FONT)
-                    .text_size(px(10.5))
+                    .text_size(theme::scaled(theme::TEXT_XS))
                     .text_color(theme::kind_color(&c.kind, &p))
                     .child(c.type_.to_string()),
             )
@@ -292,7 +357,7 @@ impl TableDelegate for RecordsDelegate {
             let n = self.page * PAGE + row_ix as u64 + 1;
             return div()
                 .font_family(theme::MONO_FONT)
-                .text_size(px(11.))
+                .text_size(theme::scaled(theme::TEXT_XS))
                 .text_color(if selected { p.primary_fg } else { p.muted_fg })
                 .child(n.to_string())
                 .into_any_element();
@@ -312,7 +377,7 @@ fn cell_value(v: Option<&Value>, c: &ColumnMeta, p: &theme::Palette, selected: b
         div()
             .font_family(theme::MONO_FONT)
             .italic()
-            .text_size(px(13.5))
+            .text_size(theme::scaled(theme::TEXT_MD))
             .text_color(fg.opacity(0.55))
             .child(if c.nullable { "null" } else { "NULL" })
             .into_any_element()
@@ -339,7 +404,7 @@ fn cell_value(v: Option<&Value>, c: &ColumnMeta, p: &theme::Palette, selected: b
     };
     div()
         .font_family(theme::MONO_FONT)
-        .text_size(px(13.5))
+        .text_size(theme::scaled(theme::TEXT_MD))
         .text_color(if selected { p.primary_fg } else { color })
         .min_w_0()
         .truncate()
@@ -438,7 +503,12 @@ impl RecordsView {
                 .col_selectable(false)
                 .col_resizable(true)
         });
-        state.update(cx, |s, cx| s.delegate_mut().load(cx));
+        let view = cx.entity().downgrade();
+        state.update(cx, |s, cx| {
+            s.delegate_mut().view = Some(view);
+            s.delegate_mut().load(cx);
+        });
+        crate::ui::query::settle_stripes(&state, window, cx);
         let obs = cx.observe(&state, |_, _, cx| cx.notify());
         Self {
             conn,
@@ -505,6 +575,56 @@ impl RecordsView {
                 row.get(i).map(|v| CellChange::new(c.name.clone(), c.kind, v.clone()))
             })
             .collect()
+    }
+
+    /// A row context-menu entry (see `RecordsDelegate::context_menu`).
+    /// Edit / delete first select the clicked row — the editor works on
+    /// the selection, like the toolbar buttons.
+    fn row_action(
+        &mut self,
+        row_ix: usize,
+        action: RowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.state.read(cx).delegate().rows.get(row_ix).cloned() else {
+            return;
+        };
+        let editing = self.editor.is_some();
+        match action {
+            RowAction::Edit | RowAction::Delete if !editing => {
+                self.state.update(cx, |s, cx| s.set_selected_row(row_ix, cx));
+                if matches!(action, RowAction::Edit) {
+                    self.open_update(window, cx);
+                } else {
+                    self.open_delete(cx);
+                }
+            }
+            RowAction::Insert if !editing => self.open_insert(window, cx),
+            RowAction::Duplicate if !editing => {
+                self.open_insert(window, cx);
+                // Prefill everything but the identity: generated / key
+                // columns must get fresh values, binary is not editable.
+                if let Some(editor) = self.editor.as_ref() {
+                    for (i, c) in self.table.columns.iter().enumerate() {
+                        if c.auto_increment || c.primary_key || c.kind == ColumnKind::Binary {
+                            continue;
+                        }
+                        let raw = row.get(i).map(|v| v.edit_string()).unwrap_or_default();
+                        editor.inputs[i].update(cx, |s, cx| s.set_value(raw, window, cx));
+                    }
+                }
+            }
+            RowAction::CopyTsv => {
+                let line = row.iter().map(|v| v.edit_string()).collect::<Vec<_>>().join("\t");
+                cx.write_to_clipboard(ClipboardItem::new_string(line));
+            }
+            RowAction::CopyJson => {
+                let json = row_to_json(&self.table.columns, &row);
+                cx.write_to_clipboard(ClipboardItem::new_string(json));
+            }
+            _ => {} // a modal is already open
+        }
     }
 
     /// Open the simplified editor for a new row.
@@ -964,6 +1084,14 @@ impl RecordsView {
                                     format!("→ {}", f.target)
                                 }
                             });
+                            // A key whose type *says* AUTO_INCREMENT but that the
+                            // database does not generate (SQLite keeps MySQL's
+                            // keyword as part of the type name): explain why
+                            // the field is still required.
+                            let fake_auto = c.primary_key && !c.auto_increment && {
+                                let t = c.type_.to_ascii_lowercase();
+                                t.contains("auto_increment") || t.contains("autoincrement")
+                            };
                             let picker = fk.filter(|_| !locked).map(|f| {
                                 let options = f.options.clone();
                                 let input = editor.inputs[i].clone();
@@ -994,7 +1122,7 @@ impl RecordsView {
                                 .gap(px(10.))
                                 .child(
                                     v_flex()
-                                        .w(px(170.))
+                                        .w(theme::scaled(170.))
                                         .flex_none()
                                         .gap(px(2.))
                                         .child(
@@ -1003,7 +1131,7 @@ impl RecordsView {
                                                 .items_center()
                                                 .child(
                                                     div()
-                                                        .text_size(px(12.5))
+                                                        .text_size(theme::scaled(theme::TEXT_MD))
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(p.foreground)
                                                         .min_w_0()
@@ -1014,31 +1142,41 @@ impl RecordsView {
                                                     div()
                                                         .px(px(3.))
                                                         .rounded(px(2.))
-                                                        .text_size(px(10.))
+                                                        .text_size(theme::scaled(theme::TEXT_XS))
                                                         .bg(p.primary.opacity(0.2))
                                                         .text_color(p.primary)
                                                         .child("PK"),
                                                 ))
                                                 .when(c.nullable, |t| t.child(
                                                     div()
-                                                        .text_size(px(10.))
+                                                        .text_size(theme::scaled(theme::TEXT_XS))
                                                         .text_color(p.muted_fg)
                                                         .child("null?"),
                                                 )),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(theme::scaled(theme::TEXT_XS))
                                                 .font_family(theme::MONO_FONT)
                                                 .text_color(theme::kind_color(&c.kind, &p))
                                                 .min_w_0()
                                                 .truncate()
                                                 .child(c.type_.clone()),
                                         )
+                                        .when(fake_auto, |t| {
+                                            t.child(
+                                                div()
+                                                    .text_size(theme::scaled(theme::TEXT_XS))
+                                                    .text_color(p.conn_err)
+                                                    .child(
+                                                        "Not generated: SQLite ignores AUTO_INCREMENT                                                          — use INTEGER PRIMARY KEY",
+                                                    ),
+                                            )
+                                        })
                                         .when_some(fk_hint, |t, hint| {
                                             t.child(
                                                 div()
-                                                    .text_size(px(11.))
+                                                    .text_size(theme::scaled(theme::TEXT_XS))
                                                     .text_color(p.primary)
                                                     .min_w_0()
                                                     .truncate()
@@ -1053,7 +1191,7 @@ impl RecordsView {
                                         .child(
                                             Input::new(&editor.inputs[i])
                                                 .large()
-                                                .h(px(38.))
+                                                .h(theme::scaled(38.))
                                                 .disabled(locked),
                                         ),
                                 )
@@ -1087,7 +1225,7 @@ impl RecordsView {
             // Rough optical centering: pull the card back by half its size.
             .mt(px(-300.))
             .ml(px(-320.))
-            .w(px(640.))
+            .w(theme::scaled(640.))
             // BlockMouse: clicks over the card never count as backdrop
             // clicks — the card's hitbox cuts the backdrop out of the
             // hover set (see `Hitbox::is_hovered` / `hit_test`).
@@ -1109,14 +1247,14 @@ impl RecordsView {
                     .border_color(p.border)
                     .child(
                         div()
-                            .text_size(px(15.))
+                            .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.foreground)
                             .child(title),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child(sub),
                     ),
@@ -1136,7 +1274,7 @@ impl RecordsView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.5))
+                            .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.conn_err)
                             .truncate()
                             .when_some(editor.error.clone(), |t, e| t.child(e)),
@@ -1231,7 +1369,7 @@ fn icon_btn(
 ) -> Stateful<gpui::Div> {
     div()
         .id(id.into())
-        .size(px(size))
+        .size(theme::scaled(size))
         .flex()
         .flex_none()
         .items_center()
@@ -1277,7 +1415,7 @@ impl Render for RecordsView {
         let editor_open = self.editor.is_some();
 
         let toolbar = h_flex()
-            .h(px(36.))
+            .h(theme::scaled(36.))
             .flex_none()
             .items_center()
             .gap_1()
@@ -1433,7 +1571,7 @@ impl Render for RecordsView {
             ));
 
         let path_strip = h_flex()
-            .h(px(28.))
+            .h(theme::scaled(28.))
             .flex_none()
             .items_center()
             .gap(px(6.))
@@ -1441,7 +1579,7 @@ impl Render for RecordsView {
             .border_b_1()
             .border_color(p.toolbar_border)
             .bg(p.table_header)
-            .text_size(px(12.))
+            .text_size(theme::scaled(theme::TEXT_SM))
             .text_color(p.muted_fg)
             .child(self.conn.database.clone())
             .child("·")
@@ -1451,7 +1589,7 @@ impl Render for RecordsView {
             .child(
                 div()
                     .ml_2()
-                    .text_size(px(11.))
+                    .text_size(theme::scaled(theme::TEXT_XS))
                     .child(format!(
                         "({} columns, ~{} total)",
                         self.table.columns.len(),
@@ -1497,7 +1635,7 @@ impl Render for RecordsView {
                             let is_copied = copied_cell == Some(i);
                             h_flex()
                                 .id(("drow", i))
-                                .h(px(28.))
+                                .h(theme::scaled(28.))
                                 .flex_none()
                                 .items_center()
                                 .gap_2()
@@ -1507,7 +1645,7 @@ impl Render for RecordsView {
                                 .hover(move |s| s.bg(hover))
                                 .child(
                                     h_flex()
-                                        .w(px(210.))
+                                        .w(theme::scaled(260.))
                                         .flex_none()
                                         .items_center()
                                         .gap(px(6.))
@@ -1519,17 +1657,20 @@ impl Render for RecordsView {
                                                 div()
                                                     .px(px(3.))
                                                     .rounded(px(2.))
-                                                    .text_size(px(10.))
+                                                    .text_size(theme::scaled(theme::TEXT_XS))
                                                     .bg(p.primary.opacity(0.2))
                                                     .text_color(p.primary)
                                                     .child("PK"),
                                             )
                                         })
+                                        // The name wins the space: it keeps its
+                                        // width (up to a cap), the type label
+                                        // shrinks and truncates instead.
                                         .child(
                                             div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .text_size(px(13.5))
+                                                .flex_shrink_0()
+                                                .max_w(theme::scaled(150.))
+                                                .text_size(theme::scaled(theme::TEXT_MD))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(p.foreground)
                                                 .truncate()
@@ -1537,16 +1678,24 @@ impl Render for RecordsView {
                                         )
                                         .child(
                                             div()
-                                                .ml_auto()
-                                                .text_size(px(11.))
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .justify_end()
+                                                .text_size(theme::scaled(theme::TEXT_XS))
                                                 .text_color(p.muted_fg)
-                                                .child(c.type_.to_string()),
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .child(c.type_.to_string()),
+                                                ),
                                         )
                                         .when(c.nullable, |this| {
                                             this.child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .text_size(px(10.))
+                                                    .text_size(theme::scaled(theme::TEXT_XS))
                                                     .text_color(p.muted_fg)
                                                     .child("null?"),
                                             )
@@ -1562,7 +1711,7 @@ impl Render for RecordsView {
                                 .child(
                                     div()
                                         .id(("copy", i))
-                                        .size(px(24.))
+                                        .size(theme::scaled(24.))
                                         .flex()
                                         .flex_none()
                                         .items_center()
@@ -1616,7 +1765,7 @@ impl Render for RecordsView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
                     .child("Click a row to inspect its fields.")
                     .into_any_element(),
@@ -1631,11 +1780,11 @@ impl Render for RecordsView {
                 .child(
                     div()
                         .flex_none()
-                        .h(px(24.))
+                        .h(theme::scaled(24.))
                         .flex()
                         .items_center()
                         .px_3()
-                        .text_size(px(11.))
+                        .text_size(theme::scaled(theme::TEXT_XS))
                         .text_color(p.muted_fg)
                         .bg(p.table_header)
                         .border_b_1()
@@ -1663,13 +1812,13 @@ impl Render for RecordsView {
         };
 
         let status_bar = h_flex()
-            .h(px(28.))
+            .h(theme::scaled(28.))
             .flex_none()
             .items_center()
             .gap_2()
             .px_3()
             .bg(p.statusbar)
-            .text_size(px(11.))
+            .text_size(theme::scaled(theme::TEXT_XS))
             .text_color(p.statusbar_fg)
             .border_t_1()
             .border_color(p.toolbar_border)
@@ -1722,7 +1871,7 @@ impl Render for RecordsView {
                 .border_color(p.conn_err.opacity(0.4))
                 .bg(p.conn_err.opacity(0.1))
                 .text_color(p.conn_err)
-                .text_size(px(13.5))
+                .text_size(theme::scaled(theme::TEXT_MD))
                 .gap_2()
                 .child(Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(16.))))
                 .child(e)
@@ -1818,7 +1967,7 @@ impl Render for RecordsView {
 fn sep(p: &theme::Palette) -> gpui::Div {
     div()
         .mx(px(2.))
-        .h(px(20.))
+        .h(theme::scaled(20.))
         .w(px(1.))
         .flex_none()
         .bg(p.toolbar_border)
@@ -1849,19 +1998,19 @@ impl crate::ui::app::DataBridge {
                     .gap(px(10.))
                     .child(
                         div()
-                            .text_size(px(46.))
+                            .text_size(theme::scaled(46.))
                             .text_color(p.muted_fg.opacity(0.7))
                             .child("▦"),
                     )
                     .child(
                         div()
-                            .text_size(px(15.))
+                            .text_size(theme::scaled(theme::TEXT_XL))
                             .text_color(p.foreground)
                             .child("No open data view"),
                     )
                     .child(
                         div()
-                            .text_size(px(13.5))
+                            .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
                             .child("Select a table in the explorer on the left to open its records here."),
                     )
@@ -1894,4 +2043,24 @@ impl crate::ui::app::DataBridge {
                     ),
             )
     }
+}
+
+/// One row as a pretty JSON object keyed by column name: numbers and
+/// booleans stay typed, JSON columns are embedded when they parse, binary
+/// becomes its edit string (hex).
+fn row_to_json(columns: &[ColumnMeta], row: &Row) -> String {
+    let mut obj = serde_json::Map::new();
+    for (c, v) in columns.iter().zip(row.iter()) {
+        let j = match v {
+            Value::Null => serde_json::Value::Null,
+            Value::Int(n) => serde_json::Value::from(*n),
+            Value::Float(f) => serde_json::Value::from(*f),
+            Value::Bool(b) => serde_json::Value::Bool(*b),
+            Value::Str(text) if c.kind == ColumnKind::Json => serde_json::from_str(text)
+                .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+            other => serde_json::Value::String(other.edit_string()),
+        };
+        obj.insert(c.name.clone(), j);
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap_or_default()
 }

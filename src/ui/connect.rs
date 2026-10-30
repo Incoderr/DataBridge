@@ -43,14 +43,14 @@ impl DataBridge {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(theme::scaled(theme::TEXT_XS))
                                     .text_color(p.muted_fg)
                                     .child("DataBridge"),
                             )
-                            .child(div().h(px(1.)).w(px(128.)).bg(p.toolbar_border))
+                            .child(div().h(px(1.)).w(theme::scaled(128.)).bg(p.toolbar_border))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(theme::scaled(theme::TEXT_XS))
                                     .text_color(p.muted_fg)
                                     .child("Database Explorer"),
                             ),
@@ -67,7 +67,7 @@ impl DataBridge {
                     .child(
                         v_flex()
                             .id("wizard")
-                            .w(px(600.))
+                            .w(theme::scaled(600.))
                             .max_h(px(700.))
                             .bg(p.card)
                             .border_1()
@@ -102,7 +102,7 @@ impl DataBridge {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .text_size(px(16.))
+                    .text_size(theme::scaled(theme::TEXT_XL))
                     .child(
                         svg()
                             .path("icons/cube.svg")
@@ -114,7 +114,7 @@ impl DataBridge {
             )
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(theme::scaled(theme::TEXT_MD))
                     .text_color(p.muted_fg)
                     .child(desc),
             )
@@ -161,7 +161,7 @@ impl DataBridge {
                 .child(
                     svg()
                         .path(t.brand_icon())
-                        .size(px(26.))
+                        .size(theme::scaled(26.))
                         .flex_none()
                         .text_color(rgb(t.brand_color())),
                 )
@@ -169,7 +169,7 @@ impl DataBridge {
                     div()
                         .w_full()
                         .truncate()
-                        .text_size(px(14.))
+                        .text_size(theme::scaled(theme::TEXT_LG))
                         .text_color(p.foreground)
                         .child(t.label()),
                 )
@@ -177,7 +177,7 @@ impl DataBridge {
                     div()
                         .w_full()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
                         .child(if !supported {
                             "coming soon".to_string()
@@ -223,7 +223,7 @@ impl DataBridge {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child("Database type"),
                     )
@@ -240,14 +240,14 @@ impl DataBridge {
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(theme::scaled(theme::TEXT_SM))
                                     .text_color(p.muted_fg)
                                     .child("…or drag & drop a SQLite file onto this window, or"),
                             )
                             .child(
                                 div()
                                     .id("create-sqlite")
-                                    .text_size(px(12.))
+                                    .text_size(theme::scaled(theme::TEXT_SM))
                                     .text_color(p.primary)
                                     .cursor_pointer()
                                     .hover(|s| s.underline())
@@ -265,7 +265,7 @@ impl DataBridge {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child("Existing connections"),
                     )
@@ -279,7 +279,7 @@ impl DataBridge {
                             .when(self.connections.is_empty(), |this| {
                                 this.child(
                                     div()
-                                        .text_size(px(12.))
+                                        .text_size(theme::scaled(theme::TEXT_SM))
                                         .text_color(p.muted_fg)
                                         .child(
                                             "No saved connections yet — create one above.",
@@ -333,14 +333,14 @@ impl DataBridge {
                                                     .child(
                                                         div()
                                                             .w_full()
-                                                            .text_size(px(14.))
+                                                            .text_size(theme::scaled(theme::TEXT_LG))
                                                             .text_color(p.foreground)
                                                             .child(c.name.clone()),
                                                     )
                                                     .child(
                                                         div()
                                                             .w_full()
-                                                            .text_size(px(12.))
+                                                            .text_size(theme::scaled(theme::TEXT_SM))
                                                             .text_color(p.muted_fg)
                                                             .child(format!(
                                                                 "{} · {}{} · {}",
@@ -361,7 +361,7 @@ impl DataBridge {
                                             .child(
                                                 div()
                                                     .id(("existing-forget", i))
-                                                    .size(px(24.))
+                                                    .size(theme::scaled(24.))
                                                     .flex()
                                                     .flex_none()
                                                     .items_center()
@@ -439,7 +439,7 @@ impl DataBridge {
                         .border_1()
                         .border_color(p.primary.opacity(0.3))
                         .bg(p.primary.opacity(0.1))
-                        .text_size(px(12.))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.primary.opacity(0.9))
                         .child(
                             svg()
@@ -485,7 +485,7 @@ impl DataBridge {
                     .py(px(2.))
                     .rounded(px(4.))
                     .bg(p.accent)
-                    .text_size(px(12.))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.primary)
                     .child(
                         svg()
@@ -550,7 +550,7 @@ impl DataBridge {
                         .border_color(border.opacity(0.4))
                         .bg(bg.opacity(0.1))
                         .text_color(fg)
-                        .text_size(px(13.))
+                        .text_size(theme::scaled(theme::TEXT_MD))
                         .child(
                             if success {
                                 Icon::new(IconName::CircleCheck)
@@ -596,7 +596,7 @@ impl DataBridge {
             )
             .child(
                 div()
-                    .text_size(px(14.))
+                    .text_size(theme::scaled(theme::TEXT_LG))
                     .text_color(p.muted_fg)
                     .child(format!("Connecting to {host}{port_suffix} …")),
             )
@@ -987,10 +987,10 @@ fn field(
         .gap_1()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(theme::scaled(theme::TEXT_SM))
                 .child(label),
         )
-        .child(Input::new(state).large().h(px(38.)))
+        .child(Input::new(state).large().h(theme::scaled(38.)))
 }
 
 /// Like [`field`], but masked with an eye toggle — the value can be
@@ -1000,10 +1000,10 @@ fn password_field(state: &gpui::Entity<gpui_component::input::InputState>) -> Di
         .gap_1()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(theme::scaled(theme::TEXT_SM))
                 .child("Password"),
         )
-        .child(Input::new(state).large().h(px(38.)).mask_toggle())
+        .child(Input::new(state).large().h(theme::scaled(38.)).mask_toggle())
 }
 
 /// The SQLite "File path" field: input plus a Browse… button opening the
@@ -1020,7 +1020,7 @@ fn file_field(
                 .items_center()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .child("File path"),
                 )
                 .child(div().flex_1())
@@ -1043,11 +1043,11 @@ fn file_field(
                         })),
                 ),
         )
-        .child(Input::new(state).large().h(px(38.)))
+        .child(Input::new(state).large().h(theme::scaled(38.)))
         // Standing hint that dropping the file works, too.
         .child(
             div()
-                .text_size(px(11.5))
+                .text_size(theme::scaled(theme::TEXT_SM))
                 .text_color(p.muted_fg)
                 .child("…or drop the file anywhere on the window."),
         )
@@ -1092,7 +1092,7 @@ fn mode_btn(
             p.border
         })
         .when(active, |this| this.bg(p.primary.opacity(0.12)))
-        .text_size(px(12.))
+        .text_size(theme::scaled(theme::TEXT_SM))
         .text_color(if active { p.primary } else { p.muted_fg })
         .cursor_pointer()
         .when(!active, move |this| {

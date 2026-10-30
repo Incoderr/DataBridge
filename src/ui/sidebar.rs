@@ -29,7 +29,7 @@ fn tool_btn(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(36.))
+        .size(theme::scaled(36.))
         .flex()
         .flex_none()
         .items_center()
@@ -61,7 +61,7 @@ impl DataBridge {
 
         v_flex()
             .id("sidebar")
-            .w(px(48.))
+            .w(theme::scaled(48.))
             .flex_none()
             .h_full()
             .items_center()
@@ -77,7 +77,7 @@ impl DataBridge {
             .child(
                 div()
                     .id("active-conn-brand")
-                    .size(px(32.))
+                    .size(theme::scaled(32.))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -99,7 +99,7 @@ impl DataBridge {
                 div()
                     .my_1()
                     .h(px(1.))
-                    .w(px(28.))
+                    .w(theme::scaled(28.))
                     .flex_none()
                     .bg(p.toolbar_border),
             )
@@ -150,7 +150,7 @@ impl DataBridge {
                 div()
                     .my_1()
                     .h(px(1.))
-                    .w(px(28.))
+                    .w(theme::scaled(28.))
                     .flex_none()
                     .bg(p.toolbar_border),
             )

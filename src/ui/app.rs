@@ -692,7 +692,7 @@ impl DataBridge {
                             .child(
                                 svg()
                                     .path(icon)
-                                    .size(px(14.))
+                                    .size(theme::scaled(14.))
                                     .text_color(if active { p.primary } else { p.muted_fg }),
                             ),
                     )
@@ -726,7 +726,7 @@ impl DataBridge {
             .suffix(
                 div()
                     .id("new-query")
-                    .size(px(28.))
+                    .size(theme::scaled(28.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -745,7 +745,7 @@ impl DataBridge {
             .suffix(
                 div()
                     .id("theme-toggle")
-                    .size(px(28.))
+                    .size(theme::scaled(28.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -768,13 +768,13 @@ impl Render for DataBridge {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let resizing = self.resizing_nav;
         let show_settings = self.show_settings;
-        // Self-heal the hint flag on every frame: any repaint during an
-        // active file drag raises the hint even if a move event was
-        // missed (our app has no internal drags, so an active drag is
-        // always external files).
-        let dragging = cx.has_active_drag();
-        if dragging != self.drag_over {
-            self.drag_over = dragging;
+        // Self-heal the hint flag on every frame — but only downwards: no
+        // active drag means no hint. Raising it is left to the typed
+        // `on_drag_move::<ExternalPaths>` below, because the app now has
+        // internal drags too (table column moves) and gpui does not expose
+        // the active drag's type.
+        if self.drag_over && !cx.has_active_drag() {
+            self.drag_over = false;
         }
         let drag_over = self.drag_over;
         let view = cx.entity();
@@ -999,20 +999,20 @@ impl DataBridge {
                     .child(
                         svg()
                             .path(sqlite.brand_icon())
-                            .size(px(36.))
+                            .size(theme::scaled(36.))
                             .flex_none()
                             .text_color(rgb(sqlite.brand_color())),
                     )
                     .child(
                         div()
-                            .text_size(px(16.))
+                            .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.foreground)
                             .child("Drop the database file here"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
                             .child("SQLite: .db · .sqlite · .sqlite3 · .db3"),
                     ),
@@ -1061,7 +1061,7 @@ impl DataBridge {
             .top_1_2()
             .mt(px(-90.))
             .ml(px(-210.))
-            .w(px(420.))
+            .w(theme::scaled(420.))
             .occlude()
             .bg(p.card)
             .border_1()
@@ -1078,7 +1078,7 @@ impl DataBridge {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .text_size(px(15.))
+                            .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 Icon::new(IconName::TriangleAlert)
@@ -1089,7 +1089,7 @@ impl DataBridge {
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
                             .child(format!(
                                 "{name} and all of its data will be permanently deleted. This cannot be undone."
@@ -1102,7 +1102,7 @@ impl DataBridge {
                                 .py(px(6.))
                                 .rounded(px(4.))
                                 .bg(p.conn_err.opacity(0.1))
-                                .text_size(px(12.5))
+                                .text_size(theme::scaled(theme::TEXT_MD))
                                 .text_color(p.conn_err)
                                 .child(e),
                         )
@@ -1166,13 +1166,13 @@ impl DataBridge {
                 .child(
                     div()
                         .flex_1()
-                        .text_size(px(13.5))
+                        .text_size(theme::scaled(theme::TEXT_MD))
                         .text_color(p.foreground)
                         .child(label.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(11.5))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
                         .child(hint.to_string()),
                 )
@@ -1216,7 +1216,7 @@ impl DataBridge {
             // Optical centering: pull the card back by half its size.
             .mt(px(-170.))
             .ml(px(-190.))
-            .w(px(380.))
+            .w(theme::scaled(380.))
             // BlockMouse: clicks over the card never count as backdrop
             // clicks (see the record editor modal in workspace.rs).
             .occlude()
@@ -1238,13 +1238,13 @@ impl DataBridge {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .text_size(px(15.))
+                            .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Settings"),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child("Interface size — scales fonts and controls."),
                     ),

@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod assets;
+pub mod completion;
 pub mod connect;
 pub mod diagram;
 pub mod nav_tree;

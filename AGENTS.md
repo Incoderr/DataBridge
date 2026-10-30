@@ -53,6 +53,7 @@ src/
     runtime.rs    # tokio sidecar + bridge into GPUI tasks
     mock.rs       # deterministic mock (the original mock layer, ported from the web app)
     storage.rs    # Stage-3 recent-connections store: connections.json + OS keyring secrets
+    completion.rs # SQL autocompletion engine (pure: text + cursor + schema tree -> suggestions)
   drivers/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
@@ -66,6 +67,7 @@ src/
     nav_tree.rs   # explorer tree (virtualized: flat row model + v_virtual_list + overlay Scrollbar)
     workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
     query.rs      # SQL editor tab (Stage 5): code-editor input, run button, results grid
+    completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
     assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-component-assets
@@ -189,11 +191,30 @@ wizard list).
   remount on every switch (web-app parity); SQL tabs are cached in
   `DataBridge::query_views`, so text and results survive switching.
 - SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
-  `run_id`. `model::is_select_like` (first keyword after comments, plus
+  `run_id`. The editor fills the tab; a results grid appears (and takes
+  half) only for result sets — DDL/DML report in the toolbar status. `model::is_select_like` (first keyword after comments, plus
   DML `RETURNING`) picks fetch vs execute. "New table" (tree row per
   schema + the empty workspace) seeds a dialect `CREATE TABLE`; DDL runs
   reload the tree via `DataBridge::reload_schemas` (stale-guarded by
   `schemas_id`).
+- SQL autocompletion (`core/completion.rs`, DataGrip-style, tested in
+  core): tables after FROM/JOIN/INTO/UPDATE/TABLE, columns after
+  `alias.` (aliases resolved from the whole statement, so `SELECT c.|
+  FROM customers c` works), in-scope columns + functions + keywords
+  elsewhere, statement keywords at a statement start; prefix → word-part
+  → first-letter-anchored subsequence ranking; identifiers quoted per
+  dialect; inside CREATE/ALTER only types/constraints (+ tables after
+  REFERENCES, columns in `INTO t (` / `REFERENCES t (`). `predict` gives
+  the grey ghost "next step" (`FROM` after `SELECT *`, `ON a.fk = b.pk`
+  guessed from `<table>_id` names, the INSERT column list, …; Tab
+  accepts). Menu items carry no `detail` — the gpui-component popover is
+  fixed at 120 px min and doesn't grow — descriptions go to
+  `documentation` (side popover). Editor: 4-space indent, Enter after `(`
+  indents (`indent_after_open_paren`), Ctrl+wheel font zoom
+  (`settings::EditorFontSize`, captured by a canvas before the editor
+  scrolls). `ui/completion.rs` reads `DataBridge::schemas` per request —
+  attach the provider only after `set_value` (it fires the trigger while
+  `DataBridge` is leased).
 - Tree context menu (`ui/nav_tree.rs`, gpui-component `context_menu`):
   Open / Drop table… on tables and views → confirmation dialog
   (`render_drop_dialog`, stale-guarded by `drop_id`); success closes the
@@ -203,7 +224,10 @@ wizard list).
   only) / `delete_row`, stale-guarded by `save_id`. FK columns get a
   "→ target" hint and a picker (up to 200 referenced values, labelled by
   the target's first text column) via `list_relations` + `fetch_rows`,
-  stale-guarded by `fk_gen`.
+  stale-guarded by `fk_gen`. Rows have a context menu
+  (`RecordsDelegate::context_menu` → `RecordsView::row_action`): edit,
+  duplicate (prefilled insert without key columns), new, copy as TSV /
+  JSON, delete; edit/delete need a PK.
 - SQLite `auto`: only the rowid alias counts — the sole PK column
   declared exactly `INTEGER` in a rowid table (`mark_rowid_alias`);
   `INT PRIMARY KEY` must be supplied.
@@ -258,7 +282,9 @@ wizard list).
 - No new dependencies without justification. `async_trait` is pre-approved for
   `DbSession` (dyn-compatible trait objects). Stage 3 sanctioned `serde` +
   `keyring` (persistence, OS keyring secrets) and `rfd` (native file picker);
-  `uuid` gained the `v4` feature for stable connection ids.
+  `uuid` gained the `v4` feature for stable connection ids. `lsp-types`
+  (same version as gpui-component's) is required by the editor's
+  `CompletionProvider` trait.
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 
@@ -270,7 +296,10 @@ wizard list).
   cells use `theme::MONO_FONT` (JetBrains Mono) — family strings must match the
   TTF metadata.
 - gpui's `set_rem_size` is driven by `theme.font_size` (settings scale). Rem-based
-  utilities scale with it; hand-tuned `px()` values multiply by `palette.scale`.
+  utilities scale with it. Chrome text uses the type scale `theme::TEXT_XS..XL`
+  (11/12/13/14/16) via `theme::scaled(n)` (design px → rems), never a raw
+  `text_size(px(..))`; control heights, icon and card sizes use `scaled` too.
+  Only hairlines/splitters stay `px`; virtual-list heights multiply by `palette.scale`.
 - Pin `gpui`/`gpui-component` to the versions in `Cargo.toml`; their APIs move fast
   (component lib is pre-1.0). Upgrades are deliberate, isolated changes.
 - **Pin absolute overlays with explicit insets (`top_0().left_0()`), keep
@@ -288,5 +317,10 @@ wizard list).
   behind it) out of the hover set. See `render_editor` in `workspace.rs` and
   `render_settings_dialog` in `app.rs`: backdrop + card are siblings under a
   transparent layer, the card occludes.
+- **Striped tables need `query::settle_stripes` after creating a
+  `TableState`.** gpui-component sizes the stripe filler rows from the
+  previous frame's bounds, so a fresh table paints without them until an
+  unrelated repaint (mouse move). Used by `RecordsView::new` and
+  `QueryView::apply_result`.
 - `/site` has its own ignore rules and lockfile (pnpm). The root `.gitignore` only
   lists `/target` — that is intentional.

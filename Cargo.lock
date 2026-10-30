@@ -1352,6 +1352,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "keyring",
+ "lsp-types",
  "rfd",
  "serde",
  "serde_json",

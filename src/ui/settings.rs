@@ -63,3 +63,26 @@ pub fn set(scale: UiScale, window: Option<&mut Window>, cx: &mut App) {
     cx.set_global(UiScaleGlobal(scale));
     crate::ui::theme::reapply(window, cx);
 }
+
+/// SQL editor font size in design px at the Normal interface scale
+/// (rendered through `theme::scaled`); Ctrl+wheel over an editor changes
+/// it for every SQL tab. Not persisted yet, like the interface scale.
+pub struct EditorFontSize(pub f32);
+impl Global for EditorFontSize {}
+
+pub const EDITOR_FONT_DEFAULT: f32 = 14.;
+pub const EDITOR_FONT_MIN: f32 = 9.;
+pub const EDITOR_FONT_MAX: f32 = 32.;
+
+pub fn editor_font_size(cx: &App) -> f32 {
+    cx.try_global::<EditorFontSize>()
+        .map(|g| g.0)
+        .unwrap_or(EDITOR_FONT_DEFAULT)
+}
+
+/// Step the editor font by `delta` px (clamped) and repaint.
+pub fn bump_editor_font_size(delta: f32, cx: &mut App) {
+    let size = (editor_font_size(cx) + delta).clamp(EDITOR_FONT_MIN, EDITOR_FONT_MAX);
+    cx.set_global(EditorFontSize(size));
+    cx.refresh_windows();
+}

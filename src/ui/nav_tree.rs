@@ -100,7 +100,7 @@ impl TreeRow {
 fn brand_icon(t: DbType, size: f32) -> AnyElement {
     svg()
         .path(t.brand_icon())
-        .size(px(size))
+        .size(theme::scaled(size))
         .flex_none()
         .text_color(rgb(t.brand_color()))
         .into_any_element()
@@ -109,7 +109,7 @@ fn brand_icon(t: DbType, size: f32) -> AnyElement {
 fn glyph_icon(path: &'static str, color: Hsla, size: f32) -> AnyElement {
     svg()
         .path(path)
-        .size(px(size))
+        .size(theme::scaled(size))
         .flex_none()
         .text_color(color)
         .into_any_element()
@@ -172,7 +172,7 @@ impl DataBridge {
             // tiny DataGrip title strip
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .h(theme::scaled(36.))
                     .flex_none()
                     .items_center()
                     .gap_2()
@@ -183,7 +183,7 @@ impl DataBridge {
                     .child(brand_icon(conn.db_type, 13.))
                     .child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
                             .min_w_0()
                             .truncate()
@@ -209,14 +209,14 @@ impl DataBridge {
                                 div().flex_1().min_w_0().child(
                                     Input::new(&self.search)
                                         .large()
-                                        .h(px(36.)),
+                                        .h(theme::scaled(36.)),
                                 ),
                             )
                             .when(!self.query.trim().is_empty(), |this| {
                                 this.child(
                                     div()
                                         .id("clear-search")
-                                        .size(px(22.))
+                                        .size(theme::scaled(22.))
                                         .ml(px(-24.))
                                         .flex()
                                         .flex_none()
@@ -238,7 +238,7 @@ impl DataBridge {
                     .child(
                         div()
                             .id("tree-filter")
-                            .size(px(32.))
+                            .size(theme::scaled(32.))
                             .flex()
                             .flex_none()
                             .items_center()
@@ -250,7 +250,7 @@ impl DataBridge {
                             .child(
                                 svg()
                                     .path("icons/filter.svg")
-                                    .size(px(15.))
+                                    .size(theme::scaled(15.))
                                     .text_color(if self.filter_only_tables { p.primary } else { p.muted_fg }),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -261,7 +261,7 @@ impl DataBridge {
                     .child(
                         div()
                             .id("tree-reload")
-                            .size(px(32.))
+                            .size(theme::scaled(32.))
                             .flex()
                             .flex_none()
                             .items_center()
@@ -272,7 +272,7 @@ impl DataBridge {
                             .child(
                                 svg()
                                     .path("icons/redo-2.svg")
-                                    .size(px(15.))
+                                    .size(theme::scaled(15.))
                                     .text_color(p.muted_fg),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -297,7 +297,7 @@ impl DataBridge {
                             Rc::new(
                                 self.nav_rows
                                     .iter()
-                                    .map(|row| size(px(0.), px(row.height())))
+                                    .map(|row| size(px(0.), px(row.height() * p.scale)))
                                     .collect::<Vec<_>>(),
                             ),
                             |this: &mut DataBridge,
@@ -632,7 +632,7 @@ fn parent_row(
     let node = node_id.clone();
     div()
         .id(ElementId::Name(SharedString::from(node_id)))
-        .h(px(ROW_H))
+        .h(theme::scaled(ROW_H))
         .flex()
         .items_center()
         .gap(px(4.))
@@ -640,7 +640,7 @@ fn parent_row(
         .rounded(px(4.))
         .pr_2()
         .pl(px(depth as f32 * 16. + 2.))
-        .text_size(px(13.5))
+        .text_size(theme::scaled(theme::TEXT_MD))
         .cursor_pointer()
         .text_color(p.muted_fg)
         .hover(move |s| s.bg(p.tree_hover))
@@ -648,7 +648,7 @@ fn parent_row(
         // level — collapsed/expanded states never shift the labels.
         .child(
             div()
-                .w(px(16.))
+                .w(theme::scaled(16.))
                 .h_full()
                 .flex()
                 .flex_none()
@@ -658,7 +658,7 @@ fn parent_row(
         )
         .child(
             div()
-                .w(px(18.))
+                .w(theme::scaled(18.))
                 .h_full()
                 .flex()
                 .flex_none()
@@ -702,7 +702,7 @@ fn leaf_row(
             "t:{schema}:{}",
             meta.name
         ))))
-        .h(px(ROW_H))
+        .h(theme::scaled(ROW_H))
         .flex()
         .items_center()
         .gap(px(4.))
@@ -710,7 +710,7 @@ fn leaf_row(
         .rounded(px(4.))
         .pr_2()
         .pl(px(depth as f32 * 16. + 2.))
-        .text_size(px(13.5))
+        .text_size(theme::scaled(theme::TEXT_MD))
         .cursor_pointer()
         .when(is_sel, |this| {
             this.bg(p.tree_selected).text_color(p.primary_fg)
@@ -721,10 +721,10 @@ fn leaf_row(
         })
         // Same fixed slots as `parent_row`: chevron slot (empty for
         // leaves) + icon slot, so labels align on every level.
-        .child(div().w(px(16.)).h_full().flex_none())
+        .child(div().w(theme::scaled(16.)).h_full().flex_none())
         .child(
             div()
-                .w(px(18.))
+                .w(theme::scaled(18.))
                 .h_full()
                 .flex()
                 .flex_none()
@@ -739,7 +739,7 @@ fn leaf_row(
                     .ml_auto()
                     .pl_2()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(theme::scaled(theme::TEXT_XS))
                     .text_color(if is_sel {
                         p.primary_fg.opacity(0.8)
                     } else {
@@ -759,7 +759,7 @@ fn diagram_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -
     let schema = schema.to_string();
     div()
         .id(ElementId::Name(SharedString::from(format!("d:{schema}"))))
-        .h(px(DIAGRAM_H))
+        .h(theme::scaled(DIAGRAM_H))
         .flex()
         .items_center()
         .gap(px(4.))
@@ -767,15 +767,15 @@ fn diagram_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -
         .rounded(px(4.))
         .pr_2()
         .pl(px(2. * 16. + 6.))
-        .text_size(px(12.))
+        .text_size(theme::scaled(theme::TEXT_SM))
         .cursor_pointer()
         .text_color(p.muted_fg)
         .hover(move |s| s.bg(p.tree_hover))
-        .child(div().w(px(16.)).h_full().flex_none())
+        .child(div().w(theme::scaled(16.)).h_full().flex_none())
         .child(
             svg()
                 .path("icons/schema.svg")
-                .size(px(14.))
+                .size(theme::scaled(14.))
                 .flex_none()
                 .text_color(p.primary.opacity(0.7)),
         )
@@ -791,7 +791,7 @@ fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>)
     let schema = schema.to_string();
     div()
         .id(ElementId::Name(SharedString::from(format!("nt:{schema}"))))
-        .h(px(DIAGRAM_H))
+        .h(theme::scaled(DIAGRAM_H))
         .flex()
         .items_center()
         .gap(px(4.))
@@ -799,11 +799,11 @@ fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>)
         .rounded(px(4.))
         .pr_2()
         .pl(px(2. * 16. + 6.))
-        .text_size(px(12.))
+        .text_size(theme::scaled(theme::TEXT_SM))
         .cursor_pointer()
         .text_color(p.muted_fg)
         .hover(move |s| s.bg(p.tree_hover))
-        .child(div().w(px(16.)).h_full().flex_none())
+        .child(div().w(theme::scaled(16.)).h_full().flex_none())
         .child(
             Icon::new(IconName::Plus)
                 .with_size(Size::Size(px(14.)))
@@ -822,10 +822,10 @@ fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>)
 fn note_row(lines: &[String], p: &theme::Palette) -> Div {
     v_flex()
         .px_4()
-        .py(px(NOTE_PAD_Y))
-        .gap(px(NOTE_GAP))
-        .text_size(px(13.))
-        .line_height(px(NOTE_LINE_H))
+        .py(theme::scaled(NOTE_PAD_Y))
+        .gap(theme::scaled(NOTE_GAP))
+        .text_size(theme::scaled(theme::TEXT_MD))
+        .line_height(theme::scaled(NOTE_LINE_H))
         .text_color(p.muted_fg)
         .children(
             lines

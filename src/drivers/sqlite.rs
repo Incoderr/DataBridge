@@ -309,9 +309,11 @@ impl DbSession for SqliteSession {
             .map(|ch| format!("\"{}\" = ?", ch.column.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
+        // `IS`, not `=`: SQLite lets non-INTEGER primary keys hold NULL,
+        // and `= NULL` never matches such a row.
         let where_ = pk
             .iter()
-            .map(|key| format!("\"{}\" = ?", key.column.replace('"', "\"\"")))
+            .map(|key| format!("\"{}\" IS ?", key.column.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!("UPDATE {ident} SET {sets} WHERE {where_}");
@@ -356,9 +358,11 @@ impl DbSession for SqliteSession {
     async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError> {
         let pool = self.pool().await?;
         let ident = sqlite_ident(&table.name);
+        // `IS`, not `=`: SQLite lets non-INTEGER primary keys hold NULL,
+        // and `= NULL` never matches such a row.
         let where_ = pk
             .iter()
-            .map(|key| format!("\"{}\" = ?", key.column.replace('"', "\"\"")))
+            .map(|key| format!("\"{}\" IS ?", key.column.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
         let sql = format!("DELETE FROM {ident} WHERE {where_}");
@@ -406,7 +410,9 @@ fn column_meta(
     ColumnMeta {
         name,
         type_: label,
-        nullable: notnull == 0,
+        // SQLite tolerates NULL in non-INTEGER primary keys (a legacy quirk);
+        // treat keys as required so the editor never creates such rows.
+        nullable: notnull == 0 && pk == 0,
         primary_key: pk > 0,
         // Set afterwards by `mark_rowid_alias` — it needs the whole table.
         auto_increment: false,

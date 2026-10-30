@@ -1,7 +1,7 @@
 //! DataBridge theme: dark and light palettes ported 1:1
 //! from the web version's `style.css` (OKLCH tokens converted to sRGB).
 
-use gpui::{px, rgb, App, Hsla, Window};
+use gpui::{px, rems, rgb, App, Hsla, Rems, Window};
 use gpui_component::{ActiveTheme, Theme, ThemeColor, ThemeMode};
 
 /// The UI typeface for app chrome (buttons, menus, tabs, inputs).
@@ -68,6 +68,21 @@ pub struct Palette {
 
 fn p(hex: u32) -> Hsla {
     rgb(hex).into()
+}
+
+/// Type scale for chrome text, in design px at the Normal interface scale.
+/// Pass through [`scaled`] so the Settings scale reaches every label.
+pub const TEXT_XS: f32 = 11.; // badges, hints, captions
+pub const TEXT_SM: f32 = 12.; // secondary text, toolbars, metadata
+pub const TEXT_MD: f32 = 13.; // body: tree rows, tabs, cells, menus
+pub const TEXT_LG: f32 = 14.; // emphasis, card titles
+pub const TEXT_XL: f32 = 16.; // dialog and screen titles
+
+/// A design-px size that follows the interface scale. Rems are relative to
+/// `theme.font_size` (= `BASE_FONT_SIZE * factor`), so `scaled(n)` renders
+/// as `n` px at Normal and grows / shrinks with Compact / Large.
+pub fn scaled(design_px: f32) -> Rems {
+    rems(design_px / crate::ui::settings::BASE_FONT_SIZE)
 }
 
 pub fn dark_palette() -> Palette {
