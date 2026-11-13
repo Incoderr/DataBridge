@@ -18,7 +18,7 @@ use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
-use crate::core::model::{first_keyword, group_digits, DbConnection, QueryPage, Row};
+use crate::core::model::{group_digits, DbConnection, QueryPage, Row};
 use crate::core::session::SessionHandle;
 use crate::ui::app::DataBridge;
 use crate::ui::completion::SqlCompletions;
@@ -31,12 +31,10 @@ const INDENT: &str = "    ";
 /// version's `QUERY_LIMIT`).
 pub const RESULT_LIMIT: u64 = 500;
 
-/// First-keyword sniff for statements that change the schema tree.
+/// Statements that change the schema tree (SQL DDL, mongosh collection
+/// calls).
 fn is_ddl(sql: &str) -> bool {
-    matches!(
-        first_keyword(sql).as_str(),
-        "create" | "drop" | "alter" | "rename"
-    )
+    crate::core::model::changes_schema(sql)
 }
 
 // ---------------- Delegate: dynamic result columns ----------------

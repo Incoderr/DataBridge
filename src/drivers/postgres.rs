@@ -16,7 +16,7 @@ use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
-use crate::core::model::is_select_like;
+use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
     QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
@@ -138,11 +138,19 @@ impl DbSession for PostgresSession {
         .fetch_all(&pool)
         .await
         .map_err(|e| DbError::with_source("failed to list PostgreSQL schemas", e))?;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            out.push(schema_meta(&pool, name).await?);
+        // Schemas introspect concurrently (bounded by the pool size).
+        let mut set = tokio::task::JoinSet::new();
+        for (ix, name) in names.into_iter().enumerate() {
+            let pool = pool.clone();
+            set.spawn(async move { (ix, schema_meta(&pool, name).await) });
         }
-        Ok(out)
+        let mut out = Vec::new();
+        while let Some(done) = set.join_next().await {
+            let (ix, meta) = done.map_err(|_| DbError::new("schema introspection task failed"))?;
+            out.push((ix, meta?));
+        }
+        out.sort_by_key(|(ix, _)| *ix);
+        Ok(out.into_iter().map(|(_, m)| m).collect())
     }
 
     async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, DbError> {
@@ -179,20 +187,43 @@ impl DbSession for PostgresSession {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = pg_ident(&table.schema, &table.name);
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
-            .fetch_one(pool)
-            .await
-            .map_err(|e| {
-                DbError::with_source(format!("failed to count {}.{}", table.schema, table.name), e)
-            })?;
-        let rows = sqlx::query(&format!("SELECT * FROM {ident} LIMIT $1 OFFSET $2"))
+        // The page and the planner's row estimate in parallel (two pool
+        // connections); an exact COUNT(*) only when neither settles the
+        // total (see `total_without_count`).
+        let page_sql = format!("SELECT * FROM {ident} LIMIT $1 OFFSET $2");
+        let page = sqlx::query(&page_sql)
             .bind(limit as i64)
             .bind(offset as i64)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| {
-                DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
-            })?;
+            .fetch_all(pool);
+        // reltuples: -1 = never analyzed (PG 14+), 0 for views.
+        let estimate = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT c.reltuples::bigint FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2",
+        )
+        .bind(&table.schema)
+        .bind(&table.name)
+        .fetch_optional(pool);
+        let (rows, estimate) = tokio::join!(page, estimate);
+        let rows = rows.map_err(|e| {
+            DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
+        })?;
+        let estimate = estimate.ok().flatten().flatten();
+        let (total, exact) = match total_without_count(offset, limit, rows.len(), estimate) {
+            Some(t) => t,
+            None => {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| {
+                        DbError::with_source(
+                            format!("failed to count {}.{}", table.schema, table.name),
+                            e,
+                        )
+                    })?;
+                (n as u64, true)
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut r = Vec::with_capacity(row.len());
@@ -203,9 +234,12 @@ impl DbSession for PostgresSession {
         }
         Ok(Page {
             rows: out,
-            total: total as u64,
-            truncated: total as u64 > offset + limit,
+            total,
+            exact,
+            truncated: total > offset + limit,
             elapsed_ms: t0.elapsed().as_millis() as u32,
+            columns: None,
+            documents: None,
         })
     }
 
@@ -380,20 +414,26 @@ impl DbSession for PostgresSession {
 /// Introspect one schema: relations with batched columns and primary keys.
 async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbError> {
     // relkind: 'r' table, 'p' partitioned table, 'v' view, 'm' matview.
-    let rels: Vec<(String, String)> = sqlx::query_as(
-        "SELECT c.relname, c.relkind::text AS relkind \
-         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') \
-         ORDER BY c.relname",
-    )
-    .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to list relations of {schema}"), e))?;
+    // The four catalog queries run in parallel (pool connections) — one
+    // round trip of latency per schema instead of four.
+    let rels = async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT c.relname, c.relkind::text AS relkind \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') \
+             ORDER BY c.relname",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::with_source(format!("failed to list relations of {schema}"), e))
+    };
 
-    let cols: Vec<
+    #[allow(clippy::type_complexity)]
+    let cols = sqlx::query_as::<
+        _,
         (String, String, String, String, Option<i32>, Option<i32>, Option<i32>, Option<String>, String),
-    > = sqlx::query_as(
+    >(
         "SELECT table_name, column_name, udt_name, is_nullable, \
                 character_maximum_length, numeric_precision, numeric_scale, \
                 column_default, is_identity::text \
@@ -402,11 +442,13 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
          ORDER BY table_name, ordinal_position",
     )
     .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))?;
+    .fetch_all(pool);
+    let cols = async {
+        cols.await
+            .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))
+    };
 
-    let pks: Vec<(String, String)> = sqlx::query_as(
+    let pks = sqlx::query_as::<_, (String, String)>(
         "SELECT tc.table_name, kcu.column_name \
          FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
@@ -415,20 +457,26 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
          WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1",
     )
     .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to read primary keys of {schema}"), e))?;
+    .fetch_all(pool);
+    let pks = async {
+        pks.await
+            .map_err(|e| DbError::with_source(format!("failed to read primary keys of {schema}"), e))
+    };
 
-    let funcs: Vec<(String, String)> = sqlx::query_as(
+    let funcs = sqlx::query_as::<_, (String, String)>(
         "SELECT routine_name, data_type \
          FROM information_schema.routines \
          WHERE routine_schema = $1 AND routine_type = 'FUNCTION' \
          ORDER BY routine_name",
     )
     .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to list functions of {schema}"), e))?;
+    .fetch_all(pool);
+    let funcs = async {
+        funcs.await
+            .map_err(|e| DbError::with_source(format!("failed to list functions of {schema}"), e))
+    };
+
+    let (rels, cols, pks, funcs) = tokio::try_join!(rels, cols, pks, funcs)?;
 
     let pk_set: HashSet<(String, String)> = pks.into_iter().collect();
 

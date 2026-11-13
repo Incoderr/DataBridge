@@ -30,6 +30,13 @@ cargo test                            # core unit tests (storage mapping, URL sa
 cargo build --release
 ```
 
+CI: `.github/workflows/windows.yml` (windows-latest) runs `cargo test`,
+`cargo check --no-default-features` and `cargo build --release` on pushes
+to main and PRs (not for `site/**` / docs-only changes) and keeps the
+zipped exe as an artifact; a pushed `v*` tag also publishes it as a GitHub
+Release. Release builds on Windows use the GUI subsystem (no console —
+`windows_subsystem` in `main.rs`), debug builds keep the console.
+
 Tests live in `core` (`storage`: URL sanitizing, JSON round-trip). More
 belong there (model mapping, mock determinism); driver integration tests
 require a live DB and must be `#[ignore]`d.
@@ -59,7 +66,9 @@ src/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
     sqlite.rs     # sqlx, feature "sqlite"
-    mongo.rs      # feature "mongo"   (stage 4 — later)
+    mongo/        # own light client, always compiled: mod.rs (DbSession), wire.rs (OP_MSG + TLS),
+                  #   scram.rs (SCRAM-SHA-256/1), uri.rs (mongodb[+srv]:// parse), dns.rs (SRV/TXT),
+                  #   shell.rs (mongosh subset)
     redis.rs      # feature "redis"   (stage 4 — later)
   ui/
     app.rs        # root entity DataBridge: connections, tabs, wizard state
@@ -67,6 +76,7 @@ src/
     sidebar.rs    # sidebar chrome
     nav_tree.rs   # explorer tree (virtualized: flat row model + v_virtual_list + overlay Scrollbar)
     workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
+    workspace/documents.rs # document stores: JSON cards, field tree, whole-document editor
     query.rs      # SQL editor tab (Stage 5): code-editor input, run button, results grid
     completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
     ai_chat.rs    # right-hand AI chat panel (AiChatView entity), toggled from the left rail
@@ -122,6 +132,9 @@ pub trait DbSession: Send + Sync {
     async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, DbError>; // schemas w/ tables/views/functions
     async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, DbError>; // FK edges → diagram
     async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError>;
+    // Page = { rows, total, exact (false = estimate), truncated, elapsed_ms,
+    //          columns: Option<Vec<ColumnMeta>> (schemaless drivers report discovered columns),
+    //          documents: Option<Vec<DocNode>> (document stores: full documents, parallel to rows) }
     // later: async fn list_tables(&self, schema: &str) -> Result<Vec<TableMeta>, DbError>
     //        (lazy per-schema trees when eager loading proves expensive)
     // stage 5 (done): one SQL statement per call.
@@ -130,6 +143,8 @@ pub trait DbSession: Send + Sync {
     async fn update_row(&self, table: TableRef, pk: Vec<CellChange>, changes: Vec<CellChange>) -> Result<u64, DbError>;
     async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError>;
     async fn delete_row(&self, table: TableRef, pk: Vec<CellChange>) -> Result<u64, DbError>;
+    // document stores: replace (pk = _id) or insert (empty pk) a whole document from mongosh text.
+    async fn save_document(&self, table: TableRef, pk: Vec<CellChange>, text: String) -> Result<u64, DbError>;
     // tree context menu: DROP TABLE / DROP VIEW (`NodeKind::drop_keyword`).
     async fn drop_table(&self, table: TableRef) -> Result<(), DbError>;
 }
@@ -153,8 +168,10 @@ cloneable `SessionHandle` (all calls go through `core::registry::open`).
 default = ["postgres", "mysql", "sqlite"]
 ```
 
-`mongo` and `redis` cargo features are declared only when implemented
-(stage 4); their `DbType` variants already exist as stubs (see below). The mock is
+MongoDB has **no** feature: it is our own client on top of `bson` (all
+its other crates are already in the tree via sqlx/reqwest), so it is
+always compiled in. A `redis` feature is declared only when implemented
+(stage 4); its `DbType` variant already exists as a stub (see below). The mock is
 always available; `cargo check --no-default-features` must always pass
 (mock-only demo build).
 
@@ -167,10 +184,57 @@ only what works, what is a stub, and the non-obvious behaviors.
 driver — same wire protocol, `mariadb://` URLs accepted), SQLite. TLS via
 rustls (`sslmode`/`ssl-mode` default to *prefer*). Lazy pools; `ping` =
 connect + `SELECT 1` (the wizard's Test Connection); batched introspection
-(SQLite: one `pragma_table_info` join); `COUNT(*)` + paged `SELECT *` with
-dialect-quoted identifiers; row counts arrive with the first page.
+(SQLite: one `pragma_table_info` join; PG/MySQL: the four catalog queries
+per schema via `try_join!`, schemas concurrently via `JoinSet`, bounded
+by the 4-connection pool); paged `SELECT *` with dialect-quoted
+identifiers. Totals (`model::total_without_count`): a short page settles
+the total; otherwise the planner estimate (PG `reltuples`, MySQL
+`TABLE_ROWS`, fetched in parallel with the page) stands in for tables ≥
+`ESTIMATE_THRESHOLD` (100k) — `Page::exact = false`, the grid shows
+`~N` and keeps "next" enabled while pages come back full; only smaller
+tables pay for an exact `COUNT(*)`.
 
-**Stubs:** MongoDB, Redis, ClickHouse, Cassandra, ScyllaDB exist in
+**Works for real (own client):** MongoDB 3.6+ (`drivers/mongo/`, no
+official `mongodb` crate — it pulls ~200 crates). `OP_MSG` over tokio TCP,
+rustls (webpki + OS roots; `tls=true`, `tlsAllowInvalidCertificates`),
+SCRAM-SHA-256/SHA-1 negotiated via `saslSupportedMechs`, seed lists
+(first reachable host, one hop to the reported primary), a 3-connection
+lazy pool (`slot()`), reads retried once after a transport error.
+Databases → schemas (admin/config/local hidden unless in the URL),
+collections/views → tables/views. The tree lists names only (all
+databases concurrently, no sampling) — collections arrive with **no
+columns**; `fetch_rows` infers them from the page's documents (`_id`
+first, majority BSON type as `type_`), widens them with keys later pages
+bring, caches them per collection, and always returns them in
+`Page::columns`. The grid adopts them (`RecordsDelegate::set_columns`)
+and `DataBridge::patch_table_meta` swaps the new `Arc<TableMeta>` into
+the tree and tabs — so the AI prompt / completion know a collection's
+fields only after it was opened. Rows are projected onto those columns;
+count (metadata) and page run in parallel. Each page also carries the
+full documents (`Page::documents`, `model::DocNode` — leaves are mongosh
+literals). The records view (`ui/workspace/documents.rs`) then offers a
+**JSON view** (toolbar `{ }`, default for document stores: one card per
+document, collapsible field tree, click selects, double-click edits), the
+same tree in the detail panel, and a **whole-document editor**: Edit /
+New / Duplicate open `format_document` text in a JavaScript code editor,
+saved via `DbSession::save_document` (replace by `_id`, or insert). The
+round trip is exact per BSON type (`documents_round_trip_through_the_editor`;
+only a regex's `\/` comes back as `/`). `--mock` serves MongoDB
+connections the Postgres demo tables with demo documents. Nested values show as
+relaxed Extended JSON and parse back on edit (`cell_to_bson` by type
+label: ObjectId/long/decimal/date survive). The query tab speaks a mongosh
+subset (`shell.rs`: `use`, `{cmd}`, `db.c.find(…).sort().limit()`,
+aggregate, count/distinct, insert/update/delete, indexes, drop…).
+`mongodb+srv://` (Atlas) resolves per the seed-list spec on every connect
+(`dns.rs`, no resolver crate): Windows via the system `DnsQuery_W`
+(`windows-sys` Dns feature), elsewhere a minimal UDP/TCP DNS client over
+`/etc/resolv.conf` nameservers (that path is not compiled on Windows CI —
+check it on Linux/macOS when touching it). SRV hosts must sit under the
+SRV name's parent domain; TXT may set only `authSource`/`replicaSet`/
+`loadBalanced`; TLS defaults on. Not supported: x.509/LDAP/Kerberos,
+compression, relations (diagram is empty).
+
+**Stubs:** Redis, ClickHouse, Cassandra, ScyllaDB exist in
 `DbType` (brand icons, ports, URL placeholders) but have no driver.
 `registry::open` returns a "not supported in this build" error for them
 (and for drivers compiled out) — never the mock: fake demo tables must not
@@ -189,9 +253,10 @@ wizard list).
   (drop zone on the shared `window-root` shell in `app.rs`), Browse…
   (`rfd`), or New… (save dialog → empty file → connect; existing files
   are never truncated).
-- Tabs: `TabKind::{Records, Diagram, Sql(seed)}`. Records/diagram views
-  remount on every switch (web-app parity); SQL tabs are cached in
-  `DataBridge::query_views`, so text and results survive switching.
+- Tabs: `TabKind::{Records, Diagram, Sql(seed)}`. Diagram views remount
+  on every switch (web-app parity); records grids (`records_views`) and
+  SQL tabs (`query_views`) are cached by tab id, so a switch back shows
+  the loaded page / text and results without a refetch (Refresh reloads).
 - SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
   `run_id`. The editor fills the tab; a results grid appears (and takes
   half) only for result sets — DDL/DML report in the toolbar status. `model::is_select_like` (first keyword after comments, plus
@@ -284,7 +349,9 @@ wizard list).
   **Mostly done.** `core/storage.rs` covers connections (`connections.json` +
   keyring, `--mock` demo flag, forget UI in the wizard). Remaining:
   `settings.json` (UI scale).
-- **Stage 4 — Mongo + Redis** (`mongodb` crate; `redis` with `tokio-comp`).
+- **Stage 4 — Mongo + Redis.** **Mongo done** — own client instead of
+  the `mongodb` crate (see Current state). Next: Redis (`redis` with
+  `tokio-comp`).
 - **Stage 5 — query editor.** `execute(sql)`, result tabs, cancellation (reuse the
   stale-guard/load_id mechanism). **Mostly done.** `execute` + the simplified
   record editor (`update_row`/`insert_row`/`delete_row`) land on all drivers
@@ -316,7 +383,13 @@ wizard list).
   `CompletionProvider` trait. Stage 6 sanctioned `reqwest` (HTTP + SSE for
   the AI chat; `rustls-no-provider`) and a direct `rustls` dep with `ring` —
   the provider sqlx already links, installed in `core::ai` (avoids
-  aws-lc-rs and its native build).
+  aws-lc-rs and its native build). Stage 4 (Mongo) sanctioned `bson` plus
+  direct deps on crates already in the tree at the same versions
+  (`tokio-rustls` without default features, `webpki-roots`,
+  `rustls-native-certs`, `hmac`, `sha1`, `sha2`, `md-5`, `base64`, `rand`,
+  `stringprep`) and tokio's `net` + `io-util` features; on Windows the
+  `Win32_NetworkManagement_Dns` + `Win32_Foundation` features of the
+  `windows-sys` 0.61 already in the tree (SRV lookups).
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 

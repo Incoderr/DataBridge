@@ -1121,7 +1121,7 @@ impl Draft {
             DbType::PostgreSql => "postgres://user:password@localhost:5432/database",
             DbType::MySql => "mysql://user:password@localhost:3306/database",
             DbType::Sqlite => "sqlite:///path/to/file.db",
-            DbType::MongoDb => "mongodb://user:password@localhost:27017/database",
+            DbType::MongoDb => "mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/database",
             DbType::Redis => "redis://localhost:6379",
             DbType::MariaDb => "mariadb://user:password@localhost:3306/database",
             DbType::ClickHouse => "clickhouse://user:password@localhost:9000/database",

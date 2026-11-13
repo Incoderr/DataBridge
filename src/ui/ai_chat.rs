@@ -29,7 +29,6 @@ use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex}
 use crate::core::ai::{
     self, AiConfig, AiEvent, AiMode, ChatMessage, Conversation, Entry, Role, segments,
 };
-use crate::core::model::first_keyword;
 use crate::ui::app::DataBridge;
 use crate::ui::query::RESULT_LIMIT;
 use crate::ui::theme;
@@ -68,7 +67,7 @@ fn new_id() -> String {
 }
 
 fn is_ddl(sql: &str) -> bool {
-    matches!(first_keyword(sql).as_str(), "create" | "drop" | "alter" | "rename")
+    crate::core::model::changes_schema(sql)
 }
 
 /// At most `n` lines of `s`, with a marker when something was cut.

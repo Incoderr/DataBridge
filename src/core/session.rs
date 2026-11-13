@@ -65,6 +65,21 @@ pub trait DbSession: Send + Sync {
         Err(DbError::new("this driver does not support row deletion"))
     }
 
+    /// Document editor (document stores): replace the document identified
+    /// by `pk` with `text` (mongosh syntax, as [`format_document`] writes
+    /// it), or insert it when `pk` is empty.
+    ///
+    /// [`format_document`]: crate::core::model::format_document
+    async fn save_document(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        text: String,
+    ) -> Result<u64, DbError> {
+        let _ = (table, pk, text);
+        Err(DbError::new("this driver does not store documents"))
+    }
+
     /// Tree context menu: drop a table or view (`table.kind` picks the
     /// statement, see `NodeKind::drop_keyword`). `table` comes from
     /// introspection; drivers quote it per dialect.
@@ -152,6 +167,16 @@ impl SessionHandle {
     ) -> oneshot::Receiver<Result<u64, DbError>> {
         let session = self.0.clone();
         crate::core::runtime::spawn(async move { session.delete_row(table, pk).await })
+    }
+
+    pub fn save_document(
+        &self,
+        table: TableRef,
+        pk: Vec<CellChange>,
+        text: String,
+    ) -> oneshot::Receiver<Result<u64, DbError>> {
+        let session = self.0.clone();
+        crate::core::runtime::spawn(async move { session.save_document(table, pk, text).await })
     }
 
     pub fn drop_table(&self, table: TableRef) -> oneshot::Receiver<Result<(), DbError>> {

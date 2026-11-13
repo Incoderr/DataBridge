@@ -15,7 +15,7 @@ use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
-use crate::core::model::is_select_like;
+use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
     QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
@@ -120,11 +120,19 @@ impl DbSession for MySqlSession {
         .fetch_all(&pool)
         .await
         .map_err(|e| DbError::with_source("failed to list MySQL databases", e))?;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
-            out.push(schema_meta(&pool, name).await?);
+        // Databases introspect concurrently (bounded by the pool size).
+        let mut set = tokio::task::JoinSet::new();
+        for (ix, name) in names.into_iter().enumerate() {
+            let pool = pool.clone();
+            set.spawn(async move { (ix, schema_meta(&pool, name).await) });
         }
-        Ok(out)
+        let mut out = Vec::new();
+        while let Some(done) = set.join_next().await {
+            let (ix, meta) = done.map_err(|_| DbError::new("schema introspection task failed"))?;
+            out.push((ix, meta?));
+        }
+        out.sort_by_key(|(ix, _)| *ix);
+        Ok(out.into_iter().map(|(_, m)| m).collect())
     }
 
     async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, DbError> {
@@ -155,20 +163,38 @@ impl DbSession for MySqlSession {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = mysql_ident(&table.schema, &table.name);
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
-            .fetch_one(pool)
-            .await
-            .map_err(|e| {
-                DbError::with_source(format!("failed to count {}.{}", table.schema, table.name), e)
-            })?;
-        let rows = sqlx::query(&format!("SELECT * FROM {ident} LIMIT ? OFFSET ?"))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| {
-                DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
-            })?;
+        // The page and InnoDB's row estimate in parallel; an exact
+        // COUNT(*) only when neither settles the total.
+        let page_sql = format!("SELECT * FROM {ident} LIMIT ? OFFSET ?");
+        let page = sqlx::query(&page_sql).bind(limit).bind(offset).fetch_all(pool);
+        // TABLE_ROWS: an estimate for InnoDB, NULL for views.
+        let estimate = sqlx::query_scalar::<_, Option<u64>>(
+            "SELECT TABLE_ROWS FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+        )
+        .bind(&table.schema)
+        .bind(&table.name)
+        .fetch_optional(pool);
+        let (rows, estimate) = tokio::join!(page, estimate);
+        let rows = rows.map_err(|e| {
+            DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
+        })?;
+        let estimate = estimate.ok().flatten().flatten().map(|n| n.min(i64::MAX as u64) as i64);
+        let (total, exact) = match total_without_count(offset, limit, rows.len(), estimate) {
+            Some(t) => t,
+            None => {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| {
+                        DbError::with_source(
+                            format!("failed to count {}.{}", table.schema, table.name),
+                            e,
+                        )
+                    })?;
+                (n as u64, true)
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut r = Vec::with_capacity(row.len());
@@ -179,9 +205,12 @@ impl DbSession for MySqlSession {
         }
         Ok(Page {
             rows: out,
-            total: total as u64,
-            truncated: total as u64 > offset + limit,
+            total,
+            exact,
+            truncated: total > offset + limit,
             elapsed_ms: t0.elapsed().as_millis() as u32,
+            columns: None,
+            documents: None,
         })
     }
 
@@ -339,52 +368,66 @@ impl DbSession for MySqlSession {
 
 /// Introspect one database: tables/views with batched columns and keys.
 async fn schema_meta(pool: &MySqlPool, schema: String) -> Result<SchemaMeta, DbError> {
-    let rels: Vec<(String, String)> = sqlx::query_as(
-        "SELECT table_name, table_type FROM information_schema.tables \
-         WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') \
-         ORDER BY table_name",
-    )
-    .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to list tables of {schema}"), e))?;
+    // The four catalog queries run in parallel (pool connections) — one
+    // round trip of latency per database instead of four.
+    let rels = async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT table_name, table_type FROM information_schema.tables \
+             WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') \
+             ORDER BY table_name",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::with_source(format!("failed to list tables of {schema}"), e))
+    };
 
-    let cols: Vec<(String, String, String, String, String, Option<String>, String)> =
-        sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let cols = async {
+        sqlx::query_as::<_, (String, String, String, String, String, Option<String>, String)>(
             "SELECT table_name, column_name, column_type, data_type, is_nullable, \
                     column_default, extra \
              FROM information_schema.columns \
              WHERE table_schema = ? \
              ORDER BY table_name, ordinal_position",
         )
-    .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))?;
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::with_source(format!("failed to read columns of {schema}"), e))
+    };
 
-    let pks: Vec<(String, String)> = sqlx::query_as(
-        "SELECT tc.table_name, kcu.column_name \
-         FROM information_schema.table_constraints tc \
-         JOIN information_schema.key_column_usage kcu \
-           ON kcu.constraint_name = tc.constraint_name \
-          AND kcu.table_schema = tc.table_schema \
-         WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ?",
-    )
-    .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to read primary keys of {schema}"), e))?;
+    let pks = async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT tc.table_name, kcu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.table_schema = tc.table_schema \
+             WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = ?",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            DbError::with_source(format!("failed to read primary keys of {schema}"), e)
+        })
+    };
 
-    let funcs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT routine_name, data_type \
-         FROM information_schema.routines \
-         WHERE routine_schema = ? AND routine_type = 'FUNCTION' \
-         ORDER BY routine_name",
-    )
-    .bind(&schema)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| DbError::with_source(format!("failed to list functions of {schema}"), e))?;
+    let funcs = async {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT routine_name, data_type \
+             FROM information_schema.routines \
+             WHERE routine_schema = ? AND routine_type = 'FUNCTION' \
+             ORDER BY routine_name",
+        )
+        .bind(&schema)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| DbError::with_source(format!("failed to list functions of {schema}"), e))
+    };
+
+    let (rels, cols, pks, funcs) = tokio::try_join!(rels, cols, pks, funcs)?;
 
     let pk_set: HashSet<(String, String)> = pks.into_iter().collect();
 

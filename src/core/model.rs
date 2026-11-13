@@ -363,8 +363,159 @@ pub struct SchemaMeta {
 pub struct Page {
     pub rows: Vec<Row>,
     pub total: u64,
+    /// `false` when `total` is a planner/statistics estimate (big tables:
+    /// an exact `COUNT(*)` would scan them) — the grid shows `~total` and
+    /// pages on while pages come back full.
+    pub exact: bool,
     pub truncated: bool,
     pub elapsed_ms: u32,
+    /// Set when the driver discovered (or widened) the result's columns
+    /// while fetching — schemaless sources (MongoDB) whose tree carries no
+    /// columns until a collection is opened. Rows are ordered by these.
+    pub columns: Option<Vec<ColumnMeta>>,
+    /// Document stores: each row's full document (parallel to `rows`) —
+    /// nested fields and keys missing from `columns` included. Drives the
+    /// grid's JSON view, the document tree and the whole-document editor.
+    pub documents: Option<Vec<DocNode>>,
+}
+
+/// One value of a document (MongoDB), already rendered for display:
+/// leaves carry their mongosh literal, which [`format_document`] joins
+/// into text the driver parses back (the document editor round trip).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocNode {
+    /// A leaf as a mongosh literal: `"text"`, `42`, `NumberLong(7)`,
+    /// `ObjectId("…")`, `ISODate("…")`, … `kind` picks the color;
+    /// `None` is `null`.
+    Scalar {
+        text: String,
+        kind: Option<ColumnKind>,
+    },
+    Object(Vec<(String, DocNode)>),
+    Array(Vec<DocNode>),
+}
+
+impl DocNode {
+    /// Collapsed label of a container: `{ 3 fields }`, `[ 5 items ]`.
+    pub fn summary(&self) -> String {
+        let plural = |n: usize, one: &str, many: &str| {
+            format!("{n} {}", if n == 1 { one } else { many })
+        };
+        match self {
+            DocNode::Scalar { text, .. } => text.clone(),
+            DocNode::Object(f) => format!("{{ {} }}", plural(f.len(), "field", "fields")),
+            DocNode::Array(a) => format!("[ {} ]", plural(a.len(), "item", "items")),
+        }
+    }
+
+    /// The value of a top-level field.
+    pub fn field(&self, name: &str) -> Option<&DocNode> {
+        match self {
+            DocNode::Object(f) => f.iter().find(|(k, _)| k == name).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// This document without one top-level field (Duplicate drops `_id`).
+    pub fn without(&self, name: &str) -> DocNode {
+        match self {
+            DocNode::Object(f) => {
+                DocNode::Object(f.iter().filter(|(k, _)| k != name).cloned().collect())
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// A document as indented mongosh text (2 spaces; short scalar arrays
+/// inline). Keys are quoted only when they are not plain identifiers.
+pub fn format_document(node: &DocNode) -> String {
+    fn key(k: &str) -> String {
+        let plain = k
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+            && k.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if plain {
+            k.to_string()
+        } else {
+            serde_json::to_string(k).unwrap_or_else(|_| format!("\"{k}\""))
+        }
+    }
+    fn go(n: &DocNode, depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth + 1);
+        let close = "  ".repeat(depth);
+        match n {
+            DocNode::Scalar { text, .. } => out.push_str(text),
+            DocNode::Object(f) if f.is_empty() => out.push_str("{}"),
+            DocNode::Array(a) if a.is_empty() => out.push_str("[]"),
+            DocNode::Array(a)
+                if a.iter().all(|x| matches!(x, DocNode::Scalar { .. }))
+                    && a.iter().map(|x| x.summary().len() + 2).sum::<usize>() <= 60 =>
+            {
+                let items: Vec<String> = a.iter().map(DocNode::summary).collect();
+                out.push('[');
+                out.push_str(&items.join(", "));
+                out.push(']');
+            }
+            DocNode::Object(f) => {
+                out.push_str("{\n");
+                for (i, (k, v)) in f.iter().enumerate() {
+                    out.push_str(&pad);
+                    out.push_str(&key(k));
+                    out.push_str(": ");
+                    go(v, depth + 1, out);
+                    out.push_str(if i + 1 < f.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&close);
+                out.push('}');
+            }
+            DocNode::Array(a) => {
+                out.push_str("[\n");
+                for (i, v) in a.iter().enumerate() {
+                    out.push_str(&pad);
+                    go(v, depth + 1, out);
+                    out.push_str(if i + 1 < a.len() { ",\n" } else { "\n" });
+                }
+                out.push_str(&close);
+                out.push(']');
+            }
+        }
+    }
+    let mut out = String::new();
+    go(node, 0, &mut out);
+    out
+}
+
+/// Tables at least this big (by the statistics estimate) get no exact
+/// `COUNT(*)` on page loads.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+pub const ESTIMATE_THRESHOLD: u64 = 100_000;
+
+/// The page's `(total, exact)` when it can be had without `COUNT(*)`:
+/// a short page ends the table (exact), and a statistics estimate of a
+/// big table is good enough (approximate — but never below what the
+/// grid already knows exists, so "next page" stays enabled). `None`
+/// means: run the exact count.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+pub fn total_without_count(offset: u64, limit: u64, fetched: usize, estimate: Option<i64>) -> Option<(u64, bool)> {
+    let fetched = fetched as u64;
+    if fetched < limit && (fetched > 0 || offset == 0) {
+        return Some((offset + fetched, true));
+    }
+    match estimate {
+        Some(e) if e >= ESTIMATE_THRESHOLD as i64 => Some(((e as u64).max(offset + fetched + 1), false)),
+        _ => None,
+    }
+}
+
+/// `24,812`, or `~24,812` for an estimate.
+pub fn total_label(total: u64, exact: bool) -> String {
+    if exact {
+        group_digits(total)
+    } else {
+        format!("~{}", group_digits(total))
+    }
 }
 
 /// Result of an arbitrary SQL statement (Stage 5): either a result set
@@ -442,6 +593,26 @@ pub fn is_select_like(sql: &str) -> bool {
     }
 }
 
+/// Statements after which the schema tree must reload: SQL DDL, and the
+/// mongosh calls that create or drop collections/databases (an insert
+/// into a missing collection creates it).
+pub fn changes_schema(stmt: &str) -> bool {
+    match first_keyword(stmt).as_str() {
+        "create" | "drop" | "alter" | "rename" => true,
+        "db" => [
+            ".drop(",
+            ".dropDatabase(",
+            ".createCollection(",
+            ".createView(",
+            ".renameCollection(",
+            ".insert",
+        ]
+        .iter()
+        .any(|m| stmt.contains(m)),
+        _ => false,
+    }
+}
+
 /// Parse the simplified editor's input for one column into a typed
 /// [`Value`]. Empty input becomes NULL (only when the column allows it);
 /// numeric and boolean columns parse strictly; binary columns are not
@@ -513,12 +684,12 @@ pub struct Relation {
 }
 
 /// Result metadata status line: `N rows fetched in X ms`.
-pub fn status_line(elapsed_ms: u32, row_count: usize, total: u64) -> String {
+pub fn status_line(elapsed_ms: u32, row_count: usize, total: u64, exact: bool) -> String {
     let plural = if row_count == 1 { "" } else { "s" };
     if total > row_count as u64 {
         format!(
             "{row_count} row{plural} fetched in {elapsed_ms} ms (truncated; {} total)",
-            group_digits(total)
+            total_label(total, exact)
         )
     } else {
         format!("{row_count} row{plural} fetched in {elapsed_ms} ms")
@@ -557,5 +728,49 @@ mod tests {
         assert!(!is_select_like("insert into t(returning_flag) values (1)"));
         assert!(!is_select_like("CREATE TABLE t (id int)"));
         assert!(!is_select_like("tablespace_thing"));
+    }
+
+    #[test]
+    fn totals_without_count() {
+        // Short first page: the whole table.
+        assert_eq!(total_without_count(0, 50, 7, None), Some((7, true)));
+        assert_eq!(total_without_count(0, 50, 0, None), Some((0, true)));
+        // Short later page.
+        assert_eq!(total_without_count(100, 50, 3, Some(10)), Some((103, true)));
+        // Full page, small or unknown estimate: count it.
+        assert_eq!(total_without_count(0, 50, 50, Some(500)), None);
+        assert_eq!(total_without_count(0, 50, 50, Some(-1)), None);
+        // Past the end: count.
+        assert_eq!(total_without_count(100, 50, 0, Some(10)), None);
+        // Big table: the estimate, never below the rows already seen.
+        assert_eq!(total_without_count(0, 50, 50, Some(2_000_000)), Some((2_000_000, false)));
+        assert_eq!(total_without_count(300_000, 50, 50, Some(200_000)), Some((300_051, false)));
+        assert_eq!(total_label(1234, false), "~1,234");
+    }
+
+    #[test]
+    fn documents_format_as_mongosh() {
+        let s = |t: &str| DocNode::Scalar { text: t.into(), kind: Some(ColumnKind::Text) };
+        let doc = DocNode::Object(vec![
+            ("_id".into(), s("ObjectId(\"65a1b2c3d4e5f60718293a4b\")")),
+            ("tags".into(), DocNode::Array(vec![s("\"a\""), s("\"b\"")])),
+            ("my key".into(), DocNode::Object(vec![("n".into(), s("1"))])),
+            ("empty".into(), DocNode::Object(vec![])),
+        ]);
+        assert_eq!(
+            format_document(&doc),
+            "{\n  _id: ObjectId(\"65a1b2c3d4e5f60718293a4b\"),\n  tags: [\"a\", \"b\"],\n  \
+             \"my key\": {\n    n: 1\n  },\n  empty: {}\n}"
+        );
+        assert_eq!(doc.field("tags").unwrap().summary(), "[ 2 items ]");
+        assert!(doc.without("_id").field("_id").is_none());
+    }
+
+    #[test]
+    fn schema_change_sniff() {
+        assert!(changes_schema("DROP TABLE t"));
+        assert!(changes_schema("db.logs.insertOne({ a: 1 })"));
+        assert!(changes_schema("db.createCollection('x')"));
+        assert!(!changes_schema("db.logs.find({ dropped: true })"));
     }
 }

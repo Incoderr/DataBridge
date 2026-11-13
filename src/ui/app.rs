@@ -100,6 +100,9 @@ pub struct DataBridge {
     pub filter_only_tables: bool,
     pub nav_width: f32,
     pub resizing_nav: bool,
+    /// AI chat panel width (logical px), dragged by the `ai-splitter`.
+    pub ai_width: f32,
+    pub resizing_ai: bool,
     /// Flat visible-row model of the explorer tree — rebuilt on every
     /// render by `render_nav_tree`; the virtual list turns only the
     /// on-screen range into elements.
@@ -113,10 +116,15 @@ pub struct DataBridge {
     pub query_seq: u32,
     /// Stale guard of the schema-tree loads (connect + DDL reloads).
     pub schemas_id: u64,
-    /// Live SQL editors by tab id. Records/diagram views remount on every
-    /// tab switch (web-app parity); a query tab must not — that would drop
-    /// the typed statement and its results.
+    /// Live SQL editors by tab id. Diagram views remount on every tab
+    /// switch (web-app parity); a query tab must not — that would drop the
+    /// typed statement and its results.
     pub query_views: HashMap<String, Entity<QueryView>>,
+    /// Live records grids by tab id: switching back shows the loaded page
+    /// (and its scroll/selection) instead of refetching it — the web app
+    /// remounted, which on a remote database meant a round trip per click.
+    /// Refresh / Run reload explicitly.
+    pub records_views: HashMap<String, Entity<RecordsView>>,
     /// The tree context menu's "Drop table…" awaiting confirmation.
     pub pending_drop: Option<PendingDrop>,
     /// Stale guard of drop requests (a new request / cancel supersedes).
@@ -180,12 +188,15 @@ impl DataBridge {
             filter_only_tables: false,
             nav_width: 288.0,
             resizing_nav: false,
+            ai_width: 380.0,
+            resizing_ai: false,
             nav_rows: Vec::new(),
             tree_scroll: VirtualListScrollHandle::new(),
             show_settings: false,
             query_seq: 0,
             schemas_id: 0,
             query_views: HashMap::new(),
+            records_views: HashMap::new(),
             pending_drop: None,
             drop_id: 0,
             grid_view: true,
@@ -318,20 +329,26 @@ impl DataBridge {
         let tab = self.tabs[ix].clone();
         let app = cx.entity().downgrade();
         self.view = Some(match tab.kind {
-            TabKind::Records(_) => WorkspaceView::Records(cx.new(|cx| {
-                let TabKind::Records(table) = &tab.kind else {
-                    unreachable!("diagram tabs open the diagram view")
-                };
-                RecordsView::new(
-                    conn.clone(),
-                    session.clone(),
-                    tab.schema.clone(),
-                    table.clone(),
-                    app,
-                    window,
-                    cx,
-                )
-            })),
+            TabKind::Records(ref table) => {
+                let view = self
+                    .records_views
+                    .entry(tab.id.clone())
+                    .or_insert_with(|| {
+                        cx.new(|cx| {
+                            RecordsView::new(
+                                conn.clone(),
+                                session.clone(),
+                                tab.schema.clone(),
+                                table.clone(),
+                                app,
+                                window,
+                                cx,
+                            )
+                        })
+                    })
+                    .clone();
+                WorkspaceView::Records(view)
+            }
             TabKind::Diagram => {
                 // The canvas shows tables and views of the schema.
                 let tables = self
@@ -370,6 +387,7 @@ impl DataBridge {
         }
         let closed = self.tabs.remove(ix);
         self.query_views.remove(&closed.id);
+        self.records_views.remove(&closed.id);
         match self.active_tab {
             Some(a) if a == ix => {
                 self.view = None;
@@ -420,8 +438,31 @@ impl DataBridge {
         self.schemas.clear();
         self.tabs.clear();
         self.query_views.clear();
+        self.records_views.clear();
         self.active_tab = None;
         self.view = None;
+        cx.notify();
+    }
+
+    /// A records grid learned its table's columns from a page (MongoDB):
+    /// swap the new meta into the schema tree and the open tabs, so the
+    /// tree, AI context and completion see the columns too.
+    pub fn patch_table_meta(&mut self, meta: Arc<TableMeta>, cx: &mut Context<Self>) {
+        if let Some(schema) = self.schemas.iter_mut().find(|s| s.name == meta.schema) {
+            for t in schema.tables.iter_mut().chain(schema.views.iter_mut()) {
+                if t.name == meta.name {
+                    *t = meta.clone();
+                }
+            }
+        }
+        for tab in &mut self.tabs {
+            if let TabKind::Records(m) = &mut tab.kind
+                && m.schema == meta.schema
+                && m.name == meta.name
+            {
+                *m = meta.clone();
+            }
+        }
         cx.notify();
     }
 
@@ -475,6 +516,7 @@ impl DataBridge {
         self.schemas.clear();
         self.tabs.clear();
         self.query_views.clear();
+        self.records_views.clear();
         self.active_tab = None;
         self.view = None;
         self.query.clear();
@@ -627,6 +669,9 @@ impl DataBridge {
         let active_closed = self
             .active_tab
             .is_some_and(|i| shows(&self.tabs[i]));
+        for t in self.tabs.iter().filter(|t| shows(t)) {
+            self.records_views.remove(&t.id);
+        }
         self.tabs.retain(|t| !shows(t));
         if active_closed {
             self.view = None;
@@ -787,7 +832,7 @@ impl DataBridge {
 
 impl Render for DataBridge {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let resizing = self.resizing_nav;
+        let resizing = self.resizing_nav || self.resizing_ai;
         let show_settings = self.show_settings;
         // Self-heal the hint flag on every frame — but only downwards: no
         // active drag means no hint. Raising it is left to the typed
@@ -887,8 +932,20 @@ impl DataBridge {
             .size_full()
             .bg(p.background)
             .text_color(p.foreground)
-            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                if this.resizing_nav && !e.dragging() {
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                if this.resizing_ai {
+                    if !e.dragging() {
+                        this.resizing_ai = false;
+                    } else {
+                        // Panel hugs the right edge: width = distance from the
+                        // cursor to the window edge minus the outer padding.
+                        let x: f32 = e.position.x.into();
+                        let vw: f32 = window.viewport_size().width.into();
+                        let max = (vw - this.nav_width - 360.0).max(300.0);
+                        this.ai_width = (vw - x - 10.0).clamp(300.0, max);
+                    }
+                    cx.notify();
+                } else if this.resizing_nav && !e.dragging() {
                     // Button was released outside the window and the OS never
                     // delivered the mouse-up here: drop the drag instead of
                     // sticking to the cursor forever.
@@ -902,8 +959,9 @@ impl DataBridge {
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.resizing_nav {
+                if this.resizing_nav || this.resizing_ai {
                     this.resizing_nav = false;
+                    this.resizing_ai = false;
                     cx.notify();
                 }
             }))
@@ -920,8 +978,9 @@ impl DataBridge {
                             window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx: &mut App| {
                                 if phase == DispatchPhase::Bubble {
                                     view.update(cx, |this, cx| {
-                                        if this.resizing_nav {
+                                        if this.resizing_nav || this.resizing_ai {
                                             this.resizing_nav = false;
+                                            this.resizing_ai = false;
                                             cx.notify();
                                         }
                                     });
@@ -988,10 +1047,27 @@ impl DataBridge {
                         |this, chat| {
                             this.child(
                                 div()
-                                    .w(theme::scaled(380.))
+                                    .id("ai-splitter")
+                                    .w(px(6.))
                                     .h_full()
                                     .flex_none()
-                                    .ml_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_col_resize()
+                                    .hover(move |s| s.bg(p.primary.opacity(0.35)))
+                                    .when(self.resizing_ai, move |s| s.bg(p.primary))
+                                    .child(div().w(px(1.)).h_full().bg(p.toolbar_border))
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.resizing_ai = true;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .w(px(self.ai_width))
+                                    .h_full()
+                                    .flex_none()
                                     .rounded(px(4.))
                                     .border_1()
                                     .border_color(p.toolbar_border)

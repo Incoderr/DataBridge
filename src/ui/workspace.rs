@@ -17,11 +17,14 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{
-    group_digits, parse_cell, status_line, CellChange, ColumnKind, ColumnMeta, ConnectionStatus,
-    DbConnection, Row, TableMeta, TableRef, Value,
+    group_digits, parse_cell, status_line, total_label, CellChange, ColumnKind,
+    ColumnMeta, ConnectionStatus, DbConnection, DocNode, Row, TableMeta, TableRef, Value,
 };
 use crate::core::session::SessionHandle;
 use crate::ui::theme;
+
+mod documents;
+use documents::{DocEdit, DocEditor};
 
 pub const PAGE: u64 = 50;
 
@@ -53,10 +56,14 @@ pub struct RecordsDelegate {
     table: Arc<TableMeta>,
     cols: Vec<Column>,
     pub rows: Vec<Row>,
+    /// Full documents of the page (document stores), parallel to `rows`.
+    pub docs: Option<Vec<DocNode>>,
     pub loading: bool,
     pub error: Option<String>,
     pub page: u64,
     pub total: u64,
+    /// `false` while `total` is a statistics estimate (`Page::exact`).
+    pub exact: bool,
     pub elapsed_ms: u32,
     pub load_id: u64,
     /// The selected row, shared with `RecordsView` (which syncs it from
@@ -91,7 +98,46 @@ fn column_min_width(c: &ColumnMeta) -> f32 {
     }
 }
 
+/// The grid's columns: the fixed row-number column plus one per table column.
+fn grid_columns(table: &TableMeta) -> Vec<Column> {
+    let mut cols = vec![Column::new("#", "#").width(px(44.)).fixed_left()];
+    for c in &table.columns {
+        cols.push(Column::new(c.name.clone(), c.name.clone()).width(px(column_min_width(c))));
+    }
+    cols
+}
+
 impl RecordsDelegate {
+    /// The table this grid shows — replaced when a page reports new
+    /// columns (schemaless sources); `RecordsView` follows it.
+    pub fn table(&self) -> &Arc<TableMeta> {
+        &self.table
+    }
+
+    /// Adopt driver-reported columns (`Page::columns`); a no-op when they
+    /// match what the grid already has.
+    fn set_columns(&mut self, columns: Vec<ColumnMeta>) -> bool {
+        let same = columns.len() == self.table.columns.len()
+            && columns
+                .iter()
+                .zip(&self.table.columns)
+                .all(|(a, b)| a.name == b.name && a.type_ == b.type_);
+        if same {
+            return false;
+        }
+        let mut meta = (*self.table).clone();
+        meta.columns = columns;
+        self.table = Arc::new(meta);
+        self.cols = grid_columns(&self.table);
+        true
+    }
+
+    /// More rows after this page: by the total, or — while the total is
+    /// only an estimate — whenever the page came back full.
+    pub fn has_next(&self) -> bool {
+        (self.page + 1) * PAGE < self.total || (!self.exact && self.rows.len() as u64 == PAGE)
+    }
+
     pub fn new(
         conn: DbConnection,
         session: SessionHandle,
@@ -99,10 +145,7 @@ impl RecordsDelegate {
         table: Arc<TableMeta>,
         sel: Rc<Cell<Option<usize>>>,
     ) -> Self {
-        let mut cols = vec![Column::new("#", "#").width(px(44.)).fixed_left()];
-        for c in &table.columns {
-            cols.push(Column::new(c.name.clone(), c.name.clone()).width(px(column_min_width(c))));
-        }
+        let cols = grid_columns(&table);
         let total = table.row_count;
         Self {
             conn,
@@ -111,10 +154,12 @@ impl RecordsDelegate {
             table,
             cols,
             rows: Vec::new(),
+            docs: None,
             loading: false,
             error: None,
             page: 0,
             total,
+            exact: true,
             elapsed_ms: 0,
             view: None,
             load_id: 0,
@@ -170,11 +215,15 @@ impl RecordsDelegate {
             let result = rx.await;
             this.update(cx, |state, cx| {
                 let d = state.delegate_mut();
+                let mut widened = false;
                 if d.load_id == cur_id {
                     match result {
                         Ok(Ok(page)) => {
+                            widened = page.columns.is_some_and(|c| d.set_columns(c));
                             d.rows = page.rows;
+                            d.docs = page.documents;
                             d.total = page.total;
+                            d.exact = page.exact;
                             d.elapsed_ms = page.elapsed_ms;
                             d.error = None;
                         }
@@ -189,6 +238,10 @@ impl RecordsDelegate {
                     // New page fetched: drop the stale row selection, like the
                     // web version's `setSelectedRow(null)` on rows change.
                     d.sel.set(None);
+                    if widened {
+                        // New column set: let the table rebuild its columns.
+                        state.refresh(cx);
+                    }
                     state.clear_selection(cx);
                     cx.notify();
                 }
@@ -206,7 +259,7 @@ impl RecordsDelegate {
     }
 
     pub fn next_page(&mut self, cx: &mut Context<TableState<Self>>) {
-        if (self.page + 1) * PAGE < self.total {
+        if self.has_next() {
             self.page += 1;
             self.load(cx);
         }
@@ -476,6 +529,12 @@ pub struct RecordsView {
     editor: Option<EditorState>,
     /// Stale guard of the editor's FK lookups (bumped per open / close).
     fk_gen: u64,
+    /// Document stores: JSON (cards) instead of the grid.
+    doc_view: bool,
+    /// Expanded paths of the document trees (`"<row>/<key>/…"`).
+    doc_open: std::collections::HashSet<String>,
+    /// The whole-document editor modal, when open.
+    doc_editor: Option<DocEditor>,
     _obs: Subscription,
 }
 
@@ -509,7 +568,20 @@ impl RecordsView {
             s.delegate_mut().load(cx);
         });
         crate::ui::query::settle_stripes(&state, window, cx);
-        let obs = cx.observe(&state, |_, _, cx| cx.notify());
+        // Follow column changes reported by the driver (schemaless
+        // sources): adopt the new meta, re-stretch the columns, and patch
+        // the app's schema tree so other views (tabs, AI, completion) see it.
+        let obs = cx.observe(&state, |this, state, cx| {
+            let table = state.read(cx).delegate().table().clone();
+            if !Arc::ptr_eq(&table, &this.table) {
+                this.table = table.clone();
+                this.last_table_w = 0.0;
+                if let Some(app) = this.app.upgrade() {
+                    app.update(cx, |app, cx| app.patch_table_meta(table, cx));
+                }
+            }
+            cx.notify()
+        });
         Self {
             conn,
             schema,
@@ -528,6 +600,9 @@ impl RecordsView {
             last_table_w: 0.0,
             editor: None,
             fk_gen: 0,
+            doc_view: true,
+            doc_open: Default::default(),
+            doc_editor: None,
             _obs: obs,
         }
     }
@@ -590,7 +665,18 @@ impl RecordsView {
         let Some(row) = self.state.read(cx).delegate().rows.get(row_ix).cloned() else {
             return;
         };
-        let editing = self.editor.is_some();
+        let editing = self.editor.is_some() || self.doc_editor.is_some();
+        if self.has_docs(cx) && !editing {
+            match action {
+                RowAction::Edit => {
+                    self.state.update(cx, |s, cx| s.set_selected_row(row_ix, cx));
+                    return self.open_doc_editor(DocEdit::Edit(row_ix), window, cx);
+                }
+                RowAction::Duplicate => return self.open_doc_editor(DocEdit::Duplicate(row_ix), window, cx),
+                RowAction::Insert => return self.open_doc_editor(DocEdit::New, window, cx),
+                _ => {}
+            }
+        }
         match action {
             RowAction::Edit | RowAction::Delete if !editing => {
                 self.state.update(cx, |s, cx| s.set_selected_row(row_ix, cx));
@@ -629,6 +715,9 @@ impl RecordsView {
 
     /// Open the simplified editor for a new row.
     fn open_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_docs(cx) {
+            return self.open_doc_editor(DocEdit::New, window, cx);
+        }
         let inputs = self
             .table
             .columns
@@ -678,6 +767,9 @@ impl RecordsView {
         let Some((ix, row)) = self.selected_row(cx) else {
             return;
         };
+        if self.has_docs(cx) {
+            return self.open_doc_editor(DocEdit::Edit(ix), window, cx);
+        }
         let row_no = self.state.read(cx).delegate().page * PAGE + ix as u64 + 1;
         let inputs = self
             .table
@@ -1399,20 +1491,31 @@ impl Render for RecordsView {
             self.last_sel = sel_now;
             self.sel.set(sel_now);
             self.copied_cell = None;
-            if sel_now.is_some() && !self.show_detail {
+            // (Not in the JSON view: the cards already show the document.)
+            let cards = self.doc_view && d.docs.is_some();
+            if sel_now.is_some() && !self.show_detail && !cards {
                 self.show_detail = true;
             }
         }
         let page = d.page;
         let total = d.total;
+        let exact = d.exact;
+        let has_next = d.has_next();
         let rows_on_page = d.rows.len();
         let loading = d.loading;
         let elapsed = d.elapsed_ms;
-        let page_count = if total == 0 { 1 } else { (total + PAGE - 1) / PAGE };
+        let page_count = if total == 0 { 1 } else { total.div_ceil(PAGE) };
+        let page_count = if exact {
+            group_digits(page_count)
+        } else {
+            format!("~{}", group_digits(page_count.max(page + 2)))
+        };
         let error = d.error.clone();
         let has_pk = self.has_pk();
         let sel_some = self.state.read(cx).selected_row().is_some();
-        let editor_open = self.editor.is_some();
+        let editor_open = self.editor.is_some() || self.doc_editor.is_some();
+        let has_docs = d.docs.is_some();
+        let cards = has_docs && self.doc_view;
 
         let toolbar = h_flex()
             .h(theme::scaled(36.))
@@ -1498,9 +1601,27 @@ impl Render for RecordsView {
                 svg().path("icons/table.svg").size_3p5().text_color(p.foreground),
                 true,
                 hover,
-                Some(p.accent),
-                cx.listener(|_, _, _, _| {}),
+                (!cards).then_some(p.accent),
+                cx.listener(|this, _, _, cx| {
+                    this.doc_view = false;
+                    cx.notify();
+                }),
             ))
+            // Document stores: the JSON (cards) view.
+            .when(has_docs, |t| {
+                t.child(icon_btn(
+                    "view-json",
+                    32.,
+                    svg().path("icons/braces.svg").size_3p5().text_color(p.foreground),
+                    true,
+                    hover,
+                    cards.then_some(p.accent),
+                    cx.listener(|this, _, _, cx| {
+                        this.doc_view = true;
+                        cx.notify();
+                    }),
+                ))
+            })
             .child(icon_btn(
                 "sql",
                 32.,
@@ -1624,7 +1745,16 @@ impl Render for RecordsView {
             let d = st.delegate();
             let sel = st.selected_row();
             let copied_cell = self.copied_cell;
+            let doc_detail = match (sel, d.docs.is_some()) {
+                (Some(ix), true) => Some(ix),
+                _ => None,
+            };
             let inner: AnyElement = match sel.and_then(|ix| d.rows.get(ix)) {
+                // Document stores: the full document as a field tree.
+                Some(_) if doc_detail.is_some() => {
+                    let ix = doc_detail.unwrap_or_default();
+                    self.render_doc_detail(ix, cx).unwrap_or_else(|| div().into_any_element())
+                }
                 Some(row) => div()
                     .flex_1()
                     .min_h_0()
@@ -1828,13 +1958,13 @@ impl Render for RecordsView {
             .child(if loading {
                 "fetching…".to_string()
             } else {
-                format!("{}-{} of {}", lower, upper, group_digits(total))
+                format!("{}-{} of {}", lower, upper, total_label(total, exact))
             })
             .child("·")
             .child(if loading {
                 "—".to_string()
             } else {
-                status_line(elapsed, rows_on_page, total)
+                status_line(elapsed, rows_on_page, total, exact)
             })
             .child(div().flex_1())
             .child(icon_btn(
@@ -1853,7 +1983,7 @@ impl Render for RecordsView {
                 "next",
                 24.,
                 Icon::new(IconName::ChevronRight).with_size(Size::Size(px(13.))),
-                (page + 1) < page_count,
+                has_next,
                 p.tree_hover,
                 None,
                 cx.listener(|this, _, _, cx| {
@@ -1940,7 +2070,10 @@ impl Render for RecordsView {
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .child(Table::new(&self.state).stripe(true).bordered(false).with_size(Size::Large))
+                    .when(!cards, |t| {
+                        t.child(Table::new(&self.state).stripe(true).bordered(false).with_size(Size::Large))
+                    })
+                    .when(cards, |t| t.child(self.render_doc_cards(cx)))
                     .child(
                         canvas(
                             {
@@ -1961,6 +2094,7 @@ impl Render for RecordsView {
             .child(status_bar)
             // The record editor modal, on top of everything.
             .when(self.editor.is_some(), |this| this.child(self.render_editor(cx)))
+            .when(self.doc_editor.is_some(), |this| this.child(self.render_doc_editor(cx)))
     }
 }
 

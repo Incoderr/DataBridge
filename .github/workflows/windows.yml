@@ -1,0 +1,76 @@
+# Windows build of the GPUI app (the repo root is cargo-only; /site has
+# its own toolchain and deploys separately, so it does not trigger this).
+#
+# - every push to main / PR: tests, the mock-only build, a release build;
+#   the zipped exe is kept as a workflow artifact for 14 days.
+# - a pushed tag `v*` (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
+#   the same build, attached to a GitHub Release for that tag.
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["site/**", "**.md"]
+  pull_request:
+    paths-ignore: ["site/**", "**.md"]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test
+
+      - name: Mock-only build (feature isolation)
+        run: cargo check --no-default-features
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "databridge-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/databridge.exe dist/
+          Compress-Archive -Path dist/databridge.exe -DestinationPath "$name.zip" -Force
+          "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: databridge-windows-x64
+          path: ${{ env.ZIP }}
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: databridge-windows-x64
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true

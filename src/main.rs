@@ -1,5 +1,9 @@
 //! DataBridge entry point: window bootstrap, fonts, theme, root view.
 
+// Release builds on Windows are a GUI app: no console window next to it.
+// Debug builds keep the console for logs (`cargo run`).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod core;
 mod drivers;
 mod ui;

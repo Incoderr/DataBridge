@@ -12,7 +12,7 @@ use async_trait::async_trait;
 
 use super::error::DbError;
 use super::model::{
-    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DbType, NodeKind, Page,
+    CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DbType, DocNode, NodeKind, Page,
     Ping, QueryPage, Relation, Row, SchemaMeta, TableMeta, TableRef, Value,
 };
 use super::model::is_select_like;
@@ -351,7 +351,9 @@ fn tree_for(conn: &DbConnection) -> Option<&'static ConnectionTree> {
             DbType::PostgreSql => trees().iter().find(|t| t.connection_id == "pg-prod"),
             DbType::MySql => trees().iter().find(|t| t.connection_id == "mysql-analytics"),
             DbType::Sqlite => trees().iter().find(|t| t.connection_id == "sqlite-local"),
-            DbType::MongoDb => trees().iter().find(|t| t.connection_id == "unauth-mongo"),
+            // Demo documents: the Postgres demo tables, served as
+            // collections with full documents (`mock_documents`).
+            DbType::MongoDb => trees().iter().find(|t| t.connection_id == "pg-prod"),
             DbType::Redis => trees().iter().find(|t| t.connection_id == "staging-pg"),
             // Stage-4 placeholders borrow the closest demo tree.
             DbType::MariaDb | DbType::ClickHouse => {
@@ -620,7 +622,11 @@ impl DbSession for MockSession {
         let ms = self.latency_ms();
         tokio::time::sleep(Duration::from_millis(ms as u64)).await;
         let edits = self.edits.lock().unwrap();
-        Ok(mock_page(&edits, &meta, &table, ms, offset, limit))
+        let mut page = mock_page(&edits, &meta, &table, ms, offset, limit);
+        if self.conn.db_type == DbType::MongoDb {
+            page.documents = Some(mock_documents(&meta, &page.rows));
+        }
+        Ok(page)
     }
 
     async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
@@ -777,6 +783,69 @@ fn mock_page(
     limit: u64,
 ) -> Page {
     let key = format!("{}.{}", table.schema, table.name);
+    mock_page_rows(edits, t, key, latency_ms, offset, limit)
+}
+
+/// Demo documents for `--mock` MongoDB connections: each row as a
+/// document, plus a nested object and an array so the JSON view and the
+/// document tree have something to unfold.
+fn mock_documents(meta: &TableMeta, rows: &[Row]) -> Vec<DocNode> {
+    let leaf = |text: String, kind: Option<ColumnKind>| DocNode::Scalar { text, kind };
+    rows.iter()
+        .map(|row| {
+            let mut fields: Vec<(String, DocNode)> = meta
+                .columns
+                .iter()
+                .zip(row)
+                .map(|(c, v)| {
+                    let node = match v {
+                        Value::Null => leaf("null".into(), None),
+                        Value::Int(n) => leaf(n.to_string(), Some(ColumnKind::Int)),
+                        Value::Float(f) => leaf(format!("{f:?}"), Some(ColumnKind::Float)),
+                        Value::Bool(b) => leaf(b.to_string(), Some(ColumnKind::Bool)),
+                        Value::Str(s) if c.kind == ColumnKind::Date => {
+                            leaf(format!("ISODate(\"{s}\")"), Some(ColumnKind::Date))
+                        }
+                        Value::Str(s) => leaf(
+                            serde_json::to_string(s).unwrap_or_default(),
+                            Some(c.kind),
+                        ),
+                        Value::Bytes(b) => leaf(format!("<{} bytes>", b.len()), Some(ColumnKind::Binary)),
+                    };
+                    (c.name.clone(), node)
+                })
+                .collect();
+            // A deterministic ObjectId-looking `_id`, like a real collection.
+            let seed = format!("{}:{:?}", meta.name, row.first());
+            let h = md5(&seed) as u32;
+            let hex = format!("65{h:08x}{:014x}", (h as u64).wrapping_mul(0x9E37_79B9) & 0xFF_FFFF_FFFF_FFFF);
+            fields.insert(0, ("_id".into(), leaf(format!("ObjectId(\"{hex}\")"), Some(ColumnKind::Uuid))));
+            fields.push((
+                "meta".into(),
+                DocNode::Object(vec![
+                    ("source".into(), leaf("\"demo\"".into(), Some(ColumnKind::Text))),
+                    (
+                        "tags".into(),
+                        DocNode::Array(vec![
+                            leaf("\"mock\"".into(), Some(ColumnKind::Text)),
+                            leaf("\"--mock\"".into(), Some(ColumnKind::Text)),
+                        ]),
+                    ),
+                ]),
+            ));
+            DocNode::Object(fields)
+        })
+        .collect()
+}
+
+fn mock_page_rows(
+    edits: &MockEdits,
+    t: &TableMeta,
+    key: String,
+    latency_ms: u32,
+    offset: u64,
+    limit: u64,
+) -> Page {
     let deleted_here = edits.deleted.iter().filter(|e| e.0 == key).count() as u64;
     let inserted = edits.inserted.get(&key).map(|v| v.len() as u64).unwrap_or(0);
     let gen_count = t.row_count.saturating_sub(deleted_here);
@@ -815,6 +884,9 @@ fn mock_page(
         truncated: total > limit,
         elapsed_ms: latency_ms,
         total,
+        exact: true,
         rows,
+        columns: None,
+        documents: None,
     }
 }

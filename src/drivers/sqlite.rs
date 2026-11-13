@@ -15,7 +15,7 @@ use sqlx::{Column as _, Row, TypeInfo as _};
 use tokio::sync::OnceCell;
 
 use crate::core::error::DbError;
-use crate::core::model::is_select_like;
+use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
     QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
@@ -212,16 +212,26 @@ impl DbSession for SqliteSession {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = sqlite_ident(&table.name);
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
-            .fetch_one(pool)
-            .await
-            .map_err(|e| DbError::with_source(format!("failed to count {}", table.name), e))?;
+        // Local file, no statistics: the page first, COUNT(*) only when the
+        // page came back full (a short page already ends the table).
         let rows = sqlx::query(&format!("SELECT * FROM {ident} LIMIT ? OFFSET ?"))
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch_all(pool)
             .await
             .map_err(|e| DbError::with_source(format!("failed to read {}", table.name), e))?;
+        let total = match total_without_count(offset, limit, rows.len(), None) {
+            Some((n, _)) => n,
+            None => {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|e| {
+                        DbError::with_source(format!("failed to count {}", table.name), e)
+                    })?;
+                n as u64
+            }
+        };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut r = Vec::with_capacity(row.len());
@@ -232,9 +242,12 @@ impl DbSession for SqliteSession {
         }
         Ok(Page {
             rows: out,
-            total: total as u64,
-            truncated: total as u64 > offset + limit,
+            total,
+            exact: true,
+            truncated: total > offset + limit,
             elapsed_ms: t0.elapsed().as_millis() as u32,
+            columns: None,
+            documents: None,
         })
     }
 

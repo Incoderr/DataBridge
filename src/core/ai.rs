@@ -320,6 +320,16 @@ pub fn system_prompt(dialect: Option<DbType>, schemas: &[SchemaMeta]) -> String 
     match dialect {
         Some(t) => {
             let _ = writeln!(s, "Database dialect: {}.", t.label());
+            if t == DbType::MongoDb {
+                s.push_str(
+                    "This is MongoDB, not SQL: write mongosh commands instead of SQL \
+                     (`use <db>`, db.<collection>.find({…}).sort({…}).limit(n), aggregate([…]), \
+                     countDocuments, distinct, insertOne/insertMany, updateOne/updateMany, \
+                     deleteOne/deleteMany, createCollection, getCollectionNames). One command \
+                     per fenced block. The schema lists database.collection(field type) \
+                     from sampled documents.\n",
+                );
+            }
         }
         None => s.push_str("No database is connected.\n"),
     }
@@ -539,6 +549,16 @@ pub fn needs_confirmation(sql: &str) -> bool {
             "drop" | "truncate" => true,
             "delete" | "update" => !has_word("where"),
             "alter" => has_word("drop"),
+            // mongosh: drops, and bulk writes with an empty filter.
+            "db" => {
+                let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+                [".drop(", ".dropdatabase(", ".dropindex(", ".renamecollection("]
+                    .iter()
+                    .any(|m| compact.contains(m))
+                    || ["deletemany(", "updatemany(", "remove("].iter().any(|m| {
+                        compact.contains(&format!("{m})")) || compact.contains(&format!("{m}{{}}"))
+                    })
+            }
             _ => false,
         }
     })
@@ -703,6 +723,10 @@ SELECT 2");
         assert!(needs_confirmation("ALTER TABLE t DROP COLUMN a"));
         assert!(!needs_confirmation("INSERT INTO t VALUES (1)"));
         assert!(!needs_confirmation("SELECT * FROM where_log"));
+        assert!(needs_confirmation("db.orders.drop()"));
+        assert!(needs_confirmation("db.orders.deleteMany({ })"));
+        assert!(!needs_confirmation("db.orders.deleteMany({ status: 'old' })"));
+        assert!(!needs_confirmation("db.orders.find({}).limit(5)"));
     }
 
     #[test]

@@ -40,6 +40,7 @@ static BRAND_ICONS: &[(&str, &[u8])] = &[
 static EXTRA_ICONS: &[(&str, &[u8])] = &[
     ("icons/cube.svg", include_bytes!("../../assets/icons/cube.svg")),
     ("icons/table.svg", include_bytes!("../../assets/icons/table.svg")),
+    ("icons/braces.svg", include_bytes!("../../assets/icons/braces.svg")),
     ("icons/schema.svg", include_bytes!("../../assets/icons/schema.svg")),
     ("icons/sigma.svg", include_bytes!("../../assets/icons/sigma.svg")),
     ("icons/filter.svg", include_bytes!("../../assets/icons/filter.svg")),
