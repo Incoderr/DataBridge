@@ -216,7 +216,7 @@ impl DbSession for PostgresSession {
             let res = sqlx::query(sql)
                 .execute(pool)
                 .await
-                .map_err(|e| DbError::with_source("query failed", e))?;
+                .map_err(super::util::query_error)?;
             return Ok(QueryPage {
                 columns: Vec::new(),
                 rows: Vec::new(),
@@ -228,7 +228,7 @@ impl DbSession for PostgresSession {
         let rows = sqlx::query(sql)
             .fetch_all(pool)
             .await
-            .map_err(|e| DbError::with_source("query failed", e))?;
+            .map_err(super::util::query_error)?;
         let mut columns: Vec<ColumnMeta> = rows
             .first()
             .map(|r| {

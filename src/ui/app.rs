@@ -23,6 +23,7 @@ use crate::core::model::{
 use crate::core::registry;
 use crate::core::session::SessionHandle;
 use crate::core::storage;
+use crate::ui::ai_chat::AiChatView;
 use crate::ui::diagram::SchemaDiagram;
 use crate::ui::nav_tree::{SelectedPath, TreeRow};
 use crate::ui::query::QueryView;
@@ -127,6 +128,10 @@ pub struct DataBridge {
     pub drag_over: bool,
     // connection wizard
     pub wizard: WizardState,
+    /// Right-hand AI chat (Stage 6); created on first open, survives
+    /// reconnects (it reads the active schema on every send).
+    pub ai_chat: Option<Entity<AiChatView>>,
+    pub show_ai: bool,
 }
 
 impl DataBridge {
@@ -186,7 +191,23 @@ impl DataBridge {
             grid_view: true,
             drag_over: false,
             wizard,
+            ai_chat: None,
+            show_ai: false,
         }
+    }
+
+    pub fn toggle_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_ai = !self.show_ai;
+        if self.show_ai && self.ai_chat.is_none() {
+            let app = cx.entity().downgrade();
+            self.ai_chat = Some(cx.new(|cx| AiChatView::new(app, window, cx)));
+        }
+        cx.notify();
+    }
+
+    /// Open a new SQL tab prefilled with `sql` (AI chat "Open in SQL tab").
+    pub fn open_query_tab_seeded(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_query_tab_with(Some(sql), window, cx);
     }
 
     // ---------------- actions ----------------
@@ -961,6 +982,23 @@ impl DataBridge {
                                 Some(WorkspaceView::Query(v)) => v.into_any_element(),
                                 None => self.render_empty_state(cx).into_any_element(),
                             }),
+                    )
+                    .when_some(
+                        self.ai_chat.clone().filter(|_| self.show_ai),
+                        |this, chat| {
+                            this.child(
+                                div()
+                                    .w(theme::scaled(380.))
+                                    .h_full()
+                                    .flex_none()
+                                    .ml_1()
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(p.toolbar_border)
+                                    .overflow_hidden()
+                                    .child(chat),
+                            )
+                        },
                     ),
             )
     }

@@ -33,3 +33,7 @@ rfd = "0.15"
 # Types of gpui-component's `CompletionProvider` (SQL editor autocompletion);
 # keep in step with the version gpui-component depends on.
 lsp-types = "0.97"
+# AI assistant (Stage 6): OpenAI-compatible HTTP + SSE. No bundled crypto
+# provider — rustls+ring is already linked by sqlx; we install it (ai.rs).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2", "charset"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

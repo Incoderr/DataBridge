@@ -77,7 +77,7 @@ fn now_ms() -> u64 {
 
 // ---------- keyring ----------
 
-fn save_secret(id: &str, suffix: &str, value: &str) {
+pub(crate) fn save_secret(id: &str, suffix: &str, value: &str) {
     if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("{id}{suffix}")) {
         if let Err(e) = entry.set_password(value) {
             eprintln!("DataBridge: keyring write failed for {id}{suffix}: {e}");
@@ -85,14 +85,14 @@ fn save_secret(id: &str, suffix: &str, value: &str) {
     }
 }
 
-fn load_secret(id: &str, suffix: &str) -> Option<String> {
+pub(crate) fn load_secret(id: &str, suffix: &str) -> Option<String> {
     keyring::Entry::new(SERVICE, &format!("{id}{suffix}"))
         .ok()?
         .get_password()
         .ok()
 }
 
-fn delete_secret(id: &str, suffix: &str) {
+pub(crate) fn delete_secret(id: &str, suffix: &str) {
     if let Ok(entry) = keyring::Entry::new(SERVICE, &format!("{id}{suffix}")) {
         if let Err(e) = entry.delete_credential() {
             // "not found" is the normal case when nothing was ever stored.

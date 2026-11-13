@@ -54,6 +54,7 @@ src/
     mock.rs       # deterministic mock (the original mock layer, ported from the web app)
     storage.rs    # Stage-3 recent-connections store: connections.json + OS keyring secrets
     completion.rs # SQL autocompletion engine (pure: text + cursor + schema tree -> suggestions)
+    ai.rs         # Stage 6: OpenAI-compatible chat client (SSE streaming), ai.json + keyring key, schema prompt
   drivers/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
@@ -68,6 +69,7 @@ src/
     workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
     query.rs      # SQL editor tab (Stage 5): code-editor input, run button, results grid
     completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
+    ai_chat.rs    # right-hand AI chat panel (AiChatView entity), toggled from the left rail
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
     assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-component-assets
@@ -233,6 +235,28 @@ wizard list).
   `INT PRIMARY KEY` must be supplied.
 - Diagram (`ui/diagram.rs`): Supabase-style ERD, bezier FK edges,
   pan/zoom/fit, relations via `list_relations`.
+- AI chat (`core/ai.rs` + `ui/ai_chat.rs`, Stage 6): **OpenAI-compatible
+  servers only** (Ollama, LM Studio, llama.cpp, vLLM, …; no vendor SDKs).
+  Right-hand panel toggled by the bot icon in the left rail (`sidebar.rs`);
+  base URL + model + mode in `ai.json`, optional API key in the keyring
+  only; `GET /models` fills a picker. The system prompt carries the
+  dialect and a compact schema listing (names/types, capped at 12k chars).
+  Answers stream over SSE (`mpsc` from the sidecar, stale-guarded by
+  `send_id`; Stop drops the task and cancels the request). Enter sends,
+  Ctrl+Enter is a newline. Modes: **Manual** — code blocks get Run / Open
+  in SQL tab / Copy; **Auto** — the answer's statements run in order (stop
+  on first error), outcomes go back as `[ok]`/`[error]` user messages
+  (`describe_outcome`: ≤20 rows TSV — so in Auto mode result rows *do*
+  reach the model) and it continues, ≤ `MAX_AUTO_STEPS` rounds;
+  `needs_confirmation` (DROP, TRUNCATE, ALTER…DROP, UPDATE/DELETE without
+  WHERE; checked per statement via `split_statements`) always waits for
+  Run; a statement that already failed pauses the loop (`repeats_failure`).
+  Retry / Edit message under the last turn. Cyrillic user turns get a
+  "reply in Russian" note (`language_hint`) — small models ignore the
+  system prompt. Conversations persist in `ai_history.json`
+  (≤50, history list in the panel header).
+- Driver errors carry the server message (`drivers::util::query_error`:
+  "query failed: no such table: dual"), not a bare "query failed".
 - Theme (`ui/theme.rs`): use `theme::palette(cx)`; no hardcoded colors
   except `DbType::brand_color()` and grid type tokens (`kind_color`).
   Brand glyphs must be registered in `ui/assets.rs` (`brand/*.svg`).
@@ -268,6 +292,11 @@ wizard list).
   Remaining niceties: result tabs inside one query view, cancellation,
   Ctrl+Enter keybinding.
 
+- **Stage 6 — AI assistant.** OpenAI-compatible only (cloud vendor SDKs
+  deferred). **Started:** side chat with schema context, streaming, model
+  picker, Manual/Auto execution, history. Next: "Fix with AI" on query errors, explain selection, inline
+  completions.
+
 ## Conventions
 
 - Edition 2024. English comments; every module starts with a `//!` doc comment.
@@ -284,7 +313,10 @@ wizard list).
   `keyring` (persistence, OS keyring secrets) and `rfd` (native file picker);
   `uuid` gained the `v4` feature for stable connection ids. `lsp-types`
   (same version as gpui-component's) is required by the editor's
-  `CompletionProvider` trait.
+  `CompletionProvider` trait. Stage 6 sanctioned `reqwest` (HTTP + SSE for
+  the AI chat; `rustls-no-provider`) and a direct `rustls` dep with `ring` —
+  the provider sqlx already links, installed in `core::ai` (avoids
+  aws-lc-rs and its native build).
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 

@@ -121,6 +121,15 @@ impl DataBridge {
                 None,
                 cx.listener(|this, _, _, cx| this.refresh(cx)),
             ))
+            .child(tool_btn(
+                "ai-toggle",
+                "AI assistant",
+                Icon::new(IconName::Bot).with_size(Size::Size(px(16.))),
+                hover,
+                if self.show_ai { Some(p.accent) } else { None },
+                if self.show_ai { Some(p.primary) } else { None },
+                cx.listener(|this, _, window, cx| this.toggle_ai(window, cx)),
+            ))
             .child(div().flex_1())
             .child(tool_btn(
                 "grid-view",

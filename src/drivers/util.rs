@@ -88,3 +88,13 @@ macro_rules! bind_cell {
     }};
 }
 pub(crate) use bind_cell;
+
+/// Statement failure with the server's own message (`no such table: dual`,
+/// syntax errors, …) — a bare "query failed" leaves the user guessing.
+pub(crate) fn query_error(e: sqlx::Error) -> crate::core::error::DbError {
+    let detail = match e.as_database_error() {
+        Some(db) => db.message().to_string(),
+        None => e.to_string(),
+    };
+    crate::core::error::DbError::with_source(format!("query failed: {detail}"), e)
+}

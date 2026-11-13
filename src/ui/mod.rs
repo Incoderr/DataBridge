@@ -1,6 +1,7 @@
 //! GPUI views: the root `DataBridge` entity plus its per-feature render
 //! blocks (wizard, sidebar, explorer tree) and the records workspace.
 
+pub mod ai_chat;
 pub mod app;
 pub mod assets;
 pub mod completion;
