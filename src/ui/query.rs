@@ -3,14 +3,17 @@
 //! through the fetch path, everything else reports affected rows. The
 //! editor autocompletes tables, columns and keywords and shows the
 //! predicted next step as ghost text (`ui/completion.rs`, Tab accepts);
-//! Enter after `(` indents, Ctrl+wheel zooms the editor font.
+//! Enter after `(` indents, Ctrl+wheel zooms the editor font. Ctrl+Enter
+//! runs; while a statement runs, Run turns into Stop (`CancelToken`:
+//! the server is asked to cancel it where the driver can).
 
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, DispatchPhase, Div, Entity, IntoElement, ParentElement, Render,
-    ScrollWheelEvent, Styled, Subscription, WeakEntity, Window, canvas, div, px, relative,
+    App, Context, DispatchPhase, Div, Entity, IntoElement, KeyBinding, ParentElement, Render,
+    ScrollWheelEvent, Styled, Subscription, WeakEntity, Window, actions, canvas, div, px,
+    relative,
 };
 
 use gpui_component::button::{Button, ButtonVariants};
@@ -19,7 +22,7 @@ use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{group_digits, DbConnection, QueryPage, Row};
-use crate::core::session::SessionHandle;
+use crate::core::session::{CancelToken, SessionHandle};
 use crate::ui::app::DataBridge;
 use crate::ui::completion::SqlCompletions;
 use crate::ui::{settings, theme};
@@ -30,6 +33,23 @@ const INDENT: &str = "    ";
 /// Rows kept in the result grid from one statement (like the web
 /// version's `QUERY_LIMIT`).
 pub const RESULT_LIMIT: u64 = 500;
+
+actions!(query, [RunQuery]);
+
+/// Key context of the SQL editor pane (scopes Ctrl+Enter to it — the AI
+/// chat's input keeps Ctrl+Enter as a newline).
+const EDITOR_CONTEXT: &str = "SqlEditor";
+
+/// Ctrl+Enter (Cmd+Enter on macOS) runs the statement. Registered after
+/// `gpui_component::init`, so it wins over the input's own
+/// "secondary-enter" (newline) binding inside the SQL editor only.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "secondary-enter",
+        RunQuery,
+        Some(&format!("{EDITOR_CONTEXT} > Input")),
+    )]);
+}
 
 /// Statements that change the schema tree (SQL DDL, mongosh collection
 /// calls).
@@ -160,6 +180,12 @@ pub struct QueryView {
     table: Option<Entity<TableState<QueryDelegate>>>,
     running: bool,
     run_id: u64,
+    /// Stops the running statement (Stop button); `None` when idle.
+    cancel: Option<CancelToken>,
+    /// Stop was pressed: the run's outcome reads "cancelled", not an error.
+    cancelling: bool,
+    /// The last run ended by Stop.
+    cancelled: bool,
     error: Option<String>,
     last: Option<RunSummary>,
     _obs: Option<Subscription>,
@@ -208,6 +234,9 @@ impl QueryView {
             table: None,
             running: false,
             run_id: 0,
+            cancel: None,
+            cancelling: false,
+            cancelled: false,
             error: None,
             last: None,
             _obs: None,
@@ -220,17 +249,24 @@ impl QueryView {
     pub fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sql = self.editor.read(cx).value().to_string();
         if sql.trim().is_empty() {
-            self.error = Some("type a statement first".into());
+            self.error = Some(tr!("query.empty").into());
             cx.notify();
             return;
         }
+        if self.running {
+            return;
+        }
         self.running = true;
+        self.cancelling = false;
+        self.cancelled = false;
         self.error = None;
         self.run_id += 1;
         let id = self.run_id;
         let ddl = is_ddl(&sql);
         cx.notify();
-        let rx = self.session.execute(sql, RESULT_LIMIT);
+        let cancel = CancelToken::new();
+        self.cancel = Some(cancel.clone());
+        let rx = self.session.execute(sql, RESULT_LIMIT, cancel);
         cx.spawn_in(window, async move |this, cx| {
             let result = rx.await;
             cx.update(|window, cx| {
@@ -239,7 +275,18 @@ impl QueryView {
                         return; // a newer run superseded this one
                     }
                     q.running = false;
+                    q.cancel = None;
+                    let cancelled = std::mem::take(&mut q.cancelling);
                     match result {
+                        // Stopped by the user: whatever came back (usually
+                        // the server's "canceling statement" error) is moot.
+                        _ if cancelled => {
+                            q.cancelled = true;
+                            // A DDL statement may have committed anyway.
+                            if ddl {
+                                q.app.update(cx, |app, cx| app.reload_schemas(cx)).ok();
+                            }
+                        }
                         Ok(Ok(page)) => {
                             q.apply_result(page, window, cx);
                             // New / dropped / altered objects: refresh the tree.
@@ -257,6 +304,16 @@ impl QueryView {
             .ok();
         })
         .detach();
+    }
+
+    /// Stop the running statement. The run ends once the driver reports
+    /// back (at most `CANCEL_GRACE` after the server was asked to stop).
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            self.cancelling = true;
+            cx.notify();
+        }
     }
 
     fn apply_result(&mut self, page: QueryPage, window: &mut Window, cx: &mut Context<Self>) {
@@ -293,17 +350,21 @@ impl Render for QueryView {
         let p = theme::palette(cx);
 
         let status: String = match (&self.last, self.running) {
-            (_, true) => "running…".into(),
-            (Some(RunSummary { affected, elapsed_ms, .. }), _) if *affected > 0 => format!("{affected} row(s) affected · {elapsed_ms} ms"),
+            (_, true) if self.cancelling => tr!("query.cancelling").into(),
+            (_, true) => tr!("query.running_status").into(),
+            _ if self.cancelled => tr!("query.cancelled").into(),
+            (Some(RunSummary { affected, elapsed_ms, .. }), _) if *affected > 0 => tr!("query.affected", n = affected, ms = elapsed_ms).to_string(),
             (Some(RunSummary { has_columns: false, elapsed_ms, .. }), _) => {
-                format!("statement executed · {elapsed_ms} ms")
+                tr!("query.executed", ms = elapsed_ms).to_string()
             }
-            (Some(RunSummary { rows, truncated, elapsed_ms, .. }), _) => format!(
-                "{} rows{} · {elapsed_ms} ms",
-                group_digits(*rows as u64),
-                if *truncated { " (truncated)" } else { "" }
-            ),
-            (None, _) => "no statement run yet".into(),
+            (Some(RunSummary { rows, truncated, elapsed_ms, .. }), _) => tr!(
+                "query.rows",
+                n = group_digits(*rows as u64),
+                more = if *truncated { tr!("query.truncated").to_string() } else { String::new() },
+                ms = elapsed_ms
+            )
+            .to_string(),
+            (None, _) => tr!("query.idle").into(),
         };
 
         let toolbar = h_flex()
@@ -315,16 +376,25 @@ impl Render for QueryView {
             .border_b_1()
             .border_color(p.toolbar_border)
             .bg(p.toolbar)
-            .child(
+            .child(if self.running {
+                Button::new("stop")
+                    .danger()
+                    .small()
+                    .icon(IconName::CircleX)
+                    .label(tr!("query.stop"))
+                    .tooltip(tr!("query.stop_hint"))
+                    .disabled(self.cancelling)
+                    .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+            } else {
                 Button::new("run")
                     .primary()
                     .small()
-                    .label(if self.running { "Running…" } else { "Run" })
-                    .disabled(self.running)
+                    .label(tr!("common.run"))
+                    .tooltip(tr!("query.run_hint"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.run(window, cx);
-                    })),
-            )
+                    }))
+            })
             .child(
                 div()
                     .text_size(theme::scaled(theme::TEXT_SM))
@@ -344,7 +414,7 @@ impl Render for QueryView {
                 div()
                     .text_size(theme::scaled(theme::TEXT_XS))
                     .text_color(p.muted_fg)
-                    .child(format!("limit {} rows", RESULT_LIMIT)),
+                    .child(tr!("query.limit", n = RESULT_LIMIT)),
             );
 
         // The editor pane: fixed share of the view; the code-editor input
@@ -352,6 +422,8 @@ impl Render for QueryView {
         // `.h`) is what makes a multi-line editor actually grow.
         let has_results = self.table.is_some();
         let editor_pane = v_flex()
+            .key_context(EDITOR_CONTEXT)
+            .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
             .flex_1()
             .min_h(theme::scaled(120.))
             .when(has_results, |this| this.border_b_1())

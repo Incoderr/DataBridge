@@ -1,0 +1,682 @@
+# DataBridge UI strings, looked up with `t!("key")` (rust-i18n, see main.rs).
+# One entry per key with every language next to it — a missing translation
+# is visible at a glance and falls back to `en` at runtime.
+# Language names in the Settings dialog are not translated (ui/settings.rs).
+_version: 2
+
+settings.title:
+  en: Settings
+  ru: Настройки
+settings.scale:
+  en: Interface size
+  ru: Размер интерфейса
+settings.scale_compact:
+  en: Compact
+  ru: Компактный
+settings.scale_normal:
+  en: Normal
+  ru: Обычный
+settings.scale_large:
+  en: Large
+  ru: Крупный
+settings.theme:
+  en: Theme
+  ru: Тема
+settings.theme_light:
+  en: Light
+  ru: Светлая
+settings.theme_dark:
+  en: Dark
+  ru: Тёмная
+settings.language:
+  en: Language
+  ru: Язык
+
+sidebar.new_connection:
+  en: "New connection"
+  ru: "Новое подключение"
+sidebar.refresh:
+  en: "Refresh"
+  ru: "Обновить"
+ai.title:
+  en: "AI assistant"
+  ru: "AI-ассистент"
+sidebar.disconnect:
+  en: "Disconnect"
+  ru: "Отключиться"
+sidebar.active:
+  en: "Active: %{name}"
+  ru: "Активно: %{name}"
+tree.schemas:
+  en: "Schemas"
+  ru: "Схемы"
+tree.last_failed:
+  en: "Last connection attempt failed."
+  ru: "Последняя попытка подключения не удалась."
+tree.not_open:
+  en: "Connection not open."
+  ru: "Подключение не открыто."
+tree.refresh_hint:
+  en: "Refresh or pick another connection."
+  ru: "Обновите или выберите другое подключение."
+tree.empty:
+  en: "Schemas list is empty."
+  ru: "Список схем пуст."
+tree.drop_view:
+  en: "Drop view…"
+  ru: "Удалить представление…"
+tree.drop_table:
+  en: "Drop table…"
+  ru: "Удалить таблицу…"
+tree.open:
+  en: "Open"
+  ru: "Открыть"
+tree.diagram:
+  en: "Schema diagram"
+  ru: "Диаграмма схемы"
+common.new_table:
+  en: "New table"
+  ru: "Новая таблица"
+tree.tables:
+  en: "Tables (%{n})"
+  ru: "Таблицы (%{n})"
+tree.views:
+  en: "Views (%{n})"
+  ru: "Представления (%{n})"
+tree.routines:
+  en: "Routines (%{n})"
+  ru: "Функции (%{n})"
+tree.no_matches:
+  en: "No matches for “%{q}”"
+  ru: "Ничего не найдено по «%{q}»"
+app.drop_here:
+  en: "Drop the database file here"
+  ru: "Перетащите файл базы сюда"
+common.cancel:
+  en: "Cancel"
+  ru: "Отмена"
+app.dropping:
+  en: "Dropping…"
+  ru: "Удаление…"
+app.drop:
+  en: "Drop"
+  ru: "Удалить"
+app.tab_diagram:
+  en: "diagram"
+  ru: "диаграмма"
+app.tab_query:
+  en: "query %{n}"
+  ru: "запрос %{n}"
+app.drop_title:
+  en: "Drop %{what}?"
+  ru: "Удалить %{what}?"
+app.drop_body:
+  en: "%{name} and all of its data will be permanently deleted. This cannot be undone."
+  ru: "%{name} и все её данные будут удалены безвозвратно. Это нельзя отменить."
+connect.tagline:
+  en: "Database Explorer"
+  ru: "Обозреватель баз данных"
+connect.choose_hint:
+  en: "Choose a database type to connect, pick an existing connection, or drop a SQLite file onto the window."
+  ru: "Выберите тип базы данных, одно из сохранённых подключений или перетащите файл SQLite в окно."
+connect.form_hint:
+  en: "Configure connection properties. Click Test Connection to verify."
+  ru: "Заполните параметры подключения. Нажмите «Проверить подключение», чтобы проверить их."
+connect.establishing:
+  en: "Establishing connection…"
+  ru: "Устанавливается подключение…"
+connect.window_title:
+  en: "New Connection — DataBridge"
+  ru: "Новое подключение — DataBridge"
+connect.coming_soon:
+  en: "coming soon"
+  ru: "скоро"
+connect.embedded:
+  en: "embedded file"
+  ru: "локальный файл"
+connect.db_type:
+  en: "Database type"
+  ru: "Тип базы данных"
+connect.drag_or:
+  en: "…or drag & drop a SQLite file onto this window, or"
+  ru: "…или перетащите файл SQLite в это окно, или"
+connect.create_sqlite:
+  en: "create a new SQLite database"
+  ru: "создайте новую базу SQLite"
+connect.existing:
+  en: "Existing connections"
+  ru: "Сохранённые подключения"
+connect.no_saved:
+  en: "No saved connections yet — create one above."
+  ru: "Сохранённых подключений пока нет — создайте новое выше."
+common.name:
+  en: "Name"
+  ru: "Название"
+connect.fields:
+  en: "Fields"
+  ru: "Поля"
+connect.url_label:
+  en: "Connection URL"
+  ru: "URL подключения"
+connect.host:
+  en: "Host"
+  ru: "Хост"
+connect.port:
+  en: "Port"
+  ru: "Порт"
+connect.database:
+  en: "Database"
+  ru: "База данных"
+connect.user:
+  en: "User"
+  ru: "Пользователь"
+connect.local_file:
+  en: "local file"
+  ru: "локальный файл"
+connect.back:
+  en: "Back"
+  ru: "Назад"
+connect.testing:
+  en: "Testing…"
+  ru: "Проверка…"
+connect.test:
+  en: "Test Connection"
+  ru: "Проверить подключение"
+connect.connect:
+  en: "Connect"
+  ru: "Подключиться"
+connect.test_ok:
+  en: "Test connection: SUCCESS"
+  ru: "Проверка подключения: успешно"
+connect.test_cancelled:
+  en: "Test connection was cancelled"
+  ru: "Проверка подключения отменена"
+connect.only_sqlite:
+  en: "Only SQLite database files can be dropped here (.db, .sqlite, .sqlite3, .db3)."
+  ru: "Сюда можно перетащить только файлы SQLite (.db, .sqlite, .sqlite3, .db3)."
+connect.sqlite_filter:
+  en: "SQLite database"
+  ru: "База данных SQLite"
+connect.open_sqlite:
+  en: "Open SQLite database"
+  ru: "Открыть базу SQLite"
+connect.new_sqlite:
+  en: "Create SQLite database"
+  ru: "Создать базу SQLite"
+connect.need_url:
+  en: "Connection URL is required"
+  ru: "Укажите URL подключения"
+connect.need_host:
+  en: "Host is required"
+  ru: "Укажите хост"
+connect.need_db:
+  en: "Database name/path is required"
+  ru: "Укажите имя или путь базы данных"
+connect.ssh:
+  en: "Connect through an SSH tunnel"
+  ru: "Подключаться через SSH-туннель"
+connect.ssh_host:
+  en: "SSH host"
+  ru: "SSH-хост"
+connect.ssh_user:
+  en: "SSH user"
+  ru: "Пользователь SSH"
+connect.ssh_password_auth:
+  en: "Password"
+  ru: "Пароль"
+connect.ssh_key_auth:
+  en: "Key file"
+  ru: "Файл ключа"
+connect.ssh_agent_auth:
+  en: "SSH agent"
+  ru: "SSH-агент"
+connect.ssh_password:
+  en: "SSH password"
+  ru: "Пароль SSH"
+connect.ssh_key_file:
+  en: "Private key"
+  ru: "Приватный ключ"
+connect.ssh_passphrase:
+  en: "Key passphrase (if any)"
+  ru: "Пароль ключа (если есть)"
+connect.ssh_pick_key:
+  en: "Choose an SSH private key"
+  ru: "Выберите приватный SSH-ключ"
+connect.ssh_agent_hint:
+  en: "Keys come from the OpenSSH agent or Pageant (Windows) / SSH_AUTH_SOCK."
+  ru: "Ключи берутся из агента OpenSSH или Pageant (Windows) / SSH_AUTH_SOCK."
+connect.ssh_remote_hint:
+  en: "The database host is resolved on the SSH server: localhost means the SSH server itself. Unknown host keys are added to ~/.ssh/known_hosts."
+  ru: "Хост базы определяется на SSH-сервере: localhost — это сам SSH-сервер. Новые ключи хостов добавляются в ~/.ssh/known_hosts."
+connect.ssh_need_host:
+  en: "enter the SSH host"
+  ru: "укажите SSH-хост"
+connect.ssh_need_user:
+  en: "enter the SSH user"
+  ru: "укажите пользователя SSH"
+connect.ssh_need_key:
+  en: "choose the SSH private key file"
+  ru: "выберите файл приватного SSH-ключа"
+connect.password:
+  en: "Password"
+  ru: "Пароль"
+connect.file_path:
+  en: "File path"
+  ru: "Путь к файлу"
+connect.new_file:
+  en: "New…"
+  ru: "Создать…"
+connect.browse:
+  en: "Browse…"
+  ru: "Обзор…"
+connect.drop_anywhere:
+  en: "…or drop the file anywhere on the window."
+  ru: "…или перетащите файл в любое место окна."
+connect.port_n:
+  en: "port %{n}"
+  ru: "порт %{n}"
+connect.editing:
+  en: "editing connection: %{name}"
+  ru: "изменение подключения: %{name}"
+connect.connecting:
+  en: "Connecting to %{target} …"
+  ru: "Подключение к %{target} …"
+connect.exists:
+  en: "%{path} already exists — open it with Browse… instead."
+  ru: "%{path} уже существует — откройте его через «Обзор…»."
+connect.create_failed:
+  en: "Could not create %{path}: %{e}"
+  ru: "Не удалось создать %{path}: %{e}"
+common.loading:
+  en: "loading…"
+  ru: "загрузка…"
+diagram.summary:
+  en: "%{tables} tables, %{relations} relations"
+  ru: "таблиц: %{tables}, связей: %{relations}"
+query.empty:
+  en: "type a statement first"
+  ru: "сначала введите запрос"
+query.running_status:
+  en: "running…"
+  ru: "выполняется…"
+query.idle:
+  en: "no statement run yet"
+  ru: "запрос ещё не выполнялся"
+common.running:
+  en: "Running…"
+  ru: "Выполнение…"
+common.run:
+  en: "Run"
+  ru: "Выполнить"
+query.affected:
+  en: "%{n} row(s) affected · %{ms} ms"
+  ru: "затронуто строк: %{n} · %{ms} мс"
+query.executed:
+  en: "statement executed · %{ms} ms"
+  ru: "запрос выполнен · %{ms} мс"
+query.rows:
+  en: "%{n} rows%{more} · %{ms} ms"
+  ru: "строк: %{n}%{more} · %{ms} мс"
+query.truncated:
+  en: " (truncated)"
+  ru: " (обрезано)"
+query.limit:
+  en: "limit %{n} rows"
+  ru: "не более %{n} строк"
+query.stop:
+  en: "Stop"
+  ru: "Остановить"
+query.stop_hint:
+  en: "Cancel the running statement"
+  ru: "Отменить выполняющийся запрос"
+query.run_hint:
+  en: "Run the statement (Ctrl+Enter)"
+  ru: "Выполнить запрос (Ctrl+Enter)"
+query.cancelling:
+  en: "cancelling…"
+  ru: "отмена…"
+query.cancelled:
+  en: "statement cancelled"
+  ru: "запрос отменён"
+ws.not_active:
+  en: "connection is not active"
+  ru: "подключение не активно"
+ws.edit_row:
+  en: "Edit row…"
+  ru: "Изменить строку…"
+ws.dup_row:
+  en: "Duplicate row…"
+  ru: "Дублировать строку…"
+ws.new_row:
+  en: "New row…"
+  ru: "Новая строка…"
+ws.copy_row:
+  en: "Copy row"
+  ru: "Копировать строку"
+ws.copy_json:
+  en: "Copy row as JSON"
+  ru: "Копировать как JSON"
+ws.delete_row_menu:
+  en: "Delete row…"
+  ru: "Удалить строку…"
+ws.fill_one:
+  en: "fill at least one column"
+  ru: "заполните хотя бы одну колонку"
+common.save_cancelled:
+  en: "save was cancelled"
+  ru: "сохранение отменено"
+ws.no_pk:
+  en: "this table has no primary key"
+  ru: "у таблицы нет первичного ключа"
+ws.delete_cancelled:
+  en: "delete was cancelled"
+  ru: "удаление отменено"
+ws.insert_hint:
+  en: "Fill the values you want to insert; empty nullable columns fall back to their defaults."
+  ru: "Заполните значения для вставки; пустые nullable-колонки получат значения по умолчанию."
+ws.update_hint:
+  en: "Change the values and save; only the changed columns are written."
+  ru: "Измените значения и сохраните; записываются только изменённые колонки."
+ws.delete_hint:
+  en: "This permanently removes the row from the database."
+  ru: "Строка будет безвозвратно удалена из базы данных."
+ws.sqlite_autoinc:
+  en: "Not generated: SQLite ignores AUTO_INCREMENT                                                          — use INTEGER PRIMARY KEY"
+  ru: "Не генерируется: SQLite игнорирует AUTO_INCREMENT — используйте INTEGER PRIMARY KEY"
+ws.deleting:
+  en: "Deleting…"
+  ru: "Удаление…"
+ws.delete_row:
+  en: "Delete row"
+  ru: "Удалить строку"
+common.saving:
+  en: "Saving…"
+  ru: "Сохранение…"
+ws.save_changes:
+  en: "Save changes"
+  ru: "Сохранить изменения"
+ws.insert_row:
+  en: "Insert row"
+  ru: "Вставить строку"
+ws.export_cancelled:
+  en: "export cancelled"
+  ru: "экспорт отменён"
+ws.export_title:
+  en: "Export to CSV"
+  ru: "Экспорт в CSV"
+ws.exporting:
+  en: "exporting…"
+  ru: "экспорт…"
+ws.filter_rows:
+  en: "Filter rows"
+  ru: "Фильтр строк"
+ws.cancel_export:
+  en: "Cancel export"
+  ru: "Отменить экспорт"
+ws.export_tip:
+  en: "Export to CSV (all rows matching the filter)"
+  ru: "Экспорт в CSV (все строки, подходящие под фильтр)"
+ws.click_row:
+  en: "Click a row to inspect its fields."
+  ru: "Выберите строку, чтобы посмотреть её поля."
+ws.fetching:
+  en: "fetching…"
+  ru: "загрузка…"
+ws.empty_title:
+  en: "No open data view"
+  ru: "Нет открытых таблиц"
+ws.empty_hint:
+  en: "Select a table in the explorer on the left to open its records here."
+  ru: "Выберите таблицу в дереве слева, чтобы открыть её записи здесь."
+ws.new_query:
+  en: "New SQL query"
+  ru: "Новый SQL-запрос"
+ws.new_row_title:
+  en: "New row"
+  ru: "Новая строка"
+ws.edit_row_title:
+  en: "Edit row %{n}"
+  ru: "Изменение строки %{n}"
+ws.delete_row_title:
+  en: "Delete row %{n}"
+  ru: "Удаление строки %{n}"
+ws.fk_unavailable:
+  en: "→ %{target} (unavailable)"
+  ru: "→ %{target} (недоступно)"
+ws.export_failed:
+  en: "export failed: %{e}"
+  ru: "ошибка экспорта: %{e}"
+ws.exported:
+  en: "%{n} rows → %{file}"
+  ru: "строк: %{n} → %{file}"
+ws.write_failed:
+  en: "cannot write %{path}: %{e}"
+  ru: "не удалось записать %{path}: %{e}"
+ws.filter_active:
+  en: "Filter (%{n} active)"
+  ru: "Фильтр (активно: %{n})"
+ws.range:
+  en: "%{from}-%{to} of %{total}"
+  ru: "%{from}–%{to} из %{total}"
+ws.page:
+  en: "Page %{n} / %{count}"
+  ru: "Страница %{n} / %{count}"
+docs.loading:
+  en: "Loading documents…"
+  ru: "Загрузка документов…"
+docs.none:
+  en: "No documents."
+  ru: "Документов нет."
+docs.no_id:
+  en: "(no _id)"
+  ru: "(без _id)"
+docs.syntax_hint:
+  en: "mongosh syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(…) … — _id is generated when omitted."
+  ru: "Синтаксис mongosh: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(…) … — если _id не указан, он будет сгенерирован."
+docs.replace_hint:
+  en: "The whole document is replaced; _id cannot change."
+  ru: "Документ заменяется целиком; _id менять нельзя."
+docs.insert:
+  en: "Insert document"
+  ru: "Вставить документ"
+docs.replace:
+  en: "Replace document"
+  ru: "Заменить документ"
+docs.edit_title:
+  en: "Edit document %{n}"
+  ru: "Изменение документа %{n}"
+docs.new_title:
+  en: "New document"
+  ru: "Новый документ"
+filter.remove:
+  en: "Remove condition"
+  ru: "Удалить условие"
+filter.add:
+  en: "Condition"
+  ru: "Условие"
+filter.clear:
+  en: "Clear"
+  ru: "Сбросить"
+filter.apply:
+  en: "Apply"
+  ru: "Применить"
+filter.value:
+  en: "value"
+  ru: "значение"
+filter.column:
+  en: "column"
+  ru: "колонка"
+filter.where:
+  en: "where"
+  ru: "где"
+filter.and:
+  en: "and"
+  ru: "и"
+ai.placeholder:
+  en: "Ask about your data…  (Enter — send, Ctrl+Enter — new line)"
+  ru: "Спросите о своих данных…  (Enter — отправить, Ctrl+Enter — новая строка)"
+ai.model_ph:
+  en: "model id — List shows what the server has"
+  ru: "id модели — «Список» покажет, что есть на сервере"
+ai.key_ph:
+  en: "optional for local servers"
+  ru: "необязательно для локальных серверов"
+ai.press_list:
+  en: "Press List to load the server's models."
+  ru: "Нажмите «Список», чтобы загрузить модели сервера."
+ai.no_models:
+  en: "the server reports no models"
+  ru: "сервер не вернул ни одной модели"
+ai.cancelled:
+  en: "request cancelled"
+  ru: "запрос отменён"
+ai.choose_model:
+  en: "choose a model first"
+  ru: "сначала выберите модель"
+ai.destructive:
+  en: "A destructive statement (DROP / TRUNCATE / no WHERE) waits for your Run."
+  ru: "Опасный запрос (DROP / TRUNCATE / без WHERE) ждёт, пока вы нажмёте «Выполнить»."
+ai.repeat_pause:
+  en: "Auto mode paused: the assistant repeated a statement that already failed."
+  ru: "Авторежим приостановлен: ассистент повторил запрос, который уже завершился ошибкой."
+ai.connect_first:
+  en: "connect to a database first"
+  ru: "сначала подключитесь к базе данных"
+ai.history:
+  en: "History"
+  ru: "История"
+ai.new_chat:
+  en: "New chat"
+  ru: "Новый чат"
+ai.model_settings:
+  en: "Model settings"
+  ru: "Настройки модели"
+ai.manual:
+  en: "Manual"
+  ru: "Вручную"
+ai.manual_tip:
+  en: "SQL runs only when you press Run"
+  ru: "SQL выполняется только по кнопке «Выполнить»"
+ai.auto:
+  en: "Auto"
+  ru: "Авто"
+ai.auto_tip:
+  en: "The assistant runs its SQL and reads the results"
+  ru: "Ассистент сам выполняет свой SQL и читает результаты"
+ai.running_sql:
+  en: "running SQL…"
+  ru: "выполняется SQL…"
+ai.answering:
+  en: "answering…"
+  ru: "отвечает…"
+ai.stop:
+  en: "Stop"
+  ru: "Стоп"
+ai.send:
+  en: "Send"
+  ru: "Отправить"
+ai.add:
+  en: "Add"
+  ru: "Добавить"
+ai.custom_tip:
+  en: "Any OpenAI-compatible URL"
+  ru: "Любой OpenAI-совместимый URL"
+ai.add_provider:
+  en: "Add a provider"
+  ru: "Добавить провайдера"
+ai.provider:
+  en: "Provider"
+  ru: "Провайдер"
+ai.server:
+  en: "Server (OpenAI-compatible base URL)"
+  ru: "Сервер (базовый OpenAI-совместимый URL)"
+ai.model:
+  en: "Model"
+  ru: "Модель"
+ai.list:
+  en: "List"
+  ru: "Список"
+ai.api_key:
+  en: "API key (stored in the OS keyring)"
+  ru: "API-ключ (хранится в хранилище ключей ОС)"
+ai.remove:
+  en: "Remove"
+  ru: "Удалить"
+ai.remove_tip:
+  en: "Forget this provider and its key"
+  ru: "Забыть этого провайдера и его ключ"
+ai.save:
+  en: "Save"
+  ru: "Сохранить"
+ai.no_history:
+  en: "No saved conversations yet."
+  ru: "Сохранённых диалогов пока нет."
+ai.delete:
+  en: "Delete"
+  ru: "Удалить"
+ai.connect_hint:
+  en: "Connect to a database to give the assistant your schema."
+  ru: "Подключитесь к базе данных, чтобы ассистент знал вашу схему."
+ai.thinking:
+  en: "thinking…"
+  ru: "думает…"
+ai.copy:
+  en: "Copy"
+  ru: "Копировать"
+ai.open_sql:
+  en: "Open in SQL tab"
+  ru: "Открыть во вкладке SQL"
+ai.executed:
+  en: "Executed"
+  ru: "Выполнено"
+ai.failed:
+  en: "Failed"
+  ru: "Ошибка"
+ai.retry:
+  en: "Retry"
+  ru: "Повторить"
+ai.retry_tip:
+  en: "Ask again (executed SQL is not undone)"
+  ru: "Спросить ещё раз (выполненный SQL не откатывается)"
+ai.edit:
+  en: "Edit message"
+  ru: "Изменить сообщение"
+ai.edit_tip:
+  en: "Move the last message back into the input"
+  ru: "Вернуть последнее сообщение в поле ввода"
+ai.more_lines:
+  en: "%{n} more line(s)"
+  ru: "ещё строк: %{n}"
+ai.paste_key:
+  en: "Paste your %{name} API key, then List → pick a model → Save."
+  ru: "Вставьте API-ключ %{name}, затем «Список» → выберите модель → «Сохранить»."
+ai.auto_paused:
+  en: "Auto mode paused after %{n} rounds — press Run to continue."
+  ru: "Авторежим приостановлен после %{n} шагов — нажмите «Выполнить», чтобы продолжить."
+ai.more_models:
+  en: "+%{n} more — type in Model to filter"
+  ru: "ещё %{n} — введите текст в поле «Модель», чтобы отфильтровать"
+ai.no_match:
+  en: "no model matches “%{q}”"
+  ru: "нет моделей по запросу «%{q}»"
+ai.messages:
+  en: "%{n} message(s)"
+  ru: "сообщений: %{n}"
+ai.intro:
+  en: "Ask for a query in plain words, or paste an error to fix. The schema (names and types, no data) is shared with the model. Auto mode lets the assistant run its SQL and read the results."
+  ru: "Попросите запрос простыми словами или вставьте ошибку, чтобы её исправить. Модели передаётся схема (имена и типы, без данных). В авторежиме ассистент сам выполняет свой SQL и читает результаты."
+ws.table_summary:
+  en: "(%{cols} columns, ~%{total} total)"
+  ru: "(колонок: %{cols}, всего ~%{total})"
+ws.row_fields:
+  en: "Row %{n} · %{fields} fields"
+  ru: "Строка %{n} · полей: %{fields}"
+filter.contains:
+  en: "contains"
+  ru: "содержит"
+filter.is_null:
+  en: "is null"
+  ru: "пусто (null)"
+filter.not_null:
+  en: "is not null"
+  ru: "не пусто"

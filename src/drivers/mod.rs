@@ -4,12 +4,13 @@
 //! `mysql` / `sqlite`); MongoDB is our own light client (only `bson`
 //! beyond crates already in the tree) and always compiled in. Drivers are
 //! reachable only through `core::registry` — the UI never imports them.
-//! Stage 4 next: Redis.
+//! `ssh` wraps any of them in an SSH tunnel (russh). Stage 4 next: Redis.
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
 mod util;
 
 pub mod mongo;
+pub mod ssh;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "postgres")]

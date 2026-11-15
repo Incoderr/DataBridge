@@ -30,7 +30,7 @@ pub type SelectedPath = Option<(String, String)>;
 
 /// Height of a regular tree row (groups + leaves).
 const ROW_H: f32 = 32.;
-/// Height of the per-schema "Schema diagram" entry.
+/// Height of the per-schema tr!("tree.diagram") entry.
 const DIAGRAM_H: f32 = 26.;
 /// Empty-note metrics: `note_row` renders with exactly these, so the
 /// virtual list can position note rows without measuring them.
@@ -78,7 +78,7 @@ pub enum TreeRow {
     },
     /// The per-schema entry to the relationships diagram.
     Diagram { schema: String },
-    /// The per-schema "New table" entry (SQL stores only).
+    /// The per-schema tr!("common.new_table") entry (SQL stores only).
     NewTable { schema: String },
     /// Empty-state / no-match note. Lines render single-line truncated at
     /// a fixed line height, so the height is exactly `note_height(len)`.
@@ -365,7 +365,7 @@ impl DataBridge {
         let schemas_open = expanded.contains("schemas");
         rows.push(TreeRow::Parent {
             depth: 1,
-            label: "Schemas".into(),
+            label: tr!("tree.schemas").into(),
             node_id: "schemas".into(),
             icon: TreeIcon::Glyph("icons/cube.svg", p.muted_fg),
             open: schemas_open,
@@ -377,12 +377,12 @@ impl DataBridge {
 
         if schemas.is_empty() {
             let hint = match conn.status {
-                ConnectionStatus::Error => "Last connection attempt failed.",
-                ConnectionStatus::Disconnected => "Connection not open.",
-                _ => "Refresh or pick another connection.",
+                ConnectionStatus::Error => tr!("tree.last_failed"),
+                ConnectionStatus::Disconnected => tr!("tree.not_open"),
+                _ => tr!("tree.refresh_hint"),
             };
             rows.push(TreeRow::Note {
-                lines: vec!["Schemas list is empty.".into(), hint.into()],
+                lines: vec![tr!("tree.empty").into(), hint.into()],
             });
             return rows;
         }
@@ -449,7 +449,7 @@ impl DataBridge {
                 let g_open = expanded.contains(&gid);
                 rows.push(TreeRow::Parent {
                     depth: 3,
-                    label: SharedString::from(format!("Tables ({})", tables.len())),
+                    label: tr!("tree.tables", n = tables.len()),
                     node_id: gid,
                     icon: TreeIcon::Glyph("icons/cube.svg", p.muted_fg),
                     open: g_open,
@@ -476,7 +476,7 @@ impl DataBridge {
                 let g_open = expanded.contains(&gid);
                 rows.push(TreeRow::Parent {
                     depth: 3,
-                    label: SharedString::from(format!("Views ({})", views.len())),
+                    label: tr!("tree.views", n = views.len()),
                     node_id: gid,
                     icon: TreeIcon::Glyph("icons/cube.svg", p.muted_fg),
                     open: g_open,
@@ -503,7 +503,7 @@ impl DataBridge {
                 let g_open = expanded.contains(&gid);
                 rows.push(TreeRow::Parent {
                     depth: 3,
-                    label: SharedString::from(format!("Routines ({})", funcs.len())),
+                    label: tr!("tree.routines", n = funcs.len()),
                     node_id: gid,
                     icon: TreeIcon::Glyph("icons/cube.svg", p.muted_fg),
                     open: g_open,
@@ -527,7 +527,7 @@ impl DataBridge {
 
         if !visible_any {
             rows.push(TreeRow::Note {
-                lines: vec![format!("No matches for \u{201c}{q}\u{201d}")],
+                lines: vec![tr!("tree.no_matches", q = q).to_string()],
             });
         }
 
@@ -586,11 +586,11 @@ fn render_tree_row(row: &TreeRow, p: &theme::Palette, cx: &mut Context<DataBridg
                 let (open_schema, drop_schema) = (schema.clone(), schema.clone());
                 let (open_meta, drop_meta) = (meta.clone(), meta.clone());
                 let drop_label = if meta.kind == NodeKind::View {
-                    "Drop view…"
+                    tr!("tree.drop_view")
                 } else {
-                    "Drop table…"
+                    tr!("tree.drop_table")
                 };
-                menu.item(PopupMenuItem::new("Open").icon(IconName::ArrowRight).on_click(
+                menu.item(PopupMenuItem::new(tr!("tree.open")).icon(IconName::ArrowRight).on_click(
                     move |_, window, cx| {
                         open_app
                             .update(cx, |this, cx| {
@@ -779,13 +779,13 @@ fn diagram_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -
                 .flex_none()
                 .text_color(p.primary.opacity(0.7)),
         )
-        .child(div().min_w_0().truncate().child("Schema diagram"))
+        .child(div().min_w_0().truncate().child(tr!("tree.diagram")))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_diagram(&schema, window, cx);
         }))
 }
 
-/// The per-schema "New table" entry: a SQL tab with a `CREATE TABLE`
+/// The per-schema tr!("common.new_table") entry: a SQL tab with a `CREATE TABLE`
 /// template. Same metrics as `diagram_row`.
 fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>) -> Stateful<Div> {
     let schema = schema.to_string();
@@ -810,7 +810,7 @@ fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>)
                 .flex_none()
                 .text_color(p.primary.opacity(0.7)),
         )
-        .child(div().min_w_0().truncate().child("New table"))
+        .child(div().min_w_0().truncate().child(tr!("common.new_table")))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.open_create_table(&schema, window, cx);
         }))

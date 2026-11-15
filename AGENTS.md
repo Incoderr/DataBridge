@@ -14,6 +14,7 @@ removed; the GPUI Rust app is the only product code in this repo.
   - `/src` — the application (layered tree below; `core::session` / `registry` /
     `runtime` and the drivers land in stages 1–2)
   - `/assets` — fonts (embedded with `include_bytes!`) and SVG icons
+  - `/locales/app.yml` — UI translations (rust-i18n, compiled in; en + ru)
   - `/site` — Astro landing page. Separate Node toolchain (pnpm), own `AGENTS.md`,
     deployed to Cloudflare Pages (build root directory `site`, output `site/dist`).
     Do not mix toolchains: the repo root is **cargo-only**,
@@ -61,7 +62,7 @@ src/
     mock.rs       # deterministic mock (the original mock layer, ported from the web app)
     storage.rs    # Stage-3 recent-connections store: connections.json + OS keyring secrets
     completion.rs # SQL autocompletion engine (pure: text + cursor + schema tree -> suggestions)
-    ai.rs         # Stage 6: OpenAI-compatible chat client (SSE streaming), ai.json + keyring key, schema prompt
+    ai.rs         # Stage 6: OpenAI-compatible chat client (SSE streaming), providers + presets in ai.json, keys in keyring, schema prompt
   drivers/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
@@ -69,6 +70,7 @@ src/
     mongo/        # own light client, always compiled: mod.rs (DbSession), wire.rs (OP_MSG + TLS),
                   #   scram.rs (SCRAM-SHA-256/1), uri.rs (mongodb[+srv]:// parse), dns.rs (SRV/TXT),
                   #   shell.rs (mongosh subset)
+    ssh.rs        # SSH tunnels (russh, always compiled): TunneledSession wraps any driver
     redis.rs      # feature "redis"   (stage 4 — later)
   ui/
     app.rs        # root entity DataBridge: connections, tabs, wizard state
@@ -131,14 +133,18 @@ pub trait DbSession: Send + Sync {
     async fn ping(&self) -> Result<Ping, DbError>;                    // status + measured latency
     async fn list_schemas(&self) -> Result<Vec<SchemaMeta>, DbError>; // schemas w/ tables/views/functions
     async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, DbError>; // FK edges → diagram
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError>;
+    async fn fetch_rows(&self, table: TableRef, query: RowQuery, offset: u64, limit: u64) -> Result<Page, DbError>;
+    // RowQuery = { filters: Vec<Filter{column, kind, type_, op: FilterOp, value}>, sort: Option<(column, desc)> }
+    //   SQL drivers build WHERE / ORDER BY with `SqlDialect::clauses` (values bound, identifiers quoted;
+    //   PG casts text values to the column's introspected type); Mongo → `$and` find filter + sort.
     // Page = { rows, total, exact (false = estimate), truncated, elapsed_ms,
     //          columns: Option<Vec<ColumnMeta>> (schemaless drivers report discovered columns),
     //          documents: Option<Vec<DocNode>> (document stores: full documents, parallel to rows) }
     // later: async fn list_tables(&self, schema: &str) -> Result<Vec<TableMeta>, DbError>
     //        (lazy per-schema trees when eager loading proves expensive)
-    // stage 5 (done): one SQL statement per call.
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError>;
+    // stage 5 (done): one SQL statement per call. `cancel` (Stop button) goes through
+    // `session::cancellable`: server-side kill where the driver can, else the call is dropped.
+    async fn execute(&self, sql: &str, limit: u64, cancel: &CancelToken) -> Result<QueryPage, DbError>;
     // simplified editor: typed writes (CellChange carries the kind so NULL binds typed).
     async fn update_row(&self, table: TableRef, pk: Vec<CellChange>, changes: Vec<CellChange>) -> Result<u64, DbError>;
     async fn insert_row(&self, table: TableRef, values: Vec<CellChange>) -> Result<u64, DbError>;
@@ -214,7 +220,11 @@ count (metadata) and page run in parallel. Each page also carries the
 full documents (`Page::documents`, `model::DocNode` — leaves are mongosh
 literals). The records view (`ui/workspace/documents.rs`) then offers a
 **JSON view** (toolbar `{ }`, default for document stores: one card per
-document, collapsible field tree, click selects, double-click edits), the
+document, collapsible field tree, click selects, double-click edits;
+virtualized — gpui `list()` + `ListState` (`doc_list`), reset by
+`sync_doc_list` when the page's `Arc<Vec<DocNode>>` changes, a card
+re-measured via `splice` when one of its tree paths toggles; the page's
+documents are shared as `Arc`, never cloned per frame), the
 same tree in the detail panel, and a **whole-document editor**: Edit /
 New / Duplicate open `format_document` text in a JavaScript code editor,
 saved via `DbSession::save_document` (replace by `_id`, or insert). The
@@ -234,6 +244,25 @@ SRV name's parent domain; TXT may set only `authSource`/`replicaSet`/
 `loadBalanced`; TLS defaults on. Not supported: x.509/LDAP/Kerberos,
 compression, relations (diagram is empty).
 
+**SSH tunnels** (`drivers/ssh.rs`, russh with ring crypto): a connection
+with `DbConnection::ssh` (`SshConfig`: host, port, user, `SshAuth::{Password,
+Key, Agent}`, key path; the password / passphrase is keyring-only) gets a
+`TunneledSession` from `registry::open` (not for SQLite or `--mock`). On
+the first call it connects + authenticates, probes one `direct-tcpip`
+channel to the DB host (so "bastion cannot reach the DB" is an SSH
+error), listens on `127.0.0.1:0` and builds the real driver for the
+rewritten connection (`model::rewrite_url_host` for URL mode) — drivers
+know nothing about SSH. Every pooled DB connection is its own channel over
+one SSH session; a dropped session reconnects on the next new channel;
+keepalive 30 s. Agent = Windows OpenSSH agent pipe, then Pageant;
+`SSH_AUTH_SOCK` elsewhere. Host keys: `~/.ssh/known_hosts` (shared with
+OpenSSH), unknown hosts recorded on first use (accept-new), a changed key
+is refused. `TargetKey::via` keeps `localhost:5432` behind two bastions
+apart. Not supported: jump hosts / `~/.ssh/config`, keyboard-interactive,
+seed lists and `+srv` URLs; TLS that verifies the server name sees
+`127.0.0.1`. Tested end-to-end against an in-process russh server
+(`tunnel_forwards_and_checks_host_keys`).
+
 **Stubs:** Redis, ClickHouse, Cassandra, ScyllaDB exist in
 `DbType` (brand icons, ports, URL placeholders) but have no driver.
 `registry::open` returns a "not supported in this build" error for them
@@ -245,8 +274,9 @@ wizard list).
 
 **Behaviors worth knowing:**
 - Recents (`core/storage.rs`): `connections.json` in the platform config
-  dir, newest first, capped at 20; passwords / full URLs only in the OS
-  keyring (service "DataBridge"). Deduplicated by `model::TargetKey` —
+  dir, newest first, capped at 20; passwords / full URLs / SSH secrets
+  only in the OS keyring (service "DataBridge"; suffixes `""`, `::url`,
+  `::ssh`). Deduplicated by `model::TargetKey` —
   the same target under a new id replaces the old entry and its secrets;
   old duplicates self-heal on load.
 - Wizard (`ui/connect.rs`): SQLite files connect via OS drag & drop
@@ -258,7 +288,17 @@ wizard list).
   SQL tabs (`query_views`) are cached by tab id, so a switch back shows
   the loaded page / text and results without a refetch (Refresh reloads).
 - SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
-  `run_id`. The editor fills the tab; a results grid appears (and takes
+  `run_id`; Ctrl+Enter runs (`RunQuery`, bound in `query::init` to
+  `SqlEditor > Input` after gpui-component's init, so other inputs keep
+  Ctrl+Enter = newline). While running, Run becomes Stop: a
+  `CancelToken` → `pg_cancel_backend(pid)` / `KILL QUERY id` (the
+  statement runs on a dedicated pool connection whose pid / id is read
+  first), then `CANCEL_GRACE` (3 s) before the call is dropped; SQLite
+  (no `sqlite3_interrupt` in sqlx) and Mongo just drop the call. Mongo's
+  `run` takes a connection out of its slot for the round trip, so a
+  dropped call never returns a half-read socket to the pool. The AI
+  chat's Stop cancels its statement the same way. `--mock` honours
+  `sleep(n)` / `pg_sleep(n)` so Stop is demoable. The editor fills the tab; a results grid appears (and takes
   half) only for result sets — DDL/DML report in the toolbar status. `model::is_select_like` (first keyword after comments, plus
   DML `RETURNING`) picks fetch vs execute. "New table" (tree row per
   schema + the empty workspace) seeds a dialect `CREATE TABLE`; DDL runs
@@ -286,6 +326,17 @@ wizard list).
   Open / Drop table… on tables and views → confirmation dialog
   (`render_drop_dialog`, stale-guarded by `drop_id`); success closes the
   object's tabs and reloads the tree. The mock records drops per session.
+- Records grid filter / sort / export (`ui/workspace/filter.rs`,
+  `RecordsDelegate::query`): the toolbar filter icon opens a bar of
+  AND-ed `column op value` rows (`FilterOp`: = ≠ < ≤ > ≥ contains, is
+  [not] null; values typed by `parse_filter_value`); header sort icons
+  (`Column::sortable`, not on json/binary) set `query.sort` via
+  `perform_sort`. Both run in the database over the whole table and
+  reset to page 1; filtered pages skip the planner estimate. The mock
+  filters/sorts its first 20k generated rows in memory. Export writes a
+  CSV file (save dialog, UTF-8 BOM, `model::csv_line`) of every row
+  matching the filter, paging 1000 at a time; a second click cancels
+  (`export_id`).
 - Record editor (`ui/workspace.rs`, `render_editor`): typed inputs per
   column (`parse_cell`), `insert_row` / `update_row` (changed columns
   only) / `delete_row`, stale-guarded by `save_id`. FK columns get a
@@ -303,8 +354,16 @@ wizard list).
 - AI chat (`core/ai.rs` + `ui/ai_chat.rs`, Stage 6): **OpenAI-compatible
   servers only** (Ollama, LM Studio, llama.cpp, vLLM, …; no vendor SDKs).
   Right-hand panel toggled by the bot icon in the left rail (`sidebar.rs`);
-  base URL + model + mode in `ai.json`, optional API key in the keyring
-  only; `GET /models` fills a picker. The system prompt carries the
+  a list of **providers** (`ai::Provider`: name, base URL, model), each
+  added from `ai::PRESETS` (OpenRouter, Groq, OpenAI, Gemini, DeepSeek,
+  Mistral, Together, Cerebras, xAI, Ollama, LM Studio, Custom) — chips in
+  the settings strip switch the active one. `ai.json` = `AiSettings
+  { providers, active, mode }` (the old single `base_url`/`model` shape
+  migrates on load); each key lives in the keyring as
+  `ai:<provider id>::api_key`, never on disk. `GET /models` fills a
+  picker filtered by the Model field (≤30 chips — routers list hundreds).
+  A 400 mentioning `temperature` retries once without it (reasoning
+  models). The system prompt carries the
   dialect and a compact schema listing (names/types, capped at 12k chars).
   Answers stream over SSE (`mpsc` from the sidecar, stale-guarded by
   `send_id`; Stop drops the task and cancels the request). Enter sends,
@@ -322,16 +381,29 @@ wizard list).
   (≤50, history list in the panel header).
 - Driver errors carry the server message (`drivers::util::query_error`:
   "query failed: no such table: dual"), not a bare "query failed".
+- Settings dialog (gear in the left rail, `render_settings_dialog`):
+  interface size, light/dark theme (`theme::set`), language
+  (`settings::set_language`). **Every user-facing string is translated**:
+  `tr!("key")` / `tr!("key", n = x)` (macro in `main.rs`, returns
+  `SharedString`; `%{n}` placeholders) from `locales/app.yml`
+  (`_version: 2`: every language next to its key, missing ones fall back
+  to `en`). The locale is rust-i18n's global, shared with gpui-component's
+  own strings. New UI text needs a key in both languages —
+  `every_ui_key_is_translated` (ui/settings.rs) fails otherwise. Not
+  translated on purpose: driver/server error messages, SQL, brand names,
+  `PK`/`FK`/`NULL`. Text already sitting in an input (placeholders of
+  open views) updates when the view is recreated.
 - Theme (`ui/theme.rs`): use `theme::palette(cx)`; no hardcoded colors
   except `DbType::brand_color()` and grid type tokens (`kind_color`).
   Brand glyphs must be registered in `ui/assets.rs` (`brand/*.svg`).
 
 ### Known deferred items
 
-- Settings (UI scale) are not persisted.
 - The schema tree loads eagerly via `list_schemas`; per-schema lazy loading
   (`list_tables`) arrives if eager trees prove slow on real databases.
-- No SSH tunnels; no query cancellation / Ctrl+Enter yet.
+- SSH: no jump hosts / `~/.ssh/config`; host-key prompts are TOFU, not
+  interactive. Cancellation of grid loads (`fetch_rows`) is stale-guard
+  only (the query keeps running server-side).
 
 ## Roadmap
 
@@ -347,8 +419,10 @@ wizard list).
 - **Stage 3 — persistence.** `connections.json` + `settings.json` in the platform
   config dir; passwords via OS keyring (never plaintext on disk).
   **Mostly done.** `core/storage.rs` covers connections (`connections.json` +
-  keyring, `--mock` demo flag, forget UI in the wizard). Remaining:
-  `settings.json` (UI scale).
+  keyring, `--mock` demo flag, forget UI in the wizard) and
+  `settings.json` (`storage::AppSettings`: UI scale, theme, language, SQL editor
+  font — `ui::settings::restore` in `main`, `persist` on every change).
+  **Done.**
 - **Stage 4 — Mongo + Redis.** **Mongo done** — own client instead of
   the `mongodb` crate (see Current state). Next: Redis (`redis` with
   `tokio-comp`).
@@ -356,8 +430,9 @@ wizard list).
   stale-guard/load_id mechanism). **Mostly done.** `execute` + the simplified
   record editor (`update_row`/`insert_row`/`delete_row`) land on all drivers
   and the mock; `QueryView` renders the editor tab with highlighting.
-  Remaining niceties: result tabs inside one query view, cancellation,
-  Ctrl+Enter keybinding.
+  Cancellation (Stop) and Ctrl+Enter are done. Remaining niceties: result
+  tabs inside one query view, run the selection / statement under the
+  cursor.
 
 - **Stage 6 — AI assistant.** OpenAI-compatible only (cloud vendor SDKs
   deferred). **Started:** side chat with schema context, streaming, model
@@ -390,6 +465,12 @@ wizard list).
   `stringprep`) and tokio's `net` + `io-util` features; on Windows the
   `Win32_NetworkManagement_Dns` + `Win32_Foundation` features of the
   `windows-sys` 0.61 already in the tree (SRV lookups).
+- SSH tunnels sanctioned `russh` (0.65, `default-features = false`,
+  features `ring` + `rsa`: no aws-lc-rs, no flate2). It brings ~60 small
+  RustCrypto crates (ed25519/curve25519, p256/384/521, ssh-key, …) — the
+  price of in-process SSH with key/agent auth and known_hosts checks.
+- UI translations: `rust-i18n` 3 (already in the tree via gpui-component,
+  which reads the same global locale).
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 

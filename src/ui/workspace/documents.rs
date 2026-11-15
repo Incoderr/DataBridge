@@ -4,8 +4,11 @@
 //! works on mongosh text (`model::format_document` → the driver's
 //! `save_document`). Rows/columns stay available through the Table view.
 
+use std::sync::Arc;
+
 use gpui::prelude::*;
-use gpui::{AnyElement, ClickEvent, Context, Entity, FontWeight, SharedString, Window, div, px};
+use gpui::{AnyElement, ClickEvent, Context, Entity, FontWeight, SharedString, Window, div, list, px};
+use gpui_component::scroll::Scrollbar;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState, TabSize};
 use gpui_component::scroll::ScrollableElement as _;
@@ -40,6 +43,7 @@ impl RecordsView {
         self.state.read(cx).delegate().docs.is_some()
     }
 
+    /// One document (cloned: for the editor, not for per-frame rendering).
     fn doc(&self, ix: usize, cx: &gpui::App) -> Option<DocNode> {
         self.state.read(cx).delegate().docs.as_ref()?.get(ix).cloned()
     }
@@ -57,20 +61,20 @@ impl RecordsView {
                     return;
                 }
                 let no = page * PAGE + ix as u64 + 1;
-                (format_document(&doc), pk, format!("Edit document {no} · {}", self.table.name))
+                (format_document(&doc), pk, format!("{} · {}", tr!("docs.edit_title", n = no), self.table.name))
             }
             DocEdit::Duplicate(ix) => {
                 let Some(doc) = self.doc(ix, cx) else { return };
                 (
                     format_document(&doc.without("_id")),
                     Vec::new(),
-                    format!("New document · {}", self.table.name),
+                    format!("{} · {}", tr!("docs.new_title"), self.table.name),
                 )
             }
             DocEdit::New => (
                 "{\n  \n}".to_string(),
                 Vec::new(),
-                format!("New document · {}", self.table.name),
+                format!("{} · {}", tr!("docs.new_title"), self.table.name),
             ),
         };
         let input = cx.new(|cx| {
@@ -125,7 +129,7 @@ impl RecordsView {
                             v.reload(cx);
                         }
                         Ok(Err(e)) => ed.error = Some(e.message().to_string()),
-                        Err(_) => ed.error = Some("save was cancelled".into()),
+                        Err(_) => ed.error = Some(tr!("common.save_cancelled").into()),
                     }
                     cx.notify();
                 })
@@ -210,6 +214,7 @@ impl RecordsView {
                         if !this.doc_open.remove(&toggle_path) {
                             this.doc_open.insert(toggle_path.clone());
                         }
+                        this.remeasure(&toggle_path);
                         cx.notify();
                     }))
             });
@@ -246,8 +251,8 @@ impl RecordsView {
 
     /// The detail panel's body for the selected document.
     pub(super) fn render_doc_detail(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let doc = self.doc(ix, cx)?;
-        let lines = self.doc_fields(ix, &doc, None, cx);
+        let docs = self.state.read(cx).delegate().docs.clone()?;
+        let lines = self.doc_fields(ix, docs.get(ix)?, None, cx);
         Some(
             v_flex()
                 .flex_1()
@@ -260,39 +265,97 @@ impl RecordsView {
         )
     }
 
-    /// The JSON view: one card per document of the page. Click selects
-    /// (toolbar edit / delete act on it), double-click edits.
+    /// Keep the virtual list in step with the page: a new documents page
+    /// (new `Arc`) resets the list — item count, measured heights, scroll
+    /// position — and forgets the expanded paths (they are keyed by the
+    /// row index). Called from the delegate observer.
+    pub(super) fn sync_doc_list(&mut self, cx: &mut Context<Self>) {
+        let docs = self.state.read(cx).delegate().docs.clone();
+        let same = match (&docs, &self.doc_list_src) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.doc_list.reset(docs.as_ref().map_or(0, |d| d.len()));
+        self.doc_open.clear();
+        self.doc_list_src = docs;
+    }
+
+    /// A tree path changed size: re-measure the card it belongs to (the
+    /// virtual list caches item heights).
+    fn remeasure(&self, path: &str) {
+        if let Some(ix) = path.split('/').next().and_then(|s| s.parse::<usize>().ok())
+            && ix < self.doc_list.item_count()
+        {
+            self.doc_list.splice(ix..ix + 1, 1);
+        }
+    }
+
+    /// The JSON view: one card per document of the page, virtualized —
+    /// only the cards in (and just around) the viewport are built and laid
+    /// out per frame. Click selects (toolbar edit / delete act on it),
+    /// double-click edits.
     pub(super) fn render_doc_cards(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = theme::palette(cx);
-        let st = self.state.read(cx);
-        let d = st.delegate();
-        let docs = d.docs.clone().unwrap_or_default();
-        let first = d.page * PAGE;
-        let selected = st.selected_row();
-        if docs.is_empty() {
+        let d = self.state.read(cx).delegate();
+        if d.docs.as_ref().is_none_or(|d| d.is_empty()) {
             return div()
-                .flex_1()
+                .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_size(theme::scaled(theme::TEXT_SM))
                 .text_color(p.muted_fg)
-                .child(if d.loading { "Loading documents…" } else { "No documents." })
+                .child(if d.loading { tr!("docs.loading") } else { tr!("docs.none") })
                 .into_any_element();
         }
-        let cards: Vec<AnyElement> = docs
-            .iter()
-            .enumerate()
-            .map(|(i, doc)| {
-                let is_sel = selected == Some(i);
-                let id = doc.field("_id").map(DocNode::summary).unwrap_or_else(|| "(no _id)".into());
-                let fields = self.doc_fields(i, doc, Some("_id"), cx);
-                // Spacing via margin: the scroll wrapper of
-                // `overflow_y_scrollbar` does not carry the list's `gap`.
+        div()
+            .size_full()
+            .relative()
+            .child(
+                list(
+                    self.doc_list.clone(),
+                    cx.processor(|this, ix: usize, _window, cx| this.render_doc_card(ix, cx)),
+                )
+                .size_full(),
+            )
+            // Overlay scrollbar, pinned (absolute-overlay gotcha).
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .child(Scrollbar::vertical(&self.doc_list)),
+            )
+            .into_any_element()
+    }
+
+    /// One card of the JSON view (the virtual list's item renderer).
+    fn render_doc_card(&mut self, i: usize, cx: &mut Context<Self>) -> AnyElement {
+        let p = theme::palette(cx);
+        let st = self.state.read(cx);
+        let first = st.delegate().page * PAGE;
+        let is_sel = st.selected_row() == Some(i);
+        let Some(docs) = st.delegate().docs.clone() else {
+            return div().into_any_element();
+        };
+        let Some(doc) = docs.get(i) else {
+            return div().into_any_element();
+        };
+        let id = doc.field("_id").map(DocNode::summary).unwrap_or_else(|| tr!("docs.no_id").into());
+        let fields = self.doc_fields(i, doc, Some("_id"), cx);
+        // The outer div carries the spacing (list items cannot use `gap`).
+        div()
+            .px_3()
+            .pt(theme::scaled(if i == 0 { 12. } else { 0. }))
+            .pb(theme::scaled(10.))
+            .child(
                 v_flex()
                     .id(("doc-card", i))
-                    .flex_none()
-                    .mb(theme::scaled(10.))
                     .gap(px(2.))
                     .px_3()
                     .py(theme::scaled(10.))
@@ -322,15 +385,8 @@ impl RecordsView {
                             this.open_doc_editor(DocEdit::Edit(i), window, cx);
                         }
                         cx.notify();
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-        v_flex()
-            .size_full()
-            .p_3()
-            .overflow_y_scrollbar()
-            .children(cards)
+                    })),
+            )
             .into_any_element()
     }
 
@@ -384,9 +440,9 @@ impl RecordsView {
                             .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child(if is_insert {
-                                "mongosh syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(…) … — _id is generated when omitted."
+                                tr!("docs.syntax_hint")
                             } else {
-                                "The whole document is replaced; _id cannot change."
+                                tr!("docs.replace_hint")
                             }),
                     ),
             )
@@ -410,7 +466,7 @@ impl RecordsView {
                     .child(
                         Button::new("doc-cancel")
                             .ghost()
-                            .label("Cancel")
+                            .label(tr!("common.cancel"))
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.close_doc_editor(cx))),
                     )
@@ -418,9 +474,9 @@ impl RecordsView {
                         Button::new("doc-save")
                             .primary()
                             .label(match (saving, is_insert) {
-                                (true, _) => "Saving…",
-                                (false, true) => "Insert document",
-                                (false, false) => "Replace document",
+                                (true, _) => tr!("common.saving"),
+                                (false, true) => tr!("docs.insert"),
+                                (false, false) => tr!("docs.replace"),
                             })
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, window, cx| this.save_doc(window, cx))),

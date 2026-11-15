@@ -13,12 +13,15 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, VirtualListScrollHandle,
+    ActiveTheme, Icon, IconName, Sizable, Size, ThemeMode, VirtualListScrollHandle,
+    button::{Button, ButtonVariants},
 };
+
+use rust_i18n::t;
 
 use crate::core::mock;
 use crate::core::model::{
-    ConnectionStatus, DbConnection, DbType, NodeKind, SchemaMeta, TableMeta, TableRef,
+    ConnectionStatus, DbConnection, DbType, NodeKind, SchemaMeta, SshAuth, TableMeta, TableRef,
 };
 use crate::core::registry;
 use crate::core::session::SessionHandle;
@@ -51,6 +54,15 @@ pub struct Draft {
     pub database: Entity<InputState>,
     pub user: Entity<InputState>,
     pub password: Entity<InputState>,
+    /// SSH tunnel section (not offered for SQLite).
+    pub ssh_on: bool,
+    pub ssh_auth: SshAuth,
+    pub ssh_host: Entity<InputState>,
+    pub ssh_port: Entity<InputState>,
+    pub ssh_user: Entity<InputState>,
+    /// SSH password or key passphrase (masked; keyring-backed).
+    pub ssh_secret: Entity<InputState>,
+    pub ssh_key: Entity<InputState>,
 }
 
 pub struct WizardState {
@@ -130,7 +142,6 @@ pub struct DataBridge {
     /// Stale guard of drop requests (a new request / cancel supersedes).
     pub drop_id: u64,
     // visual state
-    pub grid_view: bool,
     /// External files are dragged over the window right now — the
     /// "drop it here" hint overlay is up.
     pub drag_over: bool,
@@ -199,7 +210,6 @@ impl DataBridge {
             records_views: HashMap::new(),
             pending_drop: None,
             drop_id: 0,
-            grid_view: true,
             drag_over: false,
             wizard,
             ai_chat: None,
@@ -728,20 +738,13 @@ impl DataBridge {
 
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
-        let is_dark = cx.theme().is_dark();
-        let theme_icon = if is_dark {
-            IconName::Sun
-        } else {
-            IconName::Moon
-        };
-
         let mut bar = TabBar::new("tabs");
         for (ix, tab) in self.tabs.iter().enumerate() {
             let active = self.active_tab == Some(ix);
             let (label, icon) = match &tab.kind {
                 TabKind::Records(meta) => (meta.name.clone(), "icons/table.svg"),
-                TabKind::Diagram => (format!("{} · diagram", tab.schema), "icons/schema.svg"),
-                TabKind::Sql(_) => (format!("query {}", ix + 1), "icons/schema.svg"),
+                TabKind::Diagram => (format!("{} · {}", tab.schema, tr!("app.tab_diagram")), "icons/schema.svg"),
+                TabKind::Sql(_) => (tr!("app.tab_query", n = ix + 1).to_string(), "icons/schema.svg"),
             };
             bar = bar.child(
                 Tab::new()
@@ -806,25 +809,6 @@ impl DataBridge {
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_query_tab(window, cx);
-                    })),
-            )
-            .suffix(
-                div()
-                    .id("theme-toggle")
-                    .size(theme::scaled(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(p.tree_hover))
-                    .child(
-                        Icon::new(theme_icon)
-                            .with_size(Size::Size(px(14.)))
-                            .text_color(p.muted_fg),
-                    )
-                    .on_click(cx.listener(|_, _, window, cx| {
-                        theme::toggle(window, cx);
                     })),
             )
     }
@@ -1122,7 +1106,7 @@ impl DataBridge {
                             .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.foreground)
-                            .child("Drop the database file here"),
+                            .child(tr!("app.drop_here")),
                     )
                     .child(
                         div()
@@ -1199,15 +1183,13 @@ impl DataBridge {
                                     .with_size(Size::Size(px(16.)))
                                     .text_color(p.destructive),
                             )
-                            .child(format!("Drop {what}?")),
+                            .child(tr!("app.drop_title", what = what)),
                     )
                     .child(
                         div()
                             .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
-                            .child(format!(
-                                "{name} and all of its data will be permanently deleted. This cannot be undone."
-                            )),
+                            .child(tr!("app.drop_body", name = name)),
                     )
                     .when_some(error, |this, e| {
                         this.child(
@@ -1233,14 +1215,14 @@ impl DataBridge {
                     .child(
                         Button::new("drop-cancel")
                             .ghost()
-                            .label("Cancel")
+                            .label(tr!("common.cancel"))
                             .disabled(running)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_drop(cx))),
                     )
                     .child(
                         Button::new("drop-confirm")
                             .danger()
-                            .label(if running { "Dropping…" } else { "Drop" })
+                            .label(if running { tr!("app.dropping") } else { tr!("app.drop") })
                             .disabled(running)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.confirm_drop(window, cx)
@@ -1258,51 +1240,98 @@ impl DataBridge {
     }
 
     fn render_settings_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::ui::settings::{Language, UiScale};
         use gpui::{ClickEvent, FontWeight};
         let p = theme::palette(cx);
-        let active = crate::ui::settings::current(cx);
+        let scale = crate::ui::settings::current(cx);
+        let dark = cx.theme().is_dark();
+        let lang = Language::current();
 
-        let option_row = |label: &str, hint: &str, s: crate::ui::settings::UiScale| {
-            let is_active = s == active;
+        // One selectable option; `hint` sits right-aligned in muted text.
+        let option = |id: String, label: String, hint: String, active: bool| {
             h_flex()
-                .id(SharedString::from(format!("scale-{}", s.label())))
-                .w_full()
+                .id(SharedString::from(id))
+                .flex_1()
+                .min_w_0()
                 .items_center()
                 .gap_2()
                 .px_3()
-                .py(px(8.))
+                .py(px(7.))
                 .rounded(px(4.))
                 .cursor_pointer()
                 .border_1()
-                .border_color(if is_active { p.primary } else { p.border })
-                .bg(if is_active { p.accent } else { gpui::transparent_black() })
+                .border_color(if active { p.primary } else { p.border })
+                .bg(if active { p.accent } else { gpui::transparent_black() })
                 .hover(move |st| st.bg(p.accent))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .text_size(theme::scaled(theme::TEXT_MD))
                         .text_color(p.foreground)
-                        .child(label.to_string()),
+                        .child(label),
                 )
                 .child(
                     div()
                         .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
-                        .child(hint.to_string()),
+                        .child(hint),
                 )
-                .when(is_active, |this| {
+                .when(active, |this| {
                     this.child(
                         Icon::new(IconName::Check)
                             .with_size(Size::Size(px(14.)))
                             .text_color(p.primary),
                     )
                 })
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    crate::ui::settings::set(s, Some(window), cx);
-                    this.show_settings = false;
-                    cx.notify();
-                }))
         };
+        let section = |title: String| {
+            div()
+                .pt_1()
+                .text_size(theme::scaled(theme::TEXT_SM))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(p.muted_fg)
+                .child(title)
+        };
+
+        let mut scales = v_flex().gap_2();
+        for s in UiScale::ALL {
+            scales = scales.child(
+                option(format!("scale-{}", s.key()), s.label(), format!("{}%", s.percent()), s == scale)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                        crate::ui::settings::set(s, Some(window), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut themes = h_flex().gap_2();
+        for (mode, icon, label) in [
+            (ThemeMode::Light, IconName::Sun, t!("settings.theme_light")),
+            (ThemeMode::Dark, IconName::Moon, t!("settings.theme_dark")),
+        ] {
+            let active = mode.is_dark() == dark;
+            themes = themes.child(
+                option(format!("theme-{}", mode.is_dark()), label.into_owned(), String::new(), active)
+                    .child(Icon::new(icon).with_size(Size::Size(px(14.))).text_color(p.muted_fg))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                        theme::set(mode, window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut langs = h_flex().gap_2();
+        for l in Language::ALL {
+            langs = langs.child(
+                option(format!("lang-{}", l.key()), l.label().into(), String::new(), l == lang)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        crate::ui::settings::set_language(l, cx);
+                        cx.notify();
+                    })),
+            );
+        }
 
         // Click on the backdrop closes the dialog. The backdrop and the
         // card are SIBLINGS under a transparent layer so clicks inside
@@ -1324,13 +1353,7 @@ impl DataBridge {
 
         let card = v_flex()
             .id("settings-dialog")
-            .absolute()
-            .left_1_2()
-            .top_1_2()
-            // Optical centering: pull the card back by half its size.
-            .mt(px(-170.))
-            .ml(px(-190.))
-            .w(theme::scaled(380.))
+            .w(theme::scaled(400.))
             // BlockMouse: clicks over the card never count as backdrop
             // clicks (see the record editor modal in workspace.rs).
             .occlude()
@@ -1341,57 +1364,54 @@ impl DataBridge {
             .shadow_lg()
             .overflow_hidden()
             .child(
-                v_flex()
+                h_flex()
                     .flex_none()
-                    .gap_1()
+                    .items_center()
                     .px_4()
                     .py_3()
                     .border_b_1()
                     .border_color(p.border)
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
+                        div()
+                            .flex_1()
                             .text_size(theme::scaled(theme::TEXT_XL))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
+                            .child(t!("settings.title").into_owned()),
                     )
                     .child(
-                        div()
-                            .text_size(theme::scaled(theme::TEXT_SM))
-                            .text_color(p.muted_fg)
-                            .child("Interface size — scales fonts and controls."),
+                        Button::new("settings-close")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::new(IconName::Close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_settings = false;
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
                 v_flex()
                     .flex_none()
-                    .p_3()
+                    .p_4()
                     .gap_2()
-                    .child(option_row(
-                        "Compact",
-                        "85%",
-                        crate::ui::settings::UiScale::Compact,
-                    ))
-                    .child(option_row(
-                        "Normal",
-                        "100%",
-                        crate::ui::settings::UiScale::Normal,
-                    ))
-                    .child(option_row(
-                        "Large",
-                        "120%",
-                        crate::ui::settings::UiScale::Large,
-                    )),
+                    .child(section(t!("settings.scale").into_owned()))
+                    .child(scales)
+                    .child(section(t!("settings.theme").into_owned()))
+                    .child(themes)
+                    .child(section(t!("settings.language").into_owned()))
+                    .child(langs),
             );
 
         // Transparent event-passing layer: the backdrop handles outside
-        // clicks, the card sits on top as a sibling.
+        // clicks, the card is centered on top as an in-flow sibling.
         div()
             .absolute()
             .top_0()
             .left_0()
             .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
             .child(backdrop)
             .child(card)
     }

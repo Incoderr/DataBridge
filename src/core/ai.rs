@@ -6,8 +6,15 @@
 //! tested here; network calls run on the tokio sidecar and report back
 //! through runtime-agnostic channels, like `SessionHandle`.
 //!
-//! Persistence: `ai.json` (base URL + model) in the platform config dir;
-//! the optional API key lives in the OS keyring only (`storage`).
+//! Providers: the user keeps a list of endpoints (`Provider`), each started
+//! from a [`PRESETS`] entry (OpenRouter, Groq, OpenAI, …, Ollama, LM Studio,
+//! or a custom URL) and picks the active one. They all speak the same
+//! OpenAI protocol — a preset is only a base URL and a label.
+//!
+//! Persistence: `ai.json` (providers, active id, mode) in the platform
+//! config dir; each provider's API key lives in the OS keyring only
+//! (`ai:<provider id>::api_key`). The pre-provider format (one `base_url`
+//! + `model`) is migrated on load.
 //! Privacy: only the schema (names and types) is sent — never row data.
 
 use std::fmt::Write as _;
@@ -70,29 +77,199 @@ impl AiConfig {
     }
 }
 
-pub fn load_config() -> AiConfig {
-    let mut cfg = storage::config_dir()
-        .and_then(|d| std::fs::read_to_string(d.join(FILE)).ok())
-        .and_then(|s| serde_json::from_str::<AiConfig>(&s).ok())
-        .unwrap_or_default();
-    cfg.api_key = storage::load_secret(KEY_ID, KEY_SUFFIX).unwrap_or_default();
-    cfg
+// ---------------- providers ----------------
+
+/// A ready-made endpoint the user can add with one click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderPreset {
+    pub name: &'static str,
+    pub base_url: &'static str,
+    /// Hosted services need a key; local servers usually don't.
+    pub needs_key: bool,
 }
 
-pub fn save_config(cfg: &AiConfig) {
-    if let Some(dir) = storage::config_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(json) = serde_json::to_string_pretty(cfg) {
-            if let Err(e) = std::fs::write(dir.join(FILE), json) {
-                eprintln!("DataBridge: cannot write {FILE}: {e}");
-            }
+pub const PRESETS: &[ProviderPreset] = &[
+    ProviderPreset { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", needs_key: true },
+    ProviderPreset { name: "Groq", base_url: "https://api.groq.com/openai/v1", needs_key: true },
+    ProviderPreset { name: "OpenAI", base_url: "https://api.openai.com/v1", needs_key: true },
+    ProviderPreset {
+        name: "Gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        needs_key: true,
+    },
+    ProviderPreset { name: "DeepSeek", base_url: "https://api.deepseek.com/v1", needs_key: true },
+    ProviderPreset { name: "Mistral", base_url: "https://api.mistral.ai/v1", needs_key: true },
+    ProviderPreset { name: "Together", base_url: "https://api.together.xyz/v1", needs_key: true },
+    ProviderPreset { name: "Cerebras", base_url: "https://api.cerebras.ai/v1", needs_key: true },
+    ProviderPreset { name: "xAI", base_url: "https://api.x.ai/v1", needs_key: true },
+    ProviderPreset { name: "Ollama", base_url: "http://localhost:11434/v1", needs_key: false },
+    ProviderPreset { name: "LM Studio", base_url: "http://localhost:1234/v1", needs_key: false },
+    ProviderPreset { name: "Custom", base_url: "", needs_key: false },
+];
+
+/// One configured endpoint. The key is never serialized — keyring only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(skip)]
+    pub api_key: String,
+}
+
+impl Provider {
+    /// A new provider from a preset; `taken` names get a numeric suffix
+    /// ("Groq 2") so two keys for one service stay distinguishable.
+    pub fn from_preset(p: &ProviderPreset, taken: &[Provider]) -> Self {
+        let mut name = p.name.to_string();
+        let mut n = 2;
+        while taken.iter().any(|t| t.name == name) {
+            name = format!("{} {n}", p.name);
+            n += 1;
+        }
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            base_url: p.base_url.to_string(),
+            model: String::new(),
+            api_key: String::new(),
         }
     }
-    if cfg.api_key.trim().is_empty() {
-        storage::delete_secret(KEY_ID, KEY_SUFFIX);
-    } else {
-        storage::save_secret(KEY_ID, KEY_SUFFIX, cfg.api_key.trim());
+
+    fn key_id(&self) -> String {
+        format!("{KEY_ID}:{}", self.id)
     }
+}
+
+/// Everything in `ai.json`: the providers, which one is active, the mode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AiSettings {
+    #[serde(default)]
+    pub providers: Vec<Provider>,
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub mode: AiMode,
+}
+
+impl AiSettings {
+    pub fn active(&self) -> Option<&Provider> {
+        self.providers
+            .iter()
+            .find(|p| p.id == self.active)
+            .or_else(|| self.providers.first())
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut Provider> {
+        let ix = self
+            .providers
+            .iter()
+            .position(|p| p.id == self.active)
+            .or((!self.providers.is_empty()).then_some(0))?;
+        self.providers.get_mut(ix)
+    }
+
+    /// The request config of the active provider (empty when none).
+    pub fn config(&self) -> AiConfig {
+        match self.active() {
+            Some(p) => AiConfig {
+                base_url: p.base_url.clone(),
+                model: p.model.clone(),
+                mode: self.mode,
+                api_key: p.api_key.clone(),
+            },
+            None => AiConfig { base_url: String::new(), mode: self.mode, ..AiConfig::default() },
+        }
+    }
+
+    /// Parse `ai.json`, accepting the pre-provider shape
+    /// (`{ base_url, model, mode }`) as a single provider. Returns whether
+    /// the legacy shape was seen (the caller then moves its key).
+    fn parse(json: &str) -> (Self, bool) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+            return (Self::default(), false);
+        };
+        if v.get("providers").is_some() {
+            return (serde_json::from_value(v).unwrap_or_default(), false);
+        }
+        let Ok(old) = serde_json::from_value::<AiConfig>(v) else {
+            return (Self::default(), false);
+        };
+        let name = PRESETS
+            .iter()
+            .find(|p| !p.base_url.is_empty() && same_url(p.base_url, &old.base_url))
+            .map(|p| p.name)
+            .unwrap_or("Custom");
+        let p = Provider {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            base_url: old.base_url,
+            model: old.model,
+            api_key: String::new(),
+        };
+        (Self { active: p.id.clone(), providers: vec![p], mode: old.mode }, true)
+    }
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+pub fn load_settings() -> AiSettings {
+    let json = storage::config_dir().and_then(|d| std::fs::read_to_string(d.join(FILE)).ok());
+    let (mut s, legacy) = json.map(|j| AiSettings::parse(&j)).unwrap_or_default();
+    if legacy {
+        // The old single key moves to the provider's own keyring entry.
+        if let Some(p) = s.providers.first_mut() {
+            p.api_key = storage::load_secret(KEY_ID, KEY_SUFFIX).unwrap_or_default();
+            save_key(p);
+        }
+        save_settings(&s);
+        storage::delete_secret(KEY_ID, KEY_SUFFIX);
+        return s;
+    }
+    for p in &mut s.providers {
+        p.api_key = storage::load_secret(&p.key_id(), KEY_SUFFIX).unwrap_or_default();
+    }
+    s
+}
+
+/// Write `ai.json` (keys are not part of it — see [`save_key`]).
+pub fn save_settings(s: &AiSettings) {
+    let Some(dir) = storage::config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string_pretty(s) {
+        if let Err(e) = std::fs::write(dir.join(FILE), json) {
+            eprintln!("DataBridge: cannot write {FILE}: {e}");
+        }
+    }
+}
+
+/// Store (or clear) one provider's API key in the keyring.
+pub fn save_key(p: &Provider) {
+    if p.api_key.trim().is_empty() {
+        // Only touch the keyring when something is stored (a missing
+        // entry would log a "not found" on every save).
+        if storage::load_secret(&p.key_id(), KEY_SUFFIX).is_some() {
+            storage::delete_secret(&p.key_id(), KEY_SUFFIX);
+        }
+    } else {
+        storage::save_secret(&p.key_id(), KEY_SUFFIX, p.api_key.trim());
+    }
+}
+
+/// Forget a removed provider's key.
+pub fn forget_provider(p: &Provider) {
+    storage::delete_secret(&p.key_id(), KEY_SUFFIX);
+}
+
+/// Model ids matching `filter` (case-insensitive substring), for the
+/// picker — hosted routers list hundreds of models.
+pub fn filter_models<'a>(models: &'a [String], filter: &str) -> Vec<&'a String> {
+    let f = filter.trim().to_lowercase();
+    models.iter().filter(|m| f.is_empty() || m.to_lowercase().contains(&f)).collect()
 }
 
 /// Manual: SQL in answers runs only on the user's Run click.
@@ -213,22 +390,38 @@ async fn run_stream(
     if cfg.model.trim().is_empty() {
         return Err(DbError::new("choose a model in the AI settings first"));
     }
-    let body = serde_json::json!({
+    let client = client()?;
+    let mut body = serde_json::json!({
         "model": cfg.model.trim(),
         "messages": messages,
         "stream": true,
         "temperature": 0.2,
     });
-    let mut resp = authed(client()?.post(cfg.endpoint("chat/completions")), cfg)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| DbError::with_source(format!("cannot reach {}: {e}", cfg.base_url), e))?;
-    let status = resp.status();
-    if !status.is_success() {
+    let mut resp = loop {
+        let resp = authed(client.post(cfg.endpoint("chat/completions")), cfg)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| DbError::with_source(format!("cannot reach {}: {e}", cfg.base_url), e))?;
+        let status = resp.status();
+        if status.is_success() {
+            break resp;
+        }
         let text = resp.text().await.unwrap_or_default();
-        return Err(DbError::new(http_error(status, &text)));
-    }
+        // Reasoning models (OpenAI o-series, gpt-5…) accept only the
+        // default temperature: retry once without it.
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && text.contains("temperature")
+            && body.as_object_mut().and_then(|o| o.remove("temperature")).is_some()
+        {
+            continue;
+        }
+        let mut msg = http_error(status, &text);
+        if status == reqwest::StatusCode::UNAUTHORIZED && cfg.api_key.trim().is_empty() {
+            msg.push_str(" — this provider needs an API key (AI settings)");
+        }
+        return Err(DbError::new(msg));
+    };
     let mut sse = SseParser::default();
     loop {
         let chunk = resp
@@ -657,6 +850,45 @@ mod tests {
         assert_eq!(c.endpoint("chat/completions"), "http://localhost:11434/v1/chat/completions");
         c.base_url = "https://example.com/openai/v1".into();
         assert_eq!(c.endpoint("models"), "https://example.com/openai/v1/models");
+    }
+
+    #[test]
+    fn legacy_ai_json_becomes_one_provider() {
+        let (s, legacy) = AiSettings::parse(
+            r#"{"base_url":"https://api.groq.com/openai/v1/","model":"llama-3.3-70b","mode":"auto"}"#,
+        );
+        assert!(legacy);
+        assert_eq!(s.providers.len(), 1);
+        assert_eq!(s.providers[0].name, "Groq");
+        assert_eq!(s.mode, AiMode::Auto);
+        let c = s.config();
+        assert_eq!(c.model, "llama-3.3-70b");
+        assert_eq!(c.endpoint("models"), "https://api.groq.com/openai/v1/models");
+    }
+
+    #[test]
+    fn providers_round_trip_without_keys() {
+        let mut a = Provider::from_preset(&PRESETS[0], &[]);
+        a.api_key = "secret".into();
+        let b = Provider::from_preset(&PRESETS[0], std::slice::from_ref(&a));
+        assert_eq!(b.name, "OpenRouter 2");
+        let s = AiSettings { active: b.id.clone(), providers: vec![a, b.clone()], mode: AiMode::Manual };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("secret"));
+        let (back, legacy) = AiSettings::parse(&json);
+        assert!(!legacy);
+        assert_eq!(back.active().unwrap().id, b.id);
+        // An unknown active id falls back to the first provider.
+        let s = AiSettings { active: "gone".into(), ..back };
+        assert_eq!(s.active().unwrap().name, "OpenRouter");
+        assert_eq!(AiSettings::default().config().base_url, "");
+    }
+
+    #[test]
+    fn model_filter_is_case_insensitive() {
+        let m: Vec<String> = ["openai/gpt-4o", "meta-llama/Llama-3.3-70B", "qwen/qwen3"].map(String::from).into();
+        assert_eq!(filter_models(&m, "llama").len(), 1);
+        assert_eq!(filter_models(&m, " ").len(), 3);
     }
 
     #[test]

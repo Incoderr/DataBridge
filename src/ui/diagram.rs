@@ -375,11 +375,10 @@ impl Render for SchemaDiagram {
                     .min_w_0()
                     .truncate()
                     .child(format!(
-                        "{} · {} — {} tables, {} relations",
+                        "{} · {} — {}",
                         self.conn.database,
                         self.schema,
-                        self.tables.len(),
-                        self.relations.len()
+                        tr!("diagram.summary", tables = self.tables.len(), relations = self.relations.len())
                     )),
             )
             .when_some(self.error.clone(), |this, e| {
@@ -396,7 +395,7 @@ impl Render for SchemaDiagram {
                     div()
                         .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
-                        .child("loading…"),
+                        .child(tr!("common.loading")),
                 )
             })
             .child(div().flex_1())

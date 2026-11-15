@@ -4,7 +4,9 @@
 //! Passwords never touch the disk: fields-mode passwords and the full
 //! (credential-carrying) URLs of URL-mode connections go to the OS keyring
 //! (service `DataBridge`, one entry per connection id). The JSON keeps a
-//! password-stripped URL copy for display. Every operation is best-effort
+//! password-stripped URL copy for display. An SSH tunnel's settings are in
+//! the JSON too; its password / key passphrase is keyring-only
+//! (`::ssh`). Every operation is best-effort
 //! — a missing config dir or an unavailable keyring degrades to "type the
 //! password again", never a crash.
 
@@ -17,7 +19,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{ConnectionStatus, DbConnection, DbType, TargetKey};
+use super::model::{ConnectionStatus, DbConnection, DbType, SshConfig, TargetKey};
 
 /// File name inside the platform config dir.
 const FILE: &str = "connections.json";
@@ -26,6 +28,10 @@ const SERVICE: &str = "DataBridge";
 /// Keyring entry suffix for a URL-mode connection's full URL; the JSON
 /// only stores the sanitized copy for display.
 const URL_SUFFIX: &str = "::url";
+/// Keyring entry suffix for the SSH tunnel's password / key passphrase.
+const SSH_SUFFIX: &str = "::ssh";
+/// Every keyring entry a connection may own.
+const SUFFIXES: [&str; 3] = ["", URL_SUFFIX, SSH_SUFFIX];
 /// How many recent connections to remember.
 const MAX_RECENT: usize = 20;
 
@@ -43,6 +49,10 @@ struct StoredConnection {
     /// Password-stripped when it came from URL mode
     /// (see [`strip_url_password`]); the full URL lives in the keyring.
     url: Option<String>,
+    /// The SSH tunnel, without its secret (`SshConfig::secret` is
+    /// `serde(skip)`; it lives in the keyring under [`SSH_SUFFIX`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<SshConfig>,
     /// Unix milliseconds of the last successful connect — recency order.
     last_used: u64,
 }
@@ -73,6 +83,47 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ---------- app settings ----------
+
+/// `settings.json`: interface preferences (no secrets). Unknown or
+/// missing fields fall back to the defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    /// `"compact"`, `"normal"` or `"large"`.
+    pub ui_scale: String,
+    pub dark: bool,
+    /// SQL editor font size in design px.
+    pub editor_font: f32,
+    /// UI language: `"en"` or `"ru"`.
+    pub language: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self { ui_scale: "normal".into(), dark: true, editor_font: 14.0, language: "en".into() }
+    }
+}
+
+const SETTINGS_FILE: &str = "settings.json";
+
+pub fn load_settings() -> AppSettings {
+    config_dir()
+        .and_then(|d| fs::read_to_string(d.join(SETTINGS_FILE)).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(s: &AppSettings) {
+    let Some(dir) = config_dir() else { return };
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string_pretty(s) {
+        if let Err(e) = fs::write(dir.join(SETTINGS_FILE), json) {
+            eprintln!("DataBridge: cannot write {SETTINGS_FILE}: {e}");
+        }
+    }
 }
 
 // ---------- keyring ----------
@@ -124,8 +175,7 @@ pub fn load_connections() -> Vec<DbConnection> {
         list.into_iter().partition(|c| seen.insert(stored_key(c)));
     if !dupes.is_empty() {
         for d in &dupes {
-            delete_secret(&d.id, "");
-            delete_secret(&d.id, URL_SUFFIX);
+            delete_secrets(&d.id);
         }
         if let Err(e) = write_list(&path, &list) {
             eprintln!("DataBridge: cannot save connections: {e}");
@@ -140,6 +190,10 @@ pub fn load_connections() -> Vec<DbConnection> {
                 None => None,
             };
             let password = load_secret(&c.id, "").unwrap_or_default();
+            let ssh = c.ssh.map(|mut ssh| {
+                ssh.secret = load_secret(&c.id, SSH_SUFFIX).unwrap_or_default();
+                ssh
+            });
             DbConnection {
                 id: c.id,
                 name: c.name,
@@ -152,6 +206,7 @@ pub fn load_connections() -> Vec<DbConnection> {
                 url,
                 status: ConnectionStatus::Disconnected,
                 latency_ms: 0,
+                ssh,
             }
         })
         .collect()
@@ -172,8 +227,7 @@ pub fn remember_connection(conn: &DbConnection) {
         .into_iter()
         .partition(|c| c.id == conn.id || stored_key(c) == key);
     for d in dupes.iter().filter(|d| d.id != conn.id) {
-        delete_secret(&d.id, "");
-        delete_secret(&d.id, URL_SUFFIX);
+        delete_secrets(&d.id);
     }
     list.insert(
         0,
@@ -186,6 +240,7 @@ pub fn remember_connection(conn: &DbConnection) {
             database: conn.database.clone(),
             user: conn.user.clone(),
             url: conn.url.as_ref().map(|u| strip_url_password(u)),
+            ssh: conn.ssh.clone(),
             last_used: now_ms(),
         },
     );
@@ -199,12 +254,16 @@ pub fn remember_connection(conn: &DbConnection) {
     } else if !conn.password.is_empty() {
         save_secret(&conn.id, "", &conn.password);
     }
+    match &conn.ssh {
+        Some(ssh) if !ssh.secret.is_empty() => save_secret(&conn.id, SSH_SUFFIX, &ssh.secret),
+        // No tunnel (any more), or an agent / unencrypted key: drop a stale one.
+        _ => delete_secret(&conn.id, SSH_SUFFIX),
+    }
 }
 
 /// Drop a remembered connection: list entry + both keyring secrets.
 pub fn forget_connection(id: &str) {
-    delete_secret(id, "");
-    delete_secret(id, URL_SUFFIX);
+    delete_secrets(id);
     let Some(path) = connections_path() else {
         return;
     };
@@ -221,6 +280,13 @@ pub fn forget_connection(id: &str) {
 /// [`TargetKey`] ignores anyway).
 fn stored_key(c: &StoredConnection) -> TargetKey {
     TargetKey::build(c.db_type, c.url.as_deref(), &c.host, c.port, &c.database, &c.user)
+        .via(c.ssh.as_ref())
+}
+
+fn delete_secrets(id: &str) {
+    for suffix in SUFFIXES {
+        delete_secret(id, suffix);
+    }
 }
 
 /// `postgres://u:s3cret@h/db?sslmode=…` → `postgres://u@h/db?sslmode=…` —
@@ -297,6 +363,14 @@ mod tests {
             database: "acme_core".into(),
             user: "app_reader".into(),
             url: None,
+            ssh: Some(SshConfig {
+                host: "bastion.acme.io".into(),
+                port: 22,
+                user: "deploy".into(),
+                auth: crate::core::model::SshAuth::Key,
+                key_path: "~/.ssh/id_ed25519".into(),
+                secret: "passphrase".into(),
+            }),
             last_used: 1_700_000_000_000,
         };
         let json = serde_json::to_string(&c).unwrap();
@@ -304,6 +378,12 @@ mod tests {
         assert_eq!(back.id, c.id);
         assert_eq!(back.db_type, DbType::PostgreSql);
         assert_eq!(back.last_used, c.last_used);
+        // The tunnel round-trips without its secret.
+        assert!(!json.contains("passphrase"));
+        let ssh = back.ssh.unwrap();
+        assert_eq!(ssh.host, "bastion.acme.io");
+        assert_eq!(ssh.auth, crate::core::model::SshAuth::Key);
+        assert!(ssh.secret.is_empty());
     }
 
     #[test]
@@ -322,6 +402,7 @@ mod tests {
             url: Some(url.into()),
             status: ConnectionStatus::Disconnected,
             latency_ms: 0,
+            ssh: None,
         };
         let stored = StoredConnection {
             id: "old-id".into(),
@@ -332,6 +413,7 @@ mod tests {
             database: String::new(),
             user: String::new(),
             url: Some(strip_url_password(url)),
+            ssh: None,
             last_used: 0,
         };
         assert_eq!(stored_key(&stored), live.target_key());

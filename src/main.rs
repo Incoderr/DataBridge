@@ -4,6 +4,17 @@
 // Debug builds keep the console for logs (`cargo run`).
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+// UI strings: `t!("key")` looks up locales/app.yml in the current locale.
+rust_i18n::i18n!("locales", fallback = "en");
+
+/// Translated UI string as a `SharedString`: `tr!("key")` or
+/// `tr!("key", name = value)` for `%{name}` placeholders.
+macro_rules! tr {
+    ($($arg:tt)*) => {
+        gpui::SharedString::from(rust_i18n::t!($($arg)*).into_owned())
+    };
+}
+
 mod core;
 mod drivers;
 mod ui;
@@ -74,7 +85,12 @@ fn main() {
             cx.text_system().add_fonts(fonts).expect("failed to register fonts");
 
             gpui_component::init(cx);
-            theme::apply(ThemeMode::Dark, None, cx);
+            // After gpui-component: its "secondary-enter" binding must lose
+            // inside the SQL editor.
+            ui::query::init(cx);
+            // Saved interface settings (scale, theme, editor font).
+            let dark = ui::settings::restore(cx);
+            theme::apply(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
 
             let bounds = Bounds {
                 origin: Point {

@@ -18,9 +18,9 @@ use crate::core::error::DbError;
 use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
-    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
+    QueryPage, Relation, RowQuery, SchemaMeta, SqlDialect, TableMeta, TableRef,
 };
-use crate::core::session::DbSession;
+use crate::core::session::{CancelToken, DbSession, cancellable};
 use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct MySqlSession {
@@ -159,31 +159,53 @@ impl DbSession for MySqlSession {
             .collect())
     }
 
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
+    async fn fetch_rows(
+        &self,
+        table: TableRef,
+        query: RowQuery,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Page, DbError> {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = mysql_ident(&table.schema, &table.name);
+        let cl = SqlDialect::MySql.clauses(&query, 1);
+        let filtered = query.is_filtered();
         // The page and InnoDB's row estimate in parallel; an exact
-        // COUNT(*) only when neither settles the total.
-        let page_sql = format!("SELECT * FROM {ident} LIMIT ? OFFSET ?");
-        let page = sqlx::query(&page_sql).bind(limit).bind(offset).fetch_all(pool);
+        // COUNT(*) only when neither settles the total. Filter values
+        // bind first (positional `?`), then LIMIT / OFFSET.
+        let page_sql = format!("SELECT * FROM {ident}{}{} LIMIT ? OFFSET ?", cl.where_, cl.order);
+        let mut page = sqlx::query(&page_sql);
+        for b in &cl.binds {
+            page = bind_cell!(page, b);
+        }
+        let page = page.bind(limit).bind(offset).fetch_all(pool);
         // TABLE_ROWS: an estimate for InnoDB, NULL for views.
-        let estimate = sqlx::query_scalar::<_, Option<u64>>(
-            "SELECT TABLE_ROWS FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-        )
-        .bind(&table.schema)
-        .bind(&table.name)
-        .fetch_optional(pool);
+        let estimate = async {
+            if filtered {
+                return Ok(None);
+            }
+            sqlx::query_scalar::<_, Option<u64>>(
+                "SELECT TABLE_ROWS FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            )
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_optional(pool)
+            .await
+        };
         let (rows, estimate) = tokio::join!(page, estimate);
-        let rows = rows.map_err(|e| {
-            DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
-        })?;
+        let rows = rows.map_err(super::util::query_error)?;
         let estimate = estimate.ok().flatten().flatten().map(|n| n.min(i64::MAX as u64) as i64);
         let (total, exact) = match total_without_count(offset, limit, rows.len(), estimate) {
             Some(t) => t,
             None => {
-                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                let count_sql = format!("SELECT COUNT(*) FROM {ident}{}", cl.where_);
+                let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+                for b in &cl.binds {
+                    q = bind_cell!(q, b);
+                }
+                let n: i64 = q
                     .fetch_one(pool)
                     .await
                     .map_err(|e| {
@@ -214,62 +236,29 @@ impl DbSession for MySqlSession {
         })
     }
 
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        limit: u64,
+        cancel: &CancelToken,
+    ) -> Result<QueryPage, DbError> {
         let pool = self.pool().await?;
-        let t0 = Instant::now();
-        if !is_select_like(sql) {
-            let res = sqlx::query(sql)
-                .execute(pool)
-                .await
-                .map_err(super::util::query_error)?;
-            return Ok(QueryPage {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                rows_affected: res.rows_affected(),
-                truncated: false,
-                elapsed_ms: t0.elapsed().as_millis() as u32,
-            });
-        }
-        let rows = sqlx::query(sql)
-            .fetch_all(pool)
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| DbError::with_source("failed to connect to MySQL", e))?;
+        // The connection id lets Stop end the statement server-side
+        // (`KILL QUERY` from another pool connection; the connection
+        // itself survives).
+        let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *conn)
             .await
             .map_err(super::util::query_error)?;
-        let columns: Vec<ColumnMeta> = rows
-            .first()
-            .map(|r| {
-                r.columns()
-                    .iter()
-                    .map(|c| {
-                        let t = c.type_info().name().to_lowercase();
-                        ColumnMeta {
-                            name: c.name().to_string(),
-                            type_: c.type_info().to_string(),
-                            nullable: true,
-                            primary_key: false,
-                            auto_increment: false,
-                            has_default: false,
-                            kind: mysql_kind(&t, &t),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let truncated = rows.len() > limit as usize;
-        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
-        for row in rows.into_iter().take(limit as usize) {
-            let mut r = Vec::with_capacity(row.len());
-            for i in 0..row.len() {
-                r.push(dyn_cell!(row, i));
-            }
-            out.push(r);
-        }
-        Ok(QueryPage {
-            columns,
-            rows: out,
-            rows_affected: 0,
-            truncated,
-            elapsed_ms: t0.elapsed().as_millis() as u32,
-        })
+        let kill = async move {
+            // `id` is the server's own integer — never user input.
+            let _ = sqlx::raw_sql(&format!("KILL QUERY {id}")).execute(pool).await;
+        };
+        cancellable(run_statement(&mut conn, sql, limit), cancel, Some(kill)).await
     }
 
     async fn update_row(
@@ -493,5 +482,68 @@ async fn schema_meta(pool: &MySqlPool, schema: String) -> Result<SchemaMeta, DbE
         tables,
         views,
         functions,
+    })
+}
+
+/// One statement of the query editor on a dedicated connection (the
+/// caller may cancel it by its server-side id).
+async fn run_statement(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+    limit: u64,
+) -> Result<QueryPage, DbError> {
+    let t0 = Instant::now();
+    if !is_select_like(sql) {
+        let res = sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(super::util::query_error)?;
+        return Ok(QueryPage {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: res.rows_affected(),
+            truncated: false,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        });
+    }
+    let rows = sqlx::query(sql)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(super::util::query_error)?;
+    let columns: Vec<ColumnMeta> = rows
+        .first()
+        .map(|r| {
+            r.columns()
+                .iter()
+                .map(|c| {
+                    let t = c.type_info().name().to_lowercase();
+                    ColumnMeta {
+                        name: c.name().to_string(),
+                        type_: c.type_info().to_string(),
+                        nullable: true,
+                        primary_key: false,
+                        auto_increment: false,
+                        has_default: false,
+                        kind: mysql_kind(&t, &t),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let truncated = rows.len() > limit as usize;
+    let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+    for row in rows.into_iter().take(limit as usize) {
+        let mut r = Vec::with_capacity(row.len());
+        for i in 0..row.len() {
+            r.push(dyn_cell!(row, i));
+        }
+        out.push(r);
+    }
+    Ok(QueryPage {
+        columns,
+        rows: out,
+        rows_affected: 0,
+        truncated,
+        elapsed_ms: t0.elapsed().as_millis() as u32,
     })
 }

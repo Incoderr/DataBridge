@@ -336,12 +336,11 @@ pub fn apply(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     }
 }
 
-/// Toggle between light and dark.
-pub fn toggle(window: &mut Window, cx: &mut App) {
-    let next = if cx.theme().is_dark() {
-        ThemeMode::Light
-    } else {
-        ThemeMode::Dark
-    };
-    apply(next, Some(window), cx);
+/// Switch to `mode` (Settings dialog) and remember it.
+pub fn set(mode: ThemeMode, window: &mut Window, cx: &mut App) {
+    if cx.theme().is_dark() == mode.is_dark() {
+        return;
+    }
+    apply(mode, Some(window), cx);
+    crate::ui::settings::persist(cx);
 }

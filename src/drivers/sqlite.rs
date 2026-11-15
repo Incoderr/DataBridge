@@ -18,9 +18,9 @@ use crate::core::error::DbError;
 use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
-    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
+    QueryPage, Relation, RowQuery, SchemaMeta, SqlDialect, TableMeta, TableRef,
 };
-use crate::core::session::DbSession;
+use crate::core::session::{CancelToken, DbSession, cancellable};
 use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct SqliteSession {
@@ -208,22 +208,39 @@ impl DbSession for SqliteSession {
             .collect())
     }
 
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
+    async fn fetch_rows(
+        &self,
+        table: TableRef,
+        query: RowQuery,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Page, DbError> {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = sqlite_ident(&table.name);
+        let cl = SqlDialect::Sqlite.clauses(&query, 1);
         // Local file, no statistics: the page first, COUNT(*) only when the
         // page came back full (a short page already ends the table).
-        let rows = sqlx::query(&format!("SELECT * FROM {ident} LIMIT ? OFFSET ?"))
+        let sql = format!("SELECT * FROM {ident}{}{} LIMIT ? OFFSET ?", cl.where_, cl.order);
+        let mut q = sqlx::query(&sql);
+        for b in &cl.binds {
+            q = bind_cell!(q, b);
+        }
+        let rows = q
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch_all(pool)
             .await
-            .map_err(|e| DbError::with_source(format!("failed to read {}", table.name), e))?;
+            .map_err(super::util::query_error)?;
         let total = match total_without_count(offset, limit, rows.len(), None) {
             Some((n, _)) => n,
             None => {
-                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                let count_sql = format!("SELECT COUNT(*) FROM {ident}{}", cl.where_);
+                let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+                for b in &cl.binds {
+                    q = bind_cell!(q, b);
+                }
+                let n: i64 = q
                     .fetch_one(pool)
                     .await
                     .map_err(|e| {
@@ -251,59 +268,25 @@ impl DbSession for SqliteSession {
         })
     }
 
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        limit: u64,
+        cancel: &CancelToken,
+    ) -> Result<QueryPage, DbError> {
         let pool = self.pool().await?;
-        let t0 = Instant::now();
-        if !is_select_like(sql) {
-            let res = sqlx::query(sql)
-                .execute(pool)
-                .await
-                .map_err(super::util::query_error)?;
-            return Ok(QueryPage {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                rows_affected: res.rows_affected(),
-                truncated: false,
-                elapsed_ms: t0.elapsed().as_millis() as u32,
-            });
-        }
-        let rows = sqlx::query(sql)
-            .fetch_all(pool)
+        let mut conn = pool
+            .acquire()
             .await
-            .map_err(super::util::query_error)?;
-        let columns: Vec<ColumnMeta> = rows
-            .first()
-            .map(|r| {
-                r.columns()
-                    .iter()
-                    .map(|c| ColumnMeta {
-                        name: c.name().to_string(),
-                        type_: c.type_info().to_string(),
-                        nullable: true,
-                        primary_key: false,
-                        auto_increment: false,
-                        has_default: false,
-                        kind: sqlite_kind(c.type_info().name()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let truncated = rows.len() > limit as usize;
-        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
-        for row in rows.into_iter().take(limit as usize) {
-            let mut r = Vec::with_capacity(row.len());
-            for i in 0..row.len() {
-                r.push(dyn_cell!(row, i));
-            }
-            out.push(r);
-        }
-        Ok(QueryPage {
-            columns,
-            rows: out,
-            rows_affected: 0,
-            truncated,
-            elapsed_ms: t0.elapsed().as_millis() as u32,
-        })
+            .map_err(|e| DbError::with_source("failed to open the SQLite database", e))?;
+        // sqlx exposes no `sqlite3_interrupt`: Stop abandons the call (the
+        // worker thread finishes the statement in the background).
+        cancellable(
+            run_statement(&mut conn, sql, limit),
+            cancel,
+            None::<std::future::Ready<()>>,
+        )
+        .await
     }
 
     async fn update_row(
@@ -446,6 +429,66 @@ fn mark_rowid_alias(columns: &mut [ColumnMeta]) {
         only.auto_increment = true;
         only.has_default = true;
     }
+}
+
+/// One statement of the query editor on a dedicated connection (the
+/// caller may cancel it by its server-side id).
+async fn run_statement(
+    conn: &mut sqlx::SqliteConnection,
+    sql: &str,
+    limit: u64,
+) -> Result<QueryPage, DbError> {
+    let t0 = Instant::now();
+    if !is_select_like(sql) {
+        let res = sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(super::util::query_error)?;
+        return Ok(QueryPage {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: res.rows_affected(),
+            truncated: false,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        });
+    }
+    let rows = sqlx::query(sql)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(super::util::query_error)?;
+    let columns: Vec<ColumnMeta> = rows
+        .first()
+        .map(|r| {
+            r.columns()
+                .iter()
+                .map(|c| ColumnMeta {
+                    name: c.name().to_string(),
+                    type_: c.type_info().to_string(),
+                    nullable: true,
+                    primary_key: false,
+                    auto_increment: false,
+                    has_default: false,
+                    kind: sqlite_kind(c.type_info().name()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let truncated = rows.len() > limit as usize;
+    let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+    for row in rows.into_iter().take(limit as usize) {
+        let mut r = Vec::with_capacity(row.len());
+        for i in 0..row.len() {
+            r.push(dyn_cell!(row, i));
+        }
+        out.push(r);
+    }
+    Ok(QueryPage {
+        columns,
+        rows: out,
+        rows_affected: 0,
+        truncated,
+        elapsed_ms: t0.elapsed().as_millis() as u32,
+    })
 }
 
 #[cfg(test)]

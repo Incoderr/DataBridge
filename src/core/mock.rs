@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use super::error::DbError;
 use super::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DbType, DocNode, NodeKind, Page,
-    Ping, QueryPage, Relation, Row, SchemaMeta, TableMeta, TableRef, Value,
+    Ping, QueryPage, Relation, Row, RowQuery, SchemaMeta, TableMeta, TableRef, Value,
 };
 use super::model::is_select_like;
-use super::session::DbSession;
+use super::session::{CancelToken, DbSession, cancellable};
 
 // ---------- Seeds ----------
 
@@ -34,6 +34,7 @@ pub fn seed_connections() -> Vec<DbConnection> {
             url: None,
             status: ConnectionStatus::Connected,
             latency_ms: 18,
+            ssh: None,
         },
         DbConnection {
             id: "mysql-analytics".into(),
@@ -47,6 +48,7 @@ pub fn seed_connections() -> Vec<DbConnection> {
             url: None,
             status: ConnectionStatus::Connected,
             latency_ms: 41,
+            ssh: None,
         },
         DbConnection {
             id: "sqlite-local".into(),
@@ -60,6 +62,7 @@ pub fn seed_connections() -> Vec<DbConnection> {
             url: None,
             status: ConnectionStatus::Connected,
             latency_ms: 2,
+            ssh: None,
         },
         DbConnection {
             id: "staging-pg".into(),
@@ -73,6 +76,7 @@ pub fn seed_connections() -> Vec<DbConnection> {
             url: None,
             status: ConnectionStatus::Error,
             latency_ms: 0,
+            ssh: None,
         },
         DbConnection {
             id: "unauth-mongo".into(),
@@ -86,6 +90,7 @@ pub fn seed_connections() -> Vec<DbConnection> {
             url: None,
             status: ConnectionStatus::Disconnected,
             latency_ms: 0,
+            ssh: None,
         },
     ]
 }
@@ -612,7 +617,13 @@ impl DbSession for MockSession {
         })
     }
 
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
+    async fn fetch_rows(
+        &self,
+        table: TableRef,
+        query: RowQuery,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Page, DbError> {
         let Some(meta) = find_meta(&self.conn, &table.schema, &table.name) else {
             return Err(DbError::new(format!(
                 "table {}.{} not found in this connection",
@@ -622,16 +633,35 @@ impl DbSession for MockSession {
         let ms = self.latency_ms();
         tokio::time::sleep(Duration::from_millis(ms as u64)).await;
         let edits = self.edits.lock().unwrap();
-        let mut page = mock_page(&edits, &meta, &table, ms, offset, limit);
+        let mut page = if query == RowQuery::default() {
+            mock_page(&edits, &meta, &table, ms, offset, limit)
+        } else {
+            mock_query_page(&edits, &meta, &table, &query, ms, offset, limit)
+        };
         if self.conn.db_type == DbType::MongoDb {
             page.documents = Some(mock_documents(&meta, &page.rows));
         }
         Ok(page)
     }
 
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
-        let ms = self.latency_ms();
-        tokio::time::sleep(Duration::from_millis(ms as u64)).await;
+    async fn execute(
+        &self,
+        sql: &str,
+        limit: u64,
+        cancel: &CancelToken,
+    ) -> Result<QueryPage, DbError> {
+        // `SELECT pg_sleep(5)` / `SELECT SLEEP(5)` really waits, so Stop
+        // is demoable without a database.
+        let ms = self.latency_ms() + mock_sleep_ms(sql);
+        cancellable(
+            async {
+                tokio::time::sleep(Duration::from_millis(ms as u64)).await;
+                Ok(())
+            },
+            cancel,
+            None::<std::future::Ready<()>>,
+        )
+        .await?;
         // The mock cannot really run SQL; it reports a plausible outcome
         // so the editor flow is demoable end-to-end.
         if is_select_like(sql) {
@@ -888,5 +918,86 @@ fn mock_page_rows(
         rows,
         columns: None,
         documents: None,
+    }
+}
+
+/// Rows a filtered/sorted demo page scans at most (generated on the fly).
+const MOCK_SCAN: i64 = 20_000;
+
+/// Filtered and/or sorted page: every (edited) row up to [`MOCK_SCAN`] is
+/// generated, filtered and sorted in memory — demo data only.
+fn mock_query_page(
+    edits: &MockEdits,
+    t: &TableMeta,
+    table: &TableRef,
+    query: &RowQuery,
+    latency_ms: u32,
+    offset: u64,
+    limit: u64,
+) -> Page {
+    let key = format!("{}.{}", table.schema, table.name);
+    let mut rows: Vec<Row> = (0..(t.row_count as i64).min(MOCK_SCAN))
+        .filter(|id| !edits.deleted.contains(&(key.clone(), *id)))
+        .map(|id| {
+            edits
+                .updated
+                .get(&(key.clone(), id))
+                .cloned()
+                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(c, id)).collect())
+        })
+        .chain(edits.inserted.get(&key).cloned().unwrap_or_default())
+        .collect();
+    let ix = |name: &str| t.columns.iter().position(|c| c.name == name);
+    rows.retain(|r| {
+        query.filters.iter().all(|f| match ix(&f.column) {
+            Some(i) => f.matches(&r[i]),
+            None => false,
+        })
+    });
+    if let Some((col, desc)) = &query.sort {
+        if let Some(i) = ix(col) {
+            rows.sort_by(|a, b| {
+                let o = crate::core::model::cmp_values(&a[i], &b[i]);
+                if *desc { o.reverse() } else { o }
+            });
+        }
+    }
+    let total = rows.len() as u64;
+    let rows: Vec<Row> = rows.into_iter().skip(offset as usize).take(limit as usize).collect();
+    Page {
+        truncated: total > offset + limit,
+        elapsed_ms: latency_ms,
+        total,
+        exact: true,
+        rows,
+        columns: None,
+        documents: None,
+    }
+}
+
+/// Seconds of a `sleep(n)` / `pg_sleep(n)` call in a mock statement, as
+/// milliseconds (capped at a minute).
+fn mock_sleep_ms(sql: &str) -> u32 {
+    let lower = sql.to_ascii_lowercase();
+    let Some(at) = lower.find("sleep(") else {
+        return 0;
+    };
+    let arg: String = lower[at + 6..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || c.is_whitespace())
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let secs: f64 = arg.parse().unwrap_or(0.0);
+    (secs.clamp(0.0, 60.0) * 1000.0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mock_sleep_reads_the_argument() {
+        assert_eq!(super::mock_sleep_ms("SELECT pg_sleep(2)"), 2000);
+        assert_eq!(super::mock_sleep_ms("select SLEEP( 0.5 )"), 500);
+        assert_eq!(super::mock_sleep_ms("SELECT 1"), 0);
+        assert_eq!(super::mock_sleep_ms("SELECT sleep(9999)"), 60_000);
     }
 }

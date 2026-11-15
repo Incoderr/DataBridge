@@ -43,33 +43,43 @@ pub fn is_supported(t: DbType) -> bool {
 
 /// Open a session for a connection. Cheap: real pools connect lazily on
 /// the first session call (the wizard's Test Connection is that call).
+/// A connection with an SSH tunnel gets a `TunneledSession` that opens the
+/// tunnel first and points the driver at its local end (SQLite files and
+/// `--mock` ignore the tunnel).
 pub fn open(conn: &DbConnection) -> Result<SessionHandle, DbError> {
-    let session: Arc<dyn DbSession> = if is_mock() {
+    if is_mock() {
         // Demo mode: the mock serves every type, regardless of features.
-        Arc::new(MockSession::new(conn))
-    } else {
-        match conn.db_type {
-            #[cfg(feature = "postgres")]
-            DbType::PostgreSql => Arc::new(crate::drivers::postgres::PostgresSession::new(conn)),
-            // MariaDB speaks the MySQL wire protocol (and sqlx accepts
-            // `mariadb://` URLs), so the MySQL driver serves both.
-            #[cfg(feature = "mysql")]
-            DbType::MySql | DbType::MariaDb => {
-                Arc::new(crate::drivers::mysql::MySqlSession::new(conn))
-            }
-            #[cfg(feature = "sqlite")]
-            DbType::Sqlite => Arc::new(crate::drivers::sqlite::SqliteSession::new(conn)),
-            DbType::MongoDb => Arc::new(crate::drivers::mongo::MongoSession::new(conn)),
-            // No driver for this type (Stage 4 types, or a build without
-            // the feature): fail loudly. Falling back to the mock would show
-            // fake demo tables as if they were the user's database.
-            t => {
-                return Err(DbError::new(format!(
-                    "{} is not supported in this build yet — run with --mock for a demo.",
-                    t.label()
-                )));
-            }
+        return Ok(SessionHandle::new(Arc::new(MockSession::new(conn))));
+    }
+    let session = match &conn.ssh {
+        Some(ssh) if conn.db_type != DbType::Sqlite && is_supported(conn.db_type) => {
+            Arc::new(crate::drivers::ssh::TunneledSession::new(conn, ssh.clone(), driver)?)
         }
+        _ => driver(conn)?,
     };
     Ok(SessionHandle::new(session))
+}
+
+/// The real driver for a connection (no tunnel, no mock).
+fn driver(conn: &DbConnection) -> Result<Arc<dyn DbSession>, DbError> {
+    Ok(match conn.db_type {
+        #[cfg(feature = "postgres")]
+        DbType::PostgreSql => Arc::new(crate::drivers::postgres::PostgresSession::new(conn)),
+        // MariaDB speaks the MySQL wire protocol (and sqlx accepts
+        // `mariadb://` URLs), so the MySQL driver serves both.
+        #[cfg(feature = "mysql")]
+        DbType::MySql | DbType::MariaDb => Arc::new(crate::drivers::mysql::MySqlSession::new(conn)),
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => Arc::new(crate::drivers::sqlite::SqliteSession::new(conn)),
+        DbType::MongoDb => Arc::new(crate::drivers::mongo::MongoSession::new(conn)),
+        // No driver for this type (Stage 4 types, or a build without
+        // the feature): fail loudly. Falling back to the mock would show
+        // fake demo tables as if they were the user's database.
+        t => {
+            return Err(DbError::new(format!(
+                "{} is not supported in this build yet — run with --mock for a demo.",
+                t.label()
+            )));
+        }
+    })
 }

@@ -26,15 +26,23 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
+use crate::core::session::CancelToken;
 use crate::core::ai::{
-    self, AiConfig, AiEvent, AiMode, ChatMessage, Conversation, Entry, Role, segments,
+    self, AiConfig, AiEvent, AiMode, AiSettings, ChatMessage, Conversation, Entry, PRESETS,
+    Provider, Role, segments,
 };
+
+/// Model chips shown at once; the Model field filters the rest.
+const MODEL_CHIPS: usize = 30;
 use crate::ui::app::DataBridge;
 use crate::ui::query::RESULT_LIMIT;
 use crate::ui::theme;
 
 pub struct AiChatView {
     app: WeakEntity<DataBridge>,
+    /// Providers + mode as saved in `ai.json`.
+    settings: AiSettings,
+    /// Request config of the active provider (derived from `settings`).
     cfg: AiConfig,
     conv_id: String,
     entries: Vec<Entry>,
@@ -47,12 +55,18 @@ pub struct AiChatView {
     running: bool,
     send_id: u64,
     task: Option<Task<()>>,
+    /// Cancels the statement being executed (Stop); dropping `task` alone
+    /// would leave it running in the database.
+    exec_cancel: Option<CancelToken>,
     /// Auto rounds since the user's last message.
     auto_steps: usize,
     error: Option<String>,
     notice: Option<String>,
     // settings
     show_settings: bool,
+    /// The preset picker ("Add provider") is open.
+    adding: bool,
+    name: Entity<InputState>,
     base_url: Entity<InputState>,
     model: Entity<InputState>,
     api_key: Entity<InputState>,
@@ -70,6 +84,11 @@ fn is_ddl(sql: &str) -> bool {
     crate::core::model::changes_schema(sql)
 }
 
+/// A small muted note (used inside chip rows).
+fn label_owned(s: String, color: Hsla) -> gpui::Div {
+    div().text_size(theme::scaled(theme::TEXT_XS)).text_color(color).child(s)
+}
+
 /// At most `n` lines of `s`, with a marker when something was cut.
 fn clip_lines(s: &str, n: usize) -> String {
     let mut lines = s.lines();
@@ -77,19 +96,20 @@ fn clip_lines(s: &str, n: usize) -> String {
     let rest = lines.count();
     let mut out = head.join("\n");
     if rest > 0 {
-        out.push_str(&format!("\n… {rest} more line(s)"));
+        out.push_str(&format!("\n… {}", tr!("ai.more_lines", n = rest)));
     }
     out
 }
 
 impl AiChatView {
     pub fn new(app: WeakEntity<DataBridge>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let cfg = ai::load_config();
+        let settings = ai::load_settings();
+        let cfg = settings.config();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(2, 10)
-                .placeholder("Ask about your data…  (Enter — send, Ctrl+Enter — new line)")
+                .placeholder(tr!("ai.placeholder"))
         });
         let field = |v: &str, ph: &str, masked: bool, window: &mut Window, cx: &mut Context<Self>| {
             let (v, ph) = (v.to_string(), ph.to_string());
@@ -99,9 +119,22 @@ impl AiChatView {
                 s
             })
         };
-        let base_url = field(&cfg.base_url, "http://localhost:11434/v1", false, window, cx);
-        let model = field(&cfg.model, "qwen2.5-coder:7b", false, window, cx);
-        let api_key = field(&cfg.api_key, "optional", true, window, cx);
+        let name = field(
+            settings.active().map(|p| p.name.as_str()).unwrap_or(""),
+            &tr!("common.name"),
+            false,
+            window,
+            cx,
+        );
+        let base_url = field(&cfg.base_url, "https://…/v1", false, window, cx);
+        let model = field(&cfg.model, &tr!("ai.model_ph"), false, window, cx);
+        let api_key = field(&cfg.api_key, &tr!("ai.key_ph"), true, window, cx);
+        // The model chips filter by the Model field: repaint as it changes.
+        let model_sub = cx.subscribe(&model, |_, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        });
 
         // Multi-line inputs insert the newline *before* emitting
         // PressEnter (Ctrl+Enter = `secondary` included, which is exactly
@@ -124,8 +157,10 @@ impl AiChatView {
             }
         });
         let show_settings = cfg.model.trim().is_empty();
+        let adding = settings.providers.is_empty();
         Self {
             app,
+            settings,
             cfg,
             conv_id: new_id(),
             entries: Vec::new(),
@@ -136,18 +171,21 @@ impl AiChatView {
             streaming: false,
             running: false,
             send_id: 0,
+            exec_cancel: None,
             task: None,
             auto_steps: 0,
             error: None,
             notice: None,
             show_settings,
+            adding,
+            name,
             base_url,
             model,
             api_key,
             models: Vec::new(),
             models_loading: false,
             models_gen: 0,
-            _subs: vec![send_sub],
+            _subs: vec![send_sub, model_sub],
         }
     }
 
@@ -166,17 +204,94 @@ impl AiChatView {
         }
     }
 
+    /// Copy the form into the active provider and persist it (file + key).
+    fn commit_inputs(&mut self, cx: &mut Context<Self>) {
+        let name = self.name.read(cx).value().trim().to_string();
+        let form = self.read_settings(cx);
+        let Some(p) = self.settings.active_mut() else { return };
+        if !name.is_empty() {
+            p.name = name;
+        }
+        p.base_url = form.base_url;
+        p.model = form.model;
+        p.api_key = form.api_key;
+        let p = p.clone();
+        ai::save_key(&p);
+        ai::save_settings(&self.settings);
+        self.cfg = self.settings.config();
+    }
+
     fn save_settings(&mut self, cx: &mut Context<Self>) {
-        self.cfg = self.read_settings(cx);
-        ai::save_config(&self.cfg);
+        self.commit_inputs(cx);
         self.show_settings = false;
         self.error = None;
         cx.notify();
     }
 
+    /// Fill the form from the active provider; the model list belongs to
+    /// the previous server, so it is dropped (and any fetch in flight).
+    fn load_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let p = self.settings.active().cloned();
+        let get = |f: fn(&Provider) -> &String| p.as_ref().map(|p| f(p).clone()).unwrap_or_default();
+        let vals = [
+            (&self.name, get(|p| &p.name)),
+            (&self.base_url, get(|p| &p.base_url)),
+            (&self.model, get(|p| &p.model)),
+            (&self.api_key, get(|p| &p.api_key)),
+        ];
+        for (input, v) in vals {
+            input.update(cx, |s, cx| s.set_value(v, window, cx));
+        }
+        self.models.clear();
+        self.models_gen += 1;
+        self.models_loading = false;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn select_provider(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.active().is_some_and(|p| p.id == id) {
+            return;
+        }
+        self.commit_inputs(cx);
+        self.settings.active = id;
+        ai::save_settings(&self.settings);
+        self.cfg = self.settings.config();
+        self.load_inputs(window, cx);
+    }
+
+    fn add_provider(&mut self, preset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preset) = PRESETS.get(preset) else { return };
+        self.commit_inputs(cx);
+        let p = Provider::from_preset(preset, &self.settings.providers);
+        self.settings.active = p.id.clone();
+        self.settings.providers.push(p);
+        ai::save_settings(&self.settings);
+        self.cfg = self.settings.config();
+        self.adding = false;
+        self.load_inputs(window, cx);
+        if preset.needs_key {
+            self.notice = Some(tr!("ai.paste_key", name = preset.name).to_string());
+        } else if !preset.base_url.is_empty() {
+            self.notice = Some(tr!("ai.press_list").into());
+        }
+    }
+
+    fn remove_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.settings.active().cloned() else { return };
+        ai::forget_provider(&p);
+        self.settings.providers.retain(|x| x.id != p.id);
+        self.settings.active = self.settings.providers.first().map(|x| x.id.clone()).unwrap_or_default();
+        ai::save_settings(&self.settings);
+        self.cfg = self.settings.config();
+        self.adding = self.settings.providers.is_empty();
+        self.load_inputs(window, cx);
+    }
+
     fn set_mode(&mut self, mode: AiMode, cx: &mut Context<Self>) {
+        self.settings.mode = mode;
         self.cfg.mode = mode;
-        ai::save_config(&self.cfg);
+        ai::save_settings(&self.settings);
         cx.notify();
     }
 
@@ -196,11 +311,11 @@ impl AiChatView {
                 v.models_loading = false;
                 match res {
                     Ok(Ok(list)) if list.is_empty() => {
-                        v.error = Some("the server reports no models".into())
+                        v.error = Some(tr!("ai.no_models").into())
                     }
                     Ok(Ok(list)) => v.models = list,
                     Ok(Err(e)) => v.error = Some(e.message().to_string()),
-                    Err(_) => v.error = Some("request cancelled".into()),
+                    Err(_) => v.error = Some(tr!("ai.cancelled").into()),
                 }
                 cx.notify();
             });
@@ -270,6 +385,9 @@ impl AiChatView {
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.send_id += 1;
         self.task = None; // drops the receiver → the sidecar request stops
+        if let Some(cancel) = self.exec_cancel.take() {
+            cancel.cancel();
+        }
         if self.streaming {
             if matches!(self.entries.last(), Some(Entry::Assistant { text }) if text.is_empty()) {
                 self.entries.pop();
@@ -292,7 +410,7 @@ impl AiChatView {
         }
         if self.cfg.model.trim().is_empty() {
             self.show_settings = true;
-            self.error = Some("choose a model first".into());
+            self.error = Some(tr!("ai.choose_model").into());
             cx.notify();
             return;
         }
@@ -390,10 +508,10 @@ impl AiChatView {
             return;
         }
         if self.auto_steps >= ai::MAX_AUTO_STEPS {
-            self.notice = Some(format!(
-                "Auto mode paused after {} rounds — press Run to continue.",
-                ai::MAX_AUTO_STEPS
-            ));
+            self.notice = Some(tr!(
+                "ai.auto_paused",
+                n = ai::MAX_AUTO_STEPS
+            ).to_string());
             return;
         }
         // Run up to the first statement that needs a human.
@@ -404,7 +522,7 @@ impl AiChatView {
             .collect();
         if safe.len() < sqls.len() {
             self.notice = Some(
-                "A destructive statement (DROP / TRUNCATE / no WHERE) waits for your Run.".into(),
+                tr!("ai.destructive").into(),
             );
         }
         if safe.is_empty() {
@@ -412,7 +530,7 @@ impl AiChatView {
         }
         if safe.iter().any(|q| ai::repeats_failure(&self.entries, q)) {
             self.notice = Some(
-                "Auto mode paused: the assistant repeated a statement that already failed.".into(),
+                tr!("ai.repeat_pause").into(),
             );
             return;
         }
@@ -432,7 +550,7 @@ impl AiChatView {
     ) {
         let session = self.app.read_with(cx, |a, _| a.session.clone()).ok().flatten();
         let Some(session) = session else {
-            self.error = Some("connect to a database first".into());
+            self.error = Some(tr!("ai.connect_first").into());
             cx.notify();
             return;
         };
@@ -441,10 +559,12 @@ impl AiChatView {
         self.running = true;
         self.error = None;
         cx.notify();
+        let cancel = CancelToken::new();
+        self.exec_cancel = Some(cancel.clone());
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
             let mut ddl = false;
             for sql in sqls {
-                let res = match session.execute(sql.clone(), RESULT_LIMIT).await {
+                let res = match session.execute(sql.clone(), RESULT_LIMIT, cancel.clone()).await {
                     Ok(r) => r,
                     Err(_) => return,
                 };
@@ -556,10 +676,10 @@ impl Render for AiChatView {
         let busy = self.busy();
         let auto = self.cfg.mode == AiMode::Auto;
 
-        let icon_btn = |id: &'static str, icon: IconName, tip: &'static str| {
+        let icon_btn = |id: &'static str, icon: IconName, tip: SharedString| {
             Button::new(id).ghost().xsmall().icon(Icon::new(icon)).tooltip(tip)
         };
-        let mode_btn = |id: &'static str, label: &'static str, on: bool| {
+        let mode_btn = |id: &'static str, label: SharedString, on: bool| {
             let b = Button::new(id).xsmall().label(label);
             if on { b.primary() } else { b.ghost() }
         };
@@ -583,21 +703,30 @@ impl Render for AiChatView {
                     .text_size(theme::scaled(theme::TEXT_MD))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(if self.cfg.model.is_empty() {
-                        "AI assistant".to_string()
+                        tr!("ai.title").to_string()
                     } else {
                         self.cfg.model.clone()
                     }),
             )
-            .child(icon_btn("ai-history", IconName::Inbox, "History").on_click(cx.listener(
+            .when_some(self.settings.active().filter(|_| self.settings.providers.len() > 1), |this, prov| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_size(theme::scaled(theme::TEXT_XS))
+                        .text_color(p.muted_fg)
+                        .child(prov.name.clone()),
+                )
+            })
+            .child(icon_btn("ai-history", IconName::Inbox, tr!("ai.history")).on_click(cx.listener(
                 |this, _, _, cx| {
                     this.show_history = !this.show_history;
                     cx.notify();
                 },
             )))
-            .child(icon_btn("ai-new", IconName::Plus, "New chat").on_click(
+            .child(icon_btn("ai-new", IconName::Plus, tr!("ai.new_chat")).on_click(
                 cx.listener(|this, _, _, cx| this.new_chat(cx)),
             ))
-            .child(icon_btn("ai-settings", IconName::Settings, "Model settings").on_click(
+            .child(icon_btn("ai-settings", IconName::Settings, tr!("ai.model_settings")).on_click(
                 cx.listener(|this, _, _, cx| {
                     this.show_settings = !this.show_settings;
                     cx.notify();
@@ -646,13 +775,13 @@ impl Render for AiChatView {
                     .rounded(px(5.))
                     .bg(p.background)
                     .child(
-                        mode_btn("ai-manual", "Manual", !auto)
-                            .tooltip("SQL runs only when you press Run")
+                        mode_btn("ai-manual", tr!("ai.manual"), !auto)
+                            .tooltip(tr!("ai.manual_tip"))
                             .on_click(cx.listener(|this, _, _, cx| this.set_mode(AiMode::Manual, cx))),
                     )
                     .child(
-                        mode_btn("ai-auto", "Auto", auto)
-                            .tooltip("The assistant runs its SQL and reads the results")
+                        mode_btn("ai-auto", tr!("ai.auto"), auto)
+                            .tooltip(tr!("ai.auto_tip"))
                             .on_click(cx.listener(|this, _, _, cx| this.set_mode(AiMode::Auto, cx))),
                     ),
             )
@@ -662,11 +791,11 @@ impl Render for AiChatView {
                             .text_size(theme::scaled(theme::TEXT_XS))
                             .text_color(p.muted_fg)
                             .child(if self.running {
-                                "running SQL…"
+                                tr!("ai.running_sql")
                             } else if self.streaming {
-                                "answering…"
+                                tr!("ai.answering")
                             } else {
-                                ""
+                                SharedString::default()
                             }),
                     )
                     .child(if busy {
@@ -674,14 +803,14 @@ impl Render for AiChatView {
                             .small()
                             .outline()
                             .icon(Icon::new(IconName::CircleX))
-                            .label("Stop")
+                            .label(tr!("ai.stop"))
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                     } else {
                         Button::new("ai-send")
                             .small()
                             .primary()
                             .icon(Icon::new(IconName::ArrowUp))
-                            .label("Send")
+                            .label(tr!("ai.send"))
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                     }),
             );
@@ -701,15 +830,61 @@ impl Render for AiChatView {
 impl AiChatView {
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = theme::palette(cx);
-        let label = |s: &'static str| {
+        let label = |s: SharedString| {
             div()
                 .text_size(theme::scaled(theme::TEXT_XS))
                 .text_color(p.muted_fg)
                 .child(s)
         };
+        // Provider chips: one per configured endpoint, plus "Add".
+        let active_id = self.settings.active().map(|p| p.id.clone());
+        let mut providers = h_flex().flex_wrap().gap_1();
+        for (i, prov) in self.settings.providers.iter().enumerate() {
+            let id = prov.id.clone();
+            let b = Button::new(("ai-provider", i)).xsmall().label(prov.name.clone());
+            let b = if active_id.as_deref() == Some(prov.id.as_str()) { b.primary() } else { b.outline() };
+            providers = providers.child(b.on_click(cx.listener(move |this, _, window, cx| {
+                this.select_provider(id.clone(), window, cx)
+            })));
+        }
+        providers = providers.child(
+            Button::new("ai-provider-add")
+                .xsmall()
+                .ghost()
+                .icon(Icon::new(IconName::Plus))
+                .label(tr!("ai.add"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.adding = !this.adding || this.settings.providers.is_empty();
+                    cx.notify();
+                })),
+        );
+
+        let presets = self.adding.then(|| {
+            let mut row = h_flex().flex_wrap().gap_1();
+            for (i, pr) in PRESETS.iter().enumerate() {
+                row = row.child(
+                    Button::new(("ai-preset", i))
+                        .xsmall()
+                        .outline()
+                        .label(pr.name)
+                        .tooltip(if pr.base_url.is_empty() { tr!("ai.custom_tip") } else { SharedString::from(pr.base_url) })
+                        .on_click(cx.listener(move |this, _, window, cx| this.add_provider(i, window, cx))),
+                );
+            }
+            v_flex().gap_1().child(label(tr!("ai.add_provider"))).child(row)
+        });
+
+        let filter = self.model.read(cx).value().to_string();
+        let shown = ai::filter_models(&self.models, &filter);
+        // A model already typed in full still shows the whole list.
+        let shown = if shown.len() == 1 && *shown[0] == filter.trim() {
+            self.models.iter().collect()
+        } else {
+            shown
+        };
         let mut chips = h_flex().flex_wrap().gap_1();
-        for (i, m) in self.models.iter().enumerate() {
-            let m = m.clone();
+        for (i, m) in shown.iter().take(MODEL_CHIPS).enumerate() {
+            let m = (*m).clone();
             chips = chips.child(
                 Button::new(("ai-model", i))
                     .xsmall()
@@ -720,15 +895,32 @@ impl AiChatView {
                     })),
             );
         }
-        v_flex()
+        if shown.len() > MODEL_CHIPS {
+            chips = chips.child(label_owned(
+                tr!("ai.more_models", n = shown.len() - MODEL_CHIPS).to_string(),
+                p.muted_fg,
+            ));
+        } else if shown.is_empty() && !self.models.is_empty() {
+            chips = chips.child(label_owned(tr!("ai.no_match", q = filter.trim()).to_string(), p.muted_fg));
+        }
+
+        let head = v_flex()
             .flex_none()
             .gap_1()
             .p_2()
             .border_b_1()
             .border_color(p.border)
-            .child(label("Server (OpenAI-compatible base URL)"))
+            .child(label(tr!("ai.provider")))
+            .child(providers)
+            .children(presets);
+        if self.settings.providers.is_empty() {
+            return head.into_any_element();
+        }
+        head.child(label(tr!("common.name")))
+            .child(Input::new(&self.name).small())
+            .child(label(tr!("ai.server")))
             .child(Input::new(&self.base_url).small())
-            .child(label("Model"))
+            .child(label(tr!("ai.model")))
             .child(
                 h_flex()
                     .gap_1()
@@ -737,7 +929,7 @@ impl AiChatView {
                         Button::new("ai-models")
                             .small()
                             .outline()
-                            .label(if self.models_loading { "…" } else { "List" })
+                            .label(if self.models_loading { SharedString::from("…") } else { tr!("ai.list") })
                             .disabled(self.models_loading)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.fetch_models(window, cx)
@@ -745,16 +937,28 @@ impl AiChatView {
                     ),
             )
             .child(chips)
-            .child(label("API key (stored in the OS keyring)"))
+            .child(label(tr!("ai.api_key")))
             .child(Input::new(&self.api_key).small().mask_toggle())
             .child(
-                h_flex().justify_end().pt_1().child(
-                    Button::new("ai-save")
-                        .small()
-                        .primary()
-                        .label("Save")
-                        .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                ),
+                h_flex()
+                    .justify_between()
+                    .pt_1()
+                    .child(
+                        Button::new("ai-provider-remove")
+                            .small()
+                            .ghost()
+                            .icon(Icon::new(IconName::Delete))
+                            .label(tr!("ai.remove"))
+                            .tooltip(tr!("ai.remove_tip"))
+                            .on_click(cx.listener(|this, _, window, cx| this.remove_provider(window, cx))),
+                    )
+                    .child(
+                        Button::new("ai-save")
+                            .small()
+                            .primary()
+                            .label(tr!("ai.save"))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                    ),
             )
             .into_any_element()
     }
@@ -767,7 +971,7 @@ impl AiChatView {
                 div()
                     .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
-                    .child("No saved conversations yet."),
+                    .child(tr!("ai.no_history")),
             );
         }
         for (i, c) in self.history.iter().enumerate() {
@@ -803,7 +1007,7 @@ impl AiChatView {
                                 div()
                                     .text_size(theme::scaled(theme::TEXT_XS))
                                     .text_color(p.muted_fg)
-                                    .child(format!("{when} · {} message(s)", c.entries.len())),
+                                    .child(format!("{when} · {}", tr!("ai.messages", n = c.entries.len()))),
                             ),
                     )
                     .child(
@@ -811,7 +1015,7 @@ impl AiChatView {
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(IconName::Delete))
-                            .tooltip("Delete")
+                            .tooltip(tr!("ai.delete"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.delete_conv(del_id.clone(), cx)
@@ -846,11 +1050,9 @@ impl AiChatView {
                     .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
                     .child(if connected {
-                        "Ask for a query in plain words, or paste an error to fix. \
-                         The schema (names and types, no data) is shared with the model. \
-                         Auto mode lets the assistant run its SQL and read the results."
+                        tr!("ai.intro")
                     } else {
-                        "Connect to a database to give the assistant your schema."
+                        tr!("ai.connect_hint")
                     }),
             );
         }
@@ -876,7 +1078,7 @@ impl AiChatView {
                             div()
                                 .text_size(theme::scaled(theme::TEXT_SM))
                                 .text_color(p.muted_fg)
-                                .child("thinking…"),
+                                .child(tr!("ai.thinking")),
                         );
                     }
                     for (si, (code, seg)) in segments(text).into_iter().enumerate() {
@@ -908,7 +1110,7 @@ impl AiChatView {
                                                 .xsmall()
                                                 .ghost()
                                                 .icon(Icon::new(IconName::Copy))
-                                                .tooltip("Copy")
+                                                .tooltip(tr!("ai.copy"))
                                                 .on_click(move |_, _, cx| {
                                                     cx.write_to_clipboard(ClipboardItem::new_string(a.clone()))
                                                 }),
@@ -917,7 +1119,7 @@ impl AiChatView {
                                             Button::new(SharedString::from(format!("ai-open-{mi}-{si}")))
                                                 .xsmall()
                                                 .outline()
-                                                .label("Open in SQL tab")
+                                                .label(tr!("ai.open_sql"))
                                                 .disabled(!connected)
                                                 .on_click(cx.listener(move |this, _, window, cx| {
                                                     this.open_sql(b.clone(), window, cx)
@@ -926,7 +1128,7 @@ impl AiChatView {
                                         .child({
                                             let run = Button::new(SharedString::from(format!("ai-run-{mi}-{si}")))
                                                 .xsmall()
-                                                .label("Run")
+                                                .label(tr!("common.run"))
                                                 .disabled(!connected || busy)
                                                 .on_click(cx.listener(move |this, _, window, cx| {
                                                     this.run_block(c.clone(), window, cx)
@@ -958,7 +1160,7 @@ impl AiChatView {
                                         Icon::new(if *ok { IconName::CircleCheck } else { IconName::TriangleAlert })
                                             .with_size(Size::Size(px(12.))),
                                     )
-                                    .child(if *ok { "Executed" } else { "Failed" }),
+                                    .child(if *ok { tr!("ai.executed") } else { tr!("ai.failed") }),
                             )
                             .child(mono_block(clip_lines(sql, 4), p.muted_fg))
                             .child(mono_block(clip_lines(outcome, 10), if *ok { p.foreground } else { p.conn_err })),
@@ -977,16 +1179,16 @@ impl AiChatView {
                             .xsmall()
                             .ghost()
                             .icon(Icon::new(IconName::Redo2))
-                            .label("Retry")
-                            .tooltip("Ask again (executed SQL is not undone)")
+                            .label(tr!("ai.retry"))
+                            .tooltip(tr!("ai.retry_tip"))
                             .on_click(cx.listener(|this, _, window, cx| this.regenerate(window, cx))),
                     )
                     .child(
                         Button::new("ai-edit-last")
                             .xsmall()
                             .ghost()
-                            .label("Edit message")
-                            .tooltip("Move the last message back into the input")
+                            .label(tr!("ai.edit"))
+                            .tooltip(tr!("ai.edit_tip"))
                             .on_click(cx.listener(|this, _, window, cx| this.edit_last(window, cx))),
                     ),
             );

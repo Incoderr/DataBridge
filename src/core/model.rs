@@ -114,6 +114,67 @@ pub struct DbConnection {
     pub status: ConnectionStatus,
     /// how many ms the (mock) ping took
     pub latency_ms: u32,
+    /// Reach the database through an SSH tunnel (`drivers/ssh.rs`).
+    pub ssh: Option<SshConfig>,
+}
+
+/// How the SSH tunnel authenticates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SshAuth {
+    #[default]
+    Password,
+    /// A private key file (OpenSSH / PEM), optionally passphrase-protected.
+    Key,
+    /// A running agent: the OpenSSH agent or Pageant on Windows,
+    /// `SSH_AUTH_SOCK` elsewhere.
+    Agent,
+}
+
+/// SSH tunnel of a connection: the database host/port are dialled from
+/// the SSH server (so `localhost` means the bastion itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    #[serde(default)]
+    pub auth: SshAuth,
+    /// Private key file ([`SshAuth::Key`]); `~` expands to the home dir.
+    #[serde(default)]
+    pub key_path: String,
+    /// The password ([`SshAuth::Password`]) or key passphrase
+    /// ([`SshAuth::Key`]). Never serialized — it lives in the OS keyring.
+    #[serde(skip)]
+    pub secret: String,
+}
+
+impl SshConfig {
+    /// `user@host:port` — the tunnel's identity in dedupe keys and labels.
+    pub fn label(&self) -> String {
+        format!("{}@{}:{}", self.user, self.host, self.port)
+    }
+}
+
+/// Point a connection URL at another `host:port`, keeping the scheme,
+/// credentials, path and options (the SSH tunnel's local end). `None`
+/// for URLs without an authority, and for seed lists (`h1,h2`) and
+/// `+srv` URLs, which a single forwarded port cannot serve.
+pub fn rewrite_url_host(url: &str, host: &str, port: u16) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.ends_with("+srv") {
+        return None;
+    }
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    if hostport.is_empty() || hostport.contains(',') {
+        return None;
+    }
+    let user = userinfo.map(|u| format!("{u}@")).unwrap_or_default();
+    Some(format!("{scheme}://{user}{host}:{port}{tail}"))
 }
 
 /// Connection-target identity: two recents entries describe the same
@@ -132,9 +193,18 @@ pub struct TargetKey {
     pub port: u16,
     pub database: String,
     pub user: String,
+    /// The SSH tunnel (`user@host:port`), if any: `localhost:5432` behind
+    /// two different bastions are two different targets.
+    pub via: Option<String>,
 }
 
 impl TargetKey {
+    /// The same target reached through `ssh` (see [`TargetKey::via`]).
+    pub fn via(mut self, ssh: Option<&SshConfig>) -> Self {
+        self.via = ssh.map(SshConfig::label);
+        self
+    }
+
     /// Build from raw parts — either an in-memory [`DbConnection`] or
     /// its stored JSON copy (whose `url` is password-stripped). A URL
     /// overrides the structured fields; a port missing from the URL
@@ -156,6 +226,7 @@ impl TargetKey {
                 port,
                 database: database.into(),
                 user: user.into(),
+                via: None,
             };
         };
         let scheme = url.split_once("://").map(|(s, _)| s.to_string());
@@ -167,6 +238,7 @@ impl TargetKey {
                 port: if x.port > 0 { x.port } else { port },
                 database: x.database,
                 user: x.user,
+                via: None,
             },
             None => Self {
                 db_type,
@@ -175,6 +247,7 @@ impl TargetKey {
                 port,
                 database: database.into(),
                 user: user.into(),
+                via: None,
             },
         }
     }
@@ -191,6 +264,7 @@ impl DbConnection {
             &self.database,
             &self.user,
         )
+        .via(self.ssh.as_ref())
     }
 }
 
@@ -557,6 +631,268 @@ impl CellChange {
     }
 }
 
+// ---------------- grid filter + sort ----------------
+
+/// Comparison of one grid filter condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    /// Case-insensitive substring (`ILIKE '%v%'` / `$regex`).
+    Contains,
+    IsNull,
+    NotNull,
+}
+
+impl FilterOp {
+    pub const ALL: [FilterOp; 9] = [
+        FilterOp::Eq,
+        FilterOp::Ne,
+        FilterOp::Lt,
+        FilterOp::Le,
+        FilterOp::Gt,
+        FilterOp::Ge,
+        FilterOp::Contains,
+        FilterOp::IsNull,
+        FilterOp::NotNull,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "≠",
+            FilterOp::Lt => "<",
+            FilterOp::Le => "≤",
+            FilterOp::Gt => ">",
+            FilterOp::Ge => "≥",
+            FilterOp::Contains => "contains",
+            FilterOp::IsNull => "is null",
+            FilterOp::NotNull => "is not null",
+        }
+    }
+
+    pub fn takes_value(self) -> bool {
+        !matches!(self, FilterOp::IsNull | FilterOp::NotNull)
+    }
+
+    #[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+    fn sql(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "<>",
+            FilterOp::Lt => "<",
+            FilterOp::Le => "<=",
+            FilterOp::Gt => ">",
+            FilterOp::Ge => ">=",
+            FilterOp::Contains => "LIKE",
+            FilterOp::IsNull => "IS NULL",
+            FilterOp::NotNull => "IS NOT NULL",
+        }
+    }
+}
+
+/// One `column op value` condition of the records grid. The column comes
+/// from the grid's own (introspected) column list; the value is typed by
+/// the column (`parse_filter_value`) and always bound as a parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Filter {
+    pub column: String,
+    pub kind: ColumnKind,
+    /// The column's dialect type label (PostgreSQL casts text values to it).
+    pub type_: String,
+    pub op: FilterOp,
+    /// Ignored for `IsNull` / `NotNull`; a `Str` for `Contains`.
+    pub value: Value,
+}
+
+impl Filter {
+    /// In-memory evaluation (the mock driver).
+    pub fn matches(&self, v: &Value) -> bool {
+        match self.op {
+            FilterOp::IsNull => matches!(v, Value::Null),
+            FilterOp::NotNull => !matches!(v, Value::Null),
+            FilterOp::Contains => {
+                !matches!(v, Value::Null)
+                    && v.display().to_lowercase().contains(&self.value.display().to_lowercase())
+            }
+            _ if matches!(v, Value::Null) => false,
+            op => {
+                let ord = cmp_values(v, &self.value);
+                match op {
+                    FilterOp::Eq => ord.is_eq(),
+                    FilterOp::Ne => ord.is_ne(),
+                    FilterOp::Lt => ord.is_lt(),
+                    FilterOp::Le => ord.is_le(),
+                    FilterOp::Gt => ord.is_gt(),
+                    _ => ord.is_ge(),
+                }
+            }
+        }
+    }
+}
+
+/// Typed filter value for a column: like the editor's `parse_cell`, but
+/// `Contains` always takes text and empty input is an error.
+pub fn parse_filter_value(c: &ColumnMeta, op: FilterOp, raw: &str) -> Result<Value, String> {
+    if !op.takes_value() {
+        return Ok(Value::Null);
+    }
+    if raw.trim().is_empty() {
+        return Err(format!("{}: enter a value", c.name));
+    }
+    if op == FilterOp::Contains {
+        return Ok(Value::Str(raw.trim().to_string()));
+    }
+    let mut c = c.clone();
+    c.nullable = false;
+    parse_cell(&c, raw)
+}
+
+/// Total order for in-memory sorting/filtering: NULL first, numbers by
+/// value, everything else by its display text.
+pub fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let num = |v: &Value| match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    };
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        _ => match (num(a), num(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            _ => a.display().cmp(&b.display()),
+        },
+    }
+}
+
+/// What the records grid asks for besides the page window: AND-ed
+/// conditions and an optional sort column (`true` = descending).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowQuery {
+    pub filters: Vec<Filter>,
+    pub sort: Option<(String, bool)>,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+impl RowQuery {
+    pub fn is_filtered(&self) -> bool {
+        !self.filters.is_empty()
+    }
+}
+
+/// The SQL dialects the grid's WHERE / ORDER BY builder speaks.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlDialect {
+    Postgres,
+    MySql,
+    Sqlite,
+}
+
+/// ` WHERE …` / ` ORDER BY …` fragments plus the cells to bind, in order.
+#[derive(Debug, Default)]
+pub struct SqlClauses {
+    pub where_: String,
+    pub order: String,
+    pub binds: Vec<CellChange>,
+}
+
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+impl SqlDialect {
+    pub fn quote(self, ident: &str) -> String {
+        match self {
+            SqlDialect::MySql => format!("`{}`", ident.replace('`', "``")),
+            _ => format!("\"{}\"", ident.replace('"', "\"\"")),
+        }
+    }
+
+    /// Placeholder for the `n`-th (1-based) parameter.
+    fn param(self, n: usize) -> String {
+        match self {
+            SqlDialect::Postgres => format!("${n}"),
+            _ => "?".into(),
+        }
+    }
+
+    /// Build the clauses; PostgreSQL parameters start at `$first`.
+    pub fn clauses(self, q: &RowQuery, first: usize) -> SqlClauses {
+        let mut out = SqlClauses::default();
+        let mut conds = Vec::new();
+        for f in &q.filters {
+            let col = self.quote(&f.column);
+            if !f.op.takes_value() {
+                conds.push(format!("{col} {}", f.op.sql()));
+                continue;
+            }
+            let mut p = self.param(first + out.binds.len());
+            if f.op == FilterOp::Contains {
+                let like = match self {
+                    SqlDialect::Postgres => format!("{col}::text ILIKE {p}"),
+                    SqlDialect::MySql => format!("CAST({col} AS CHAR) LIKE {p}"),
+                    SqlDialect::Sqlite => format!("CAST({col} AS TEXT) LIKE {p}"),
+                };
+                conds.push(like);
+                let pat = format!("%{}%", f.value.display().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+                out.binds.push(CellChange::new(&f.column, ColumnKind::Text, Value::Str(pat)));
+                if self == SqlDialect::Sqlite {
+                    conds.last_mut().unwrap().push_str(" ESCAPE '\\'");
+                }
+                continue;
+            }
+            // PostgreSQL is strict about `date = text`: cast text values
+            // to the column's own (introspected) type.
+            if self == SqlDialect::Postgres
+                && matches!(f.value, Value::Str(_))
+                && !matches!(f.kind, ColumnKind::Text)
+                && is_plain_type(&f.type_)
+            {
+                p = format!("CAST({p} AS {})", f.type_);
+            }
+            conds.push(format!("{col} {} {p}", f.op.sql()));
+            out.binds.push(CellChange::new(&f.column, f.kind, f.value.clone()));
+        }
+        if !conds.is_empty() {
+            out.where_ = format!(" WHERE {}", conds.join(" AND "));
+        }
+        if let Some((col, desc)) = &q.sort {
+            out.order = format!(" ORDER BY {} {}", self.quote(col), if *desc { "DESC" } else { "ASC" });
+        }
+        out
+    }
+}
+
+/// A type label safe to splice into `CAST(… AS <type>)`: introspected
+/// labels like `timestamptz`, `numeric(10,2)`, `character varying`.
+#[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
+fn is_plain_type(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ','))
+}
+
+/// One RFC 4180 CSV line: NULL is an empty field, floats keep full
+/// precision, fields with `,` `"` or line breaks are quoted.
+pub fn csv_line<'a>(cells: impl IntoIterator<Item = Option<&'a Value>>) -> String {
+    cells
+        .into_iter()
+        .map(|v| {
+            let s = v.map(Value::edit_string).unwrap_or_default();
+            if s.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The statement's first keyword, lowercased — leading whitespace, `(`
 /// and SQL comments (`-- …`, `/* … */`) skipped. Empty when there is none.
 pub fn first_keyword(sql: &str) -> String {
@@ -713,6 +1049,65 @@ pub fn group_digits(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flt(column: &str, kind: ColumnKind, type_: &str, op: FilterOp, value: Value) -> Filter {
+        Filter { column: column.into(), kind, type_: type_.into(), op, value }
+    }
+
+    #[test]
+    fn grid_query_builds_parameterized_sql() {
+        let q = RowQuery {
+            filters: vec![
+                flt("age", ColumnKind::Int, "int4", FilterOp::Ge, Value::Int(18)),
+                flt("na\"me", ColumnKind::Text, "text", FilterOp::Contains, Value::Str("50%".into())),
+                flt("created", ColumnKind::Date, "timestamptz", FilterOp::Lt, Value::Str("2024-01-01".into())),
+                flt("deleted_at", ColumnKind::Date, "timestamptz", FilterOp::IsNull, Value::Null),
+            ],
+            sort: Some(("age".into(), true)),
+        };
+        let pg = SqlDialect::Postgres.clauses(&q, 3);
+        assert_eq!(
+            pg.where_,
+            " WHERE \"age\" >= $3 AND \"na\"\"me\"::text ILIKE $4 AND \"created\" < CAST($5 AS timestamptz) AND \"deleted_at\" IS NULL"
+        );
+        assert_eq!(pg.order, " ORDER BY \"age\" DESC");
+        assert_eq!(pg.binds.len(), 3);
+        // The user's text never reaches the SQL; `%` in it is escaped.
+        assert_eq!(pg.binds[1].value, Value::Str("%50\\%%".into()));
+        let my = SqlDialect::MySql.clauses(&q, 1);
+        assert!(my.where_.starts_with(" WHERE `age` >= ? AND CAST(`na\"me` AS CHAR) LIKE ?"));
+        let lite = SqlDialect::Sqlite.clauses(&q, 1);
+        assert!(lite.where_.contains("LIKE ? ESCAPE '\\'"));
+        assert!(SqlDialect::Sqlite.clauses(&RowQuery::default(), 1).where_.is_empty());
+    }
+
+    #[test]
+    fn filters_match_in_memory_and_parse_typed() {
+        let f = flt("n", ColumnKind::Int, "int", FilterOp::Gt, Value::Int(5));
+        assert!(f.matches(&Value::Int(7)) && !f.matches(&Value::Int(5)) && !f.matches(&Value::Null));
+        let c = flt("s", ColumnKind::Text, "text", FilterOp::Contains, Value::Str("ALI".into()));
+        assert!(c.matches(&Value::Str("Alice".into())));
+        let col = ColumnMeta {
+            name: "n".into(),
+            type_: "int".into(),
+            nullable: true,
+            primary_key: false,
+            auto_increment: false,
+            has_default: false,
+            kind: ColumnKind::Int,
+        };
+        assert_eq!(parse_filter_value(&col, FilterOp::Eq, "42"), Ok(Value::Int(42)));
+        assert!(parse_filter_value(&col, FilterOp::Eq, "x").is_err());
+        assert!(parse_filter_value(&col, FilterOp::Eq, " ").is_err());
+        assert_eq!(parse_filter_value(&col, FilterOp::Contains, "4"), Ok(Value::Str("4".into())));
+    }
+
+    #[test]
+    fn csv_lines_quote_and_blank_nulls() {
+        let row = [Value::Int(1), Value::Null, Value::Str("a,\"b\"".into()), Value::Float(0.125)];
+        assert_eq!(csv_line(row.iter().map(Some)), "1,,\"a,\"\"b\"\"\",0.125");
+        assert_eq!(csv_line([None, Some(&Value::Bool(true))]), ",true");
+    }
 
     #[test]
     fn first_keyword_skips_comments_and_parens() {

@@ -12,19 +12,21 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::table::{Column, Table, TableDelegate, TableState};
+use gpui_component::table::{Column, ColumnSort, Table, TableDelegate, TableState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{
-    group_digits, parse_cell, status_line, total_label, CellChange, ColumnKind,
-    ColumnMeta, ConnectionStatus, DbConnection, DocNode, Row, TableMeta, TableRef, Value,
+    csv_line, group_digits, parse_cell, status_line, total_label, CellChange, ColumnKind,
+    ColumnMeta, ConnectionStatus, DbConnection, DocNode, Row, RowQuery, TableMeta, TableRef, Value,
 };
 use crate::core::session::SessionHandle;
 use crate::ui::theme;
 
 mod documents;
+mod filter;
 use documents::{DocEdit, DocEditor};
+use filter::FilterRow;
 
 pub const PAGE: u64 = 50;
 
@@ -35,7 +37,7 @@ pub enum TabKind {
     /// The Supabase-style relationships canvas for the whole schema.
     Diagram,
     /// The SQL editor (Stage 5), optionally seeded with starter text
-    /// (the "New table" template).
+    /// (the tr!("common.new_table") template).
     Sql(Option<String>),
 }
 
@@ -57,7 +59,8 @@ pub struct RecordsDelegate {
     cols: Vec<Column>,
     pub rows: Vec<Row>,
     /// Full documents of the page (document stores), parallel to `rows`.
-    pub docs: Option<Vec<DocNode>>,
+    /// Shared: renders take a cheap handle instead of cloning the page.
+    pub docs: Option<Arc<Vec<DocNode>>>,
     pub loading: bool,
     pub error: Option<String>,
     pub page: u64,
@@ -66,6 +69,9 @@ pub struct RecordsDelegate {
     pub exact: bool,
     pub elapsed_ms: u32,
     pub load_id: u64,
+    /// Filters + sort of the grid (filter bar, header sort icons); sent
+    /// with every page request.
+    pub query: RowQuery,
     /// The selected row, shared with `RecordsView` (which syncs it from
     /// `TableState` on every render). The crate's own selection overlay paints
     /// OVER the cell contents, so we draw the solid background in `render_tr`.
@@ -98,11 +104,24 @@ fn column_min_width(c: &ColumnMeta) -> f32 {
     }
 }
 
-/// The grid's columns: the fixed row-number column plus one per table column.
-fn grid_columns(table: &TableMeta) -> Vec<Column> {
+/// The grid's columns: the fixed row-number column plus one per table
+/// column. Ordered kinds get the header sort icon; `sort` marks the
+/// active one.
+fn grid_columns(table: &TableMeta, sort: &Option<(String, bool)>) -> Vec<Column> {
     let mut cols = vec![Column::new("#", "#").width(px(44.)).fixed_left()];
     for c in &table.columns {
-        cols.push(Column::new(c.name.clone(), c.name.clone()).width(px(column_min_width(c))));
+        let col = Column::new(c.name.clone(), c.name.clone()).width(px(column_min_width(c)));
+        let col = match sort {
+            Some((name, desc)) if *name == c.name => col.sort(if *desc {
+                ColumnSort::Descending
+            } else {
+                ColumnSort::Ascending
+            }),
+            // json / binary have no ordering in every dialect.
+            _ if matches!(c.kind, ColumnKind::Json | ColumnKind::Binary) => col,
+            _ => col.sortable(),
+        };
+        cols.push(col);
     }
     cols
 }
@@ -128,7 +147,7 @@ impl RecordsDelegate {
         let mut meta = (*self.table).clone();
         meta.columns = columns;
         self.table = Arc::new(meta);
-        self.cols = grid_columns(&self.table);
+        self.cols = grid_columns(&self.table, &self.query.sort);
         true
     }
 
@@ -145,7 +164,7 @@ impl RecordsDelegate {
         table: Arc<TableMeta>,
         sel: Rc<Cell<Option<usize>>>,
     ) -> Self {
-        let cols = grid_columns(&table);
+        let cols = grid_columns(&table, &None);
         let total = table.row_count;
         Self {
             conn,
@@ -163,6 +182,7 @@ impl RecordsDelegate {
             elapsed_ms: 0,
             view: None,
             load_id: 0,
+            query: RowQuery::default(),
             sel,
         }
     }
@@ -199,7 +219,7 @@ impl RecordsDelegate {
     /// Fetch the current page through the session (stale-guarded by load_id).
     pub fn load(&mut self, cx: &mut Context<TableState<Self>>) {
         if self.conn.status != ConnectionStatus::Connected {
-            self.error = Some("connection is not active".into());
+            self.error = Some(tr!("ws.not_active").into());
             cx.notify();
             return;
         }
@@ -210,7 +230,7 @@ impl RecordsDelegate {
         cx.notify();
         let table = TableRef::of(&self.table);
         let offset = self.page * PAGE;
-        let rx = self.session.fetch_rows(table, offset, PAGE);
+        let rx = self.session.fetch_rows(table, self.query.clone(), offset, PAGE);
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             this.update(cx, |state, cx| {
@@ -221,7 +241,7 @@ impl RecordsDelegate {
                         Ok(Ok(page)) => {
                             widened = page.columns.is_some_and(|c| d.set_columns(c));
                             d.rows = page.rows;
-                            d.docs = page.documents;
+                            d.docs = page.documents.map(Arc::new);
                             d.total = page.total;
                             d.exact = page.exact;
                             d.elapsed_ms = page.elapsed_ms;
@@ -283,6 +303,34 @@ impl TableDelegate for RecordsDelegate {
         self.loading
     }
 
+    /// Header sort icon: the database orders the rows (server side, over
+    /// the whole table — not just this page); back to page 1.
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(c) = col_ix.checked_sub(1).and_then(|i| self.table.columns.get(i)) else {
+            return;
+        };
+        self.query.sort = match sort {
+            ColumnSort::Default => None,
+            ColumnSort::Ascending => Some((c.name.clone(), false)),
+            ColumnSort::Descending => Some((c.name.clone(), true)),
+        };
+        // Keep our column list in step with the table's own sort state
+        // (a later `refresh` rebuilds the header from it).
+        for (i, col) in self.cols.iter_mut().enumerate().skip(1) {
+            if col.sort.is_some() {
+                col.sort = Some(if i == col_ix { sort } else { ColumnSort::Default });
+            }
+        }
+        self.page = 0;
+        self.load(cx);
+    }
+
     fn is_eof(&self, _: &App) -> bool {
         true
     }
@@ -315,7 +363,7 @@ impl TableDelegate for RecordsDelegate {
             return menu;
         }
         let has_pk = self.table.columns.iter().any(|c| c.primary_key);
-        let item = |label: &'static str, icon: Icon, enabled: bool, action: RowAction| {
+        let item = |label: SharedString, icon: Icon, enabled: bool, action: RowAction| {
             let view = view.clone();
             PopupMenuItem::new(label)
                 .icon(icon)
@@ -326,24 +374,24 @@ impl TableDelegate for RecordsDelegate {
                 })
         };
         menu.item(item(
-            "Edit row…",
+            tr!("ws.edit_row"),
             Icon::empty().path("icons/pencil.svg"),
             has_pk,
             RowAction::Edit,
         ))
-        .item(item("Duplicate row…", Icon::new(IconName::Copy), true, RowAction::Duplicate))
-        .item(item("New row…", Icon::new(IconName::Plus), true, RowAction::Insert))
+        .item(item(tr!("ws.dup_row"), Icon::new(IconName::Copy), true, RowAction::Duplicate))
+        .item(item(tr!("ws.new_row"), Icon::new(IconName::Plus), true, RowAction::Insert))
         .separator()
-        .item(item("Copy row", Icon::new(IconName::Copy), true, RowAction::CopyTsv))
+        .item(item(tr!("ws.copy_row"), Icon::new(IconName::Copy), true, RowAction::CopyTsv))
         .item(item(
-            "Copy row as JSON",
+            tr!("ws.copy_json"),
             Icon::new(IconName::Copy),
             true,
             RowAction::CopyJson,
         ))
         .separator()
         .item(item(
-            "Delete row…",
+            tr!("ws.delete_row_menu"),
             Icon::new(IconName::Delete),
             has_pk,
             RowAction::Delete,
@@ -517,7 +565,15 @@ pub struct RecordsView {
     resizing_detail: bool,
     resize_start_y: f32,
     resize_start_h: f32,
-    export_copied: bool,
+    /// Export to CSV: progress / outcome shown next to the export icon.
+    export_status: Option<String>,
+    exporting: bool,
+    /// Stale guard of the export task (bumped to cancel).
+    export_id: u64,
+    /// The filter bar (conditions are applied by the driver).
+    show_filter: bool,
+    filter_rows: Vec<FilterRow>,
+    filter_error: Option<String>,
     copied_cell: Option<usize>,
     /// Selected row shared with the delegate; synced from `TableState` on
     /// every render of this view.
@@ -533,6 +589,10 @@ pub struct RecordsView {
     doc_view: bool,
     /// Expanded paths of the document trees (`"<row>/<key>/…"`).
     doc_open: std::collections::HashSet<String>,
+    /// The JSON view's virtual list (variable-height cards).
+    doc_list: gpui::ListState,
+    /// The documents page `doc_list` was last reset for.
+    doc_list_src: Option<Arc<Vec<DocNode>>>,
     /// The whole-document editor modal, when open.
     doc_editor: Option<DocEditor>,
     _obs: Subscription,
@@ -580,6 +640,7 @@ impl RecordsView {
                     app.update(cx, |app, cx| app.patch_table_meta(table, cx));
                 }
             }
+            this.sync_doc_list(cx);
             cx.notify()
         });
         Self {
@@ -593,7 +654,12 @@ impl RecordsView {
             resizing_detail: false,
             resize_start_y: 0.0,
             resize_start_h: 190.0,
-            export_copied: false,
+            export_status: None,
+            exporting: false,
+            export_id: 0,
+            show_filter: false,
+            filter_rows: Vec::new(),
+            filter_error: None,
             copied_cell: None,
             sel,
             last_sel: None,
@@ -602,6 +668,10 @@ impl RecordsView {
             fk_gen: 0,
             doc_view: true,
             doc_open: Default::default(),
+            // Overdraw: a few cards beyond the viewport stay laid out, so
+            // fast scrolling does not show blank gaps.
+            doc_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
+            doc_list_src: None,
             doc_editor: None,
             _obs: obs,
         }
@@ -900,7 +970,7 @@ impl RecordsView {
                 error: None,
                 options: Arc::new(Vec::new()),
             });
-            let rx = session.fetch_rows(TableRef::of(&target), 0, FK_OPTIONS);
+            let rx = session.fetch_rows(TableRef::of(&target), RowQuery::default(), 0, FK_OPTIONS);
             cx.spawn(async move |this, cx| {
                 let result = rx.await;
                 this.update(cx, |v, cx| {
@@ -1001,7 +1071,7 @@ impl RecordsView {
         let (table, pk, is_update) = match &editor.mode {
             EditorMode::Insert => {
                 if changes.is_empty() {
-                    self.editor.as_mut().map(|ed| ed.error = Some("fill at least one column".into()));
+                    self.editor.as_mut().map(|ed| ed.error = Some(tr!("ws.fill_one").into()));
                     cx.notify();
                     return;
                 }
@@ -1054,7 +1124,7 @@ impl RecordsView {
                             v.reload(cx);
                         }
                         Ok(Err(e)) => editor.error = Some(e.message().to_string()),
-                        Err(_) => editor.error = Some("save was cancelled".into()),
+                        Err(_) => editor.error = Some(tr!("common.save_cancelled").into()),
                     }
                     cx.notify();
                 })
@@ -1075,7 +1145,7 @@ impl RecordsView {
         };
         let pk = self.pk_cells(row);
         if pk.is_empty() {
-            self.editor.as_mut().map(|ed| ed.error = Some("this table has no primary key".into()));
+            self.editor.as_mut().map(|ed| ed.error = Some(tr!("ws.no_pk").into()));
             cx.notify();
             return;
         }
@@ -1114,7 +1184,7 @@ impl RecordsView {
                             v.reload(cx);
                         }
                         Ok(Err(e)) => editor.error = Some(e.message().to_string()),
-                        Err(_) => editor.error = Some("delete was cancelled".into()),
+                        Err(_) => editor.error = Some(tr!("ws.delete_cancelled").into()),
                     }
                     cx.notify();
                 })
@@ -1135,16 +1205,16 @@ impl RecordsView {
         let saving = editor.saving;
         let (title, sub): (String, String) = match &editor.mode {
             EditorMode::Insert => (
-                format!("New row · {}", self.table.name),
-                "Fill the values you want to insert; empty nullable columns fall back to their defaults.".into(),
+                format!("{} · {}", tr!("ws.new_row_title"), self.table.name),
+                tr!("ws.insert_hint").into(),
             ),
             EditorMode::Update { row_no, .. } => (
-                format!("Edit row {row_no} · {}", self.table.name),
-                "Change the values and save; only the changed columns are written.".into(),
+                format!("{} · {}", tr!("ws.edit_row_title", n = row_no), self.table.name),
+                tr!("ws.update_hint").into(),
             ),
             EditorMode::Delete { row_no, .. } => (
-                format!("Delete row {row_no} · {}", self.table.name),
-                "This permanently removes the row from the database.".into(),
+                format!("{} · {}", tr!("ws.delete_row_title", n = row_no), self.table.name),
+                tr!("ws.delete_hint").into(),
             ),
         };
         let is_delete = matches!(editor.mode, EditorMode::Delete { .. });
@@ -1171,7 +1241,7 @@ impl RecordsView {
                             let fk = editor.fk.get(i).and_then(|f| f.as_ref());
                             let fk_hint = fk.map(|f| {
                                 if f.error.is_some() {
-                                    format!("→ {} (unavailable)", f.target)
+                                    tr!("ws.fk_unavailable", target = f.target).to_string()
                                 } else {
                                     format!("→ {}", f.target)
                                 }
@@ -1261,7 +1331,7 @@ impl RecordsView {
                                                     .text_size(theme::scaled(theme::TEXT_XS))
                                                     .text_color(p.conn_err)
                                                     .child(
-                                                        "Not generated: SQLite ignores AUTO_INCREMENT                                                          — use INTEGER PRIMARY KEY",
+                                                        tr!("ws.sqlite_autoinc"),
                                                     ),
                                             )
                                         })
@@ -1374,14 +1444,14 @@ impl RecordsView {
                     .child(
                         Button::new("editor-cancel")
                             .ghost()
-                            .label("Cancel")
+                            .label(tr!("common.cancel"))
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.close_editor(cx))),
                     )
                     .child(if is_delete {
                         Button::new("editor-confirm")
                             .danger()
-                            .label(if saving { "Deleting…" } else { "Delete row" })
+                            .label(if saving { tr!("ws.deleting") } else { tr!("ws.delete_row") })
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.confirm_delete(window, cx);
@@ -1391,11 +1461,11 @@ impl RecordsView {
                         Button::new("editor-save")
                             .primary()
                             .label(if saving {
-                                "Saving…".to_string()
+                                tr!("common.saving").to_string()
                             } else if is_update {
-                                "Save changes".to_string()
+                                tr!("ws.save_changes").to_string()
                             } else {
-                                "Insert row".to_string()
+                                tr!("ws.insert_row").to_string()
                             })
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1417,34 +1487,98 @@ impl RecordsView {
             .into_any_element()
     }
 
-    pub fn export_csv(&mut self, cx: &mut Context<Self>) {        let st = self.state.read(cx);
-        let d = st.delegate();
-        let header = self
-            .table
-            .columns
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut lines = vec![header];
-        for row in &d.rows {
-            let line = row
-                .iter()
-                .map(|v| {
-                    let s = v.display();
-                    if s.contains(',') || s.contains('"') || s.contains('\n') {
-                        format!("\"{}\"", s.replace('"', "\"\""))
-                    } else {
-                        s
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            lines.push(line);
+    /// Export every row matching the grid's filter/sort to a CSV file:
+    /// the save dialog, then pages of `EXPORT_PAGE` through the session
+    /// until a short page ends it. Clicking again while it runs cancels
+    /// (stale-guarded by `export_id`). UTF-8 with a BOM (Excel).
+    pub fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const EXPORT_PAGE: u64 = 1000;
+        self.export_id += 1;
+        let id = self.export_id;
+        if self.exporting {
+            self.exporting = false;
+            self.export_status = Some(tr!("ws.export_cancelled").into());
+            cx.notify();
+            return;
         }
-        let csv = lines.join("\n");
-        cx.write_to_clipboard(ClipboardItem::new_string(csv));
-        self.export_copied = true;
+        let (session, query) = {
+            let d = self.state.read(cx).delegate();
+            (d.session.clone(), d.query.clone())
+        };
+        let table = TableRef::of(&self.table);
+        let header: Vec<String> = self.table.columns.iter().map(|c| c.name.clone()).collect();
+        let file_name = format!("{}.csv", self.table.name);
+        cx.spawn_in(window, async move |this, cx| {
+            let file = rfd::AsyncFileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .set_title(tr!("ws.export_title"))
+                .set_file_name(file_name)
+                .save_file()
+                .await;
+            let Some(file) = file else { return };
+            let path = file.path().to_path_buf();
+            // Apply progress unless the export was cancelled / restarted.
+            let report = |cx: &mut gpui::AsyncWindowContext, status: String, done: bool| {
+                this.update(cx, |v, cx| {
+                    if v.export_id != id {
+                        return false;
+                    }
+                    v.exporting = !done;
+                    v.export_status = Some(status);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false)
+            };
+            if !report(cx, tr!("ws.exporting").into(), false) {
+                return;
+            }
+            let mut out = String::from("\u{FEFF}");
+            let head: Vec<Value> = header.iter().map(|h| Value::Str(h.clone())).collect();
+            out.push_str(&csv_line(head.iter().map(Some)));
+            out.push_str("\r\n");
+            let mut offset = 0u64;
+            loop {
+                let rx = session.fetch_rows(table.clone(), query.clone(), offset, EXPORT_PAGE);
+                let page = match rx.await {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(e)) => {
+                        report(cx, tr!("ws.export_failed", e = e.message()).to_string(), true);
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                // Schemaless pages project onto their own (widened) column
+                // list: map each onto the header by name.
+                let map: Vec<Option<usize>> = match &page.columns {
+                    Some(cols) => header.iter().map(|h| cols.iter().position(|c| &c.name == h)).collect(),
+                    None => (0..header.len()).map(Some).collect(),
+                };
+                let n = page.rows.len() as u64;
+                for row in &page.rows {
+                    out.push_str(&csv_line(map.iter().map(|ix| ix.and_then(|i| row.get(i)))));
+                    out.push_str("\r\n");
+                }
+                offset += n;
+                if n < EXPORT_PAGE {
+                    break;
+                }
+                if !report(cx, format!("{} {}", tr!("ws.exporting"), group_digits(offset)), false) {
+                    return;
+                }
+            }
+            let status = match std::fs::write(&path, out) {
+                Ok(()) => tr!(
+                    "ws.exported",
+                    n = group_digits(offset),
+                    file = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+                )
+                .to_string(),
+                Err(e) => tr!("ws.write_failed", path = path.display(), e = e).to_string(),
+            };
+            report(cx, status, true);
+        })
+        .detach();
         cx.notify();
     }
 }
@@ -1516,6 +1650,8 @@ impl Render for RecordsView {
         let editor_open = self.editor.is_some() || self.doc_editor.is_some();
         let has_docs = d.docs.is_some();
         let cards = has_docs && self.doc_view;
+        let filters = d.query.filters.len();
+        let exporting = self.exporting;
 
         let toolbar = h_flex()
             .h(theme::scaled(36.))
@@ -1526,18 +1662,6 @@ impl Render for RecordsView {
             .border_b_1()
             .border_color(p.toolbar_border)
             .bg(p.toolbar)
-            .child(icon_btn(
-                "run",
-                32.,
-                svg().path("icons/play.svg").size_3p5().text_color(p.conn_ok),
-                !loading,
-                hover,
-                None,
-                cx.listener(|this, _, _, cx| {
-                    this.export_copied = false;
-                    this.reload(cx);
-                }),
-            ))
             .child(icon_btn(
                 "stop",
                 32.,
@@ -1561,7 +1685,7 @@ impl Render for RecordsView {
                 hover,
                 None,
                 cx.listener(|this, _, _, cx| {
-                    this.export_copied = false;
+                    this.export_status = None;
                     this.reload(cx);
                 }),
             ))
@@ -1640,24 +1764,54 @@ impl Render for RecordsView {
                 }),
             ))
             .child(sep(&p))
-            .child(icon_btn(
-                "filter",
-                32.,
-                svg().path("icons/filter.svg").size_3p5().text_color(p.muted_fg),
-                true,
-                hover,
-                None,
-                cx.listener(|_, _, _, _| {}),
-            ))
-            .child(icon_btn(
-                "export",
-                32.,
-                svg().path("icons/download.svg").size_3p5().text_color(if self.export_copied { p.conn_ok } else { p.muted_fg }),
-                true,
-                hover,
-                if self.export_copied { Some(p.conn_ok.opacity(0.15)) } else { None },
-                cx.listener(|this, _, _, cx| this.export_csv(cx)),
-            ))
+            .child(
+                icon_btn(
+                    "filter",
+                    32.,
+                    svg()
+                        .path("icons/filter.svg")
+                        .size_3p5()
+                        .text_color(if filters > 0 || self.show_filter { p.primary } else { p.muted_fg }),
+                    true,
+                    hover,
+                    self.show_filter.then_some(p.accent),
+                    cx.listener(|this, _, window, cx| this.toggle_filter(window, cx)),
+                )
+                .tooltip(move |_, cx| {
+                    let tip = if filters > 0 {
+                        tr!("ws.filter_active", n = filters).to_string()
+                    } else {
+                        tr!("ws.filter_rows").to_string()
+                    };
+                    cx.new(|_| gpui_component::tooltip::Tooltip::new(tip)).into()
+                }),
+            )
+            .child(
+                icon_btn(
+                    "export",
+                    32.,
+                    svg().path("icons/download.svg").size_3p5().text_color(if self.exporting { p.primary } else { p.muted_fg }),
+                    true,
+                    hover,
+                    self.exporting.then_some(p.accent),
+                    cx.listener(|this, _, window, cx| this.export_csv(window, cx)),
+                )
+                .tooltip(move |_, cx| {
+                    let tip = if exporting { tr!("ws.cancel_export") } else { tr!("ws.export_tip") };
+                    cx.new(|_| gpui_component::tooltip::Tooltip::new(tip)).into()
+                }),
+            )
+            .when_some(self.export_status.clone(), |t, s| {
+                t.child(
+                    div()
+                        .ml_1()
+                        .max_w(theme::scaled(320.))
+                        .truncate()
+                        .text_size(theme::scaled(theme::TEXT_XS))
+                        .text_color(p.muted_fg)
+                        .child(s),
+                )
+            })
             .child(div().flex_1())
             .child(icon_btn(
                 "detail",
@@ -1671,23 +1825,6 @@ impl Render for RecordsView {
                 cx.listener(|this, _, _, cx| {
                     this.show_detail = !this.show_detail;
                     cx.notify();
-                }),
-            ))
-            .child(icon_btn(
-                "settings",
-                32.,
-                Icon::new(IconName::Settings).with_size(Size::Size(px(14.))),
-                true,
-                hover,
-                None,
-                cx.listener(|this, _, _, cx| {
-                    // Open the root app settings dialog through the handle.
-                    if let Some(app) = this.app.upgrade() {
-                        app.update(cx, |app, cx| {
-                            app.show_settings = true;
-                            cx.notify();
-                        });
-                    }
                 }),
             ));
 
@@ -1711,10 +1848,10 @@ impl Render for RecordsView {
                 div()
                     .ml_2()
                     .text_size(theme::scaled(theme::TEXT_XS))
-                    .child(format!(
-                        "({} columns, ~{} total)",
-                        self.table.columns.len(),
-                        group_digits(self.table.row_count)
+                    .child(tr!(
+                        "ws.table_summary",
+                        cols = self.table.columns.len(),
+                        total = group_digits(self.table.row_count)
                     )),
             );
 
@@ -1897,7 +2034,7 @@ impl Render for RecordsView {
                     .justify_center()
                     .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.muted_fg)
-                    .child("Click a row to inspect its fields.")
+                    .child(tr!("ws.click_row"))
                     .into_any_element(),
             };
             let sel_no = sel.map(|ix| (page * PAGE) as usize + ix + 1);
@@ -1919,10 +2056,10 @@ impl Render for RecordsView {
                         .bg(p.table_header)
                         .border_b_1()
                         .border_color(p.table_border)
-                        .child(format!(
-                            "Row {} · {} fields",
-                            sel_no.unwrap_or(0),
-                            self.table.columns.len()
+                        .child(tr!(
+                            "ws.row_fields",
+                            n = sel_no.unwrap_or(0),
+                            fields = self.table.columns.len()
                         )),
                 )
                 .child(inner)
@@ -1956,9 +2093,9 @@ impl Render for RecordsView {
             .child(host)
             .child("·")
             .child(if loading {
-                "fetching…".to_string()
+                tr!("ws.fetching").to_string()
             } else {
-                format!("{}-{} of {}", lower, upper, total_label(total, exact))
+                tr!("ws.range", from = lower, to = upper, total = total_label(total, exact)).to_string()
             })
             .child("·")
             .child(if loading {
@@ -1978,7 +2115,7 @@ impl Render for RecordsView {
                     this.state.update(cx, |s, cx| s.delegate_mut().prev_page(cx))
                 }),
             ))
-            .child(format!("Page {} / {}", page + 1, page_count))
+            .child(tr!("ws.page", n = page + 1, count = page_count))
             .child(icon_btn(
                 "next",
                 24.,
@@ -2064,6 +2201,7 @@ impl Render for RecordsView {
             }))
             .child(toolbar)
             .child(path_strip)
+            .when(self.show_filter, |this| this.child(self.render_filter_bar(cx)))
             .when_some(error_banner, |this, b| this.child(b))
             .child(
                 div()
@@ -2109,8 +2247,8 @@ fn sep(p: &theme::Palette) -> gpui::Div {
 
 impl crate::ui::app::DataBridge {
     /// The "no open data view" placeholder shown when all tabs are closed.
-    /// Also the way into an empty database: "New SQL query" and, for SQL
-    /// stores, "New table" (a seeded `CREATE TABLE` tab).
+    /// Also the way into an empty database: tr!("ws.new_query") and, for SQL
+    /// stores, tr!("common.new_table") (a seeded `CREATE TABLE` tab).
     pub fn render_empty_state(
         &mut self,
         cx: &mut Context<crate::ui::app::DataBridge>,
@@ -2140,13 +2278,13 @@ impl crate::ui::app::DataBridge {
                         div()
                             .text_size(theme::scaled(theme::TEXT_XL))
                             .text_color(p.foreground)
-                            .child("No open data view"),
+                            .child(tr!("ws.empty_title")),
                     )
                     .child(
                         div()
                             .text_size(theme::scaled(theme::TEXT_MD))
                             .text_color(p.muted_fg)
-                            .child("Select a table in the explorer on the left to open its records here."),
+                            .child(tr!("ws.empty_hint")),
                     )
                     .child(
                         h_flex()
@@ -2158,7 +2296,7 @@ impl crate::ui::app::DataBridge {
                                         .primary()
                                         .small()
                                         .icon(IconName::Plus)
-                                        .label("New table")
+                                        .label(tr!("common.new_table"))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.open_create_table(&schema, window, cx);
                                         })),
@@ -2169,7 +2307,7 @@ impl crate::ui::app::DataBridge {
                                     .ghost()
                                     .small()
                                     .icon(IconName::SquareTerminal)
-                                    .label("New SQL query")
+                                    .label(tr!("ws.new_query"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_query_tab(window, cx);
                                     })),

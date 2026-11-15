@@ -19,9 +19,9 @@ use crate::core::error::DbError;
 use crate::core::model::{is_select_like, total_without_count};
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, NodeKind, Page, Ping,
-    QueryPage, Relation, SchemaMeta, TableMeta, TableRef,
+    QueryPage, Relation, RowQuery, SchemaMeta, SqlDialect, TableMeta, TableRef,
 };
-use crate::core::session::DbSession;
+use crate::core::session::{CancelToken, DbSession, cancellable};
 use crate::drivers::util::{bind_cell, dyn_cell};
 
 pub struct PostgresSession {
@@ -183,36 +183,60 @@ impl DbSession for PostgresSession {
             .collect())
     }
 
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
+    async fn fetch_rows(
+        &self,
+        table: TableRef,
+        query: RowQuery,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Page, DbError> {
         let pool = self.pool().await?;
         let t0 = Instant::now();
         let ident = pg_ident(&table.schema, &table.name);
+        let cl = SqlDialect::Postgres.clauses(&query, 3);
+        let filtered = query.is_filtered();
         // The page and the planner's row estimate in parallel (two pool
         // connections); an exact COUNT(*) only when neither settles the
-        // total (see `total_without_count`).
-        let page_sql = format!("SELECT * FROM {ident} LIMIT $1 OFFSET $2");
-        let page = sqlx::query(&page_sql)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(pool);
+        // total (see `total_without_count`). Filtered pages skip the
+        // estimate — it describes the whole table.
+        let page_sql = format!(
+            "SELECT * FROM {ident}{}{} LIMIT $1 OFFSET $2",
+            cl.where_, cl.order
+        );
+        let mut page = sqlx::query(&page_sql).bind(limit as i64).bind(offset as i64);
+        for b in &cl.binds {
+            page = bind_cell!(page, b);
+        }
+        let page = page.fetch_all(pool);
         // reltuples: -1 = never analyzed (PG 14+), 0 for views.
-        let estimate = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT c.reltuples::bigint FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relname = $2",
-        )
-        .bind(&table.schema)
-        .bind(&table.name)
-        .fetch_optional(pool);
+        let estimate = async {
+            if filtered {
+                return Ok(None);
+            }
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT c.reltuples::bigint FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+            )
+            .bind(&table.schema)
+            .bind(&table.name)
+            .fetch_optional(pool)
+            .await
+        };
         let (rows, estimate) = tokio::join!(page, estimate);
-        let rows = rows.map_err(|e| {
-            DbError::with_source(format!("failed to read {}.{}", table.schema, table.name), e)
-        })?;
+        let rows = rows.map_err(super::util::query_error)?;
         let estimate = estimate.ok().flatten().flatten();
         let (total, exact) = match total_without_count(offset, limit, rows.len(), estimate) {
             Some(t) => t,
             None => {
-                let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {ident}"))
+                // Same WHERE, parameters renumbered from $1.
+                let cc = SqlDialect::Postgres.clauses(&query, 1);
+                let count_sql = format!("SELECT COUNT(*) FROM {ident}{}", cc.where_);
+                let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+                for b in &cc.binds {
+                    q = bind_cell!(q, b);
+                }
+                let n: i64 = q
                     .fetch_one(pool)
                     .await
                     .map_err(|e| {
@@ -243,65 +267,30 @@ impl DbSession for PostgresSession {
         })
     }
 
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        limit: u64,
+        cancel: &CancelToken,
+    ) -> Result<QueryPage, DbError> {
         let pool = self.pool().await?;
-        let t0 = Instant::now();
-        if !is_select_like(sql) {
-            let res = sqlx::query(sql)
-                .execute(pool)
-                .await
-                .map_err(super::util::query_error)?;
-            return Ok(QueryPage {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                rows_affected: res.rows_affected(),
-                truncated: false,
-                elapsed_ms: t0.elapsed().as_millis() as u32,
-            });
-        }
-        let rows = sqlx::query(sql)
-            .fetch_all(pool)
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| DbError::with_source("failed to connect to PostgreSQL", e))?;
+        // The backend pid lets Stop cancel the statement server-side
+        // (`pg_cancel_backend` from another pool connection).
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
             .await
             .map_err(super::util::query_error)?;
-        let mut columns: Vec<ColumnMeta> = rows
-            .first()
-            .map(|r| {
-                r.columns()
-                    .iter()
-                    .map(|c| ColumnMeta {
-                        name: c.name().to_string(),
-                        type_: c.type_info().to_string(),
-                        nullable: true,
-                        primary_key: false,
-                        auto_increment: false,
-                        has_default: false,
-                        kind: pg_kind(c.type_info().name()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if columns.is_empty() && rows.is_empty() {
-            // `SELECT` with no rows still knows its column list through
-            // the statement metadata — fall back to a re-run via `fetch`
-            // is overkill; report an empty result set.
-            columns = Vec::new();
-        }
-        let truncated = rows.len() > limit as usize;
-        let mut out = Vec::with_capacity(rows.len().min(limit as usize));
-        for row in rows.into_iter().take(limit as usize) {
-            let mut r = Vec::with_capacity(row.len());
-            for i in 0..row.len() {
-                r.push(dyn_cell!(row, i));
-            }
-            out.push(r);
-        }
-        Ok(QueryPage {
-            columns,
-            rows: out,
-            rows_affected: 0,
-            truncated,
-            elapsed_ms: t0.elapsed().as_millis() as u32,
-        })
+        let kill = async move {
+            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .execute(pool)
+                .await;
+        };
+        cancellable(run_statement(&mut conn, sql, limit), cancel, Some(kill)).await
     }
 
     async fn update_row(
@@ -547,5 +536,71 @@ async fn schema_meta(pool: &PgPool, schema: String) -> Result<SchemaMeta, DbErro
         tables,
         views,
         functions,
+    })
+}
+
+/// One statement of the query editor on a dedicated connection (the
+/// caller may cancel it by its server-side id).
+async fn run_statement(
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+    limit: u64,
+) -> Result<QueryPage, DbError> {
+    let t0 = Instant::now();
+    if !is_select_like(sql) {
+        let res = sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(super::util::query_error)?;
+        return Ok(QueryPage {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: res.rows_affected(),
+            truncated: false,
+            elapsed_ms: t0.elapsed().as_millis() as u32,
+        });
+    }
+    let rows = sqlx::query(sql)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(super::util::query_error)?;
+    let mut columns: Vec<ColumnMeta> = rows
+        .first()
+        .map(|r| {
+            r.columns()
+                .iter()
+                .map(|c| ColumnMeta {
+                    name: c.name().to_string(),
+                    type_: c.type_info().to_string(),
+                    nullable: true,
+                    primary_key: false,
+                    auto_increment: false,
+                    has_default: false,
+                    kind: pg_kind(c.type_info().name()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if columns.is_empty() && rows.is_empty() {
+        // `SELECT` with no rows still knows its column list through
+        // the statement metadata — fall back to a re-run via `fetch`
+        // is overkill; report an empty result set.
+        columns = Vec::new();
+    }
+    let truncated = rows.len() > limit as usize;
+    let mut out = Vec::with_capacity(rows.len().min(limit as usize));
+    for row in rows.into_iter().take(limit as usize) {
+        let mut r = Vec::with_capacity(row.len());
+        for i in 0..row.len() {
+            r.push(dyn_cell!(row, i));
+        }
+        out.push(r);
+    }
+    Ok(QueryPage {
+        columns,
+        rows: out,
+        rows_affected: 0,
+        truncated,
+        elapsed_ms: t0.elapsed().as_millis() as u32,
     })
 }

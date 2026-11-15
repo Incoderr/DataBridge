@@ -39,9 +39,9 @@ use std::sync::Arc;
 use crate::core::error::DbError;
 use crate::core::model::{
     CellChange, ColumnKind, ColumnMeta, ConnectionStatus, DbConnection, DocNode, NodeKind, Page, Ping,
-    QueryPage, Relation, Row, SchemaMeta, TableMeta, TableRef, Value,
+    FilterOp, QueryPage, Relation, Row, RowQuery, SchemaMeta, TableMeta, TableRef, Value,
 };
-use crate::core::session::DbSession;
+use crate::core::session::{CancelToken, DbSession, cancellable};
 
 use scram::Mechanism;
 use shell::Statement;
@@ -172,18 +172,23 @@ impl MongoSession {
         let read = is_read(&cmd);
         let mut guard = self.slot().await;
         for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.open().await?);
-            }
-            let live = guard.as_mut().unwrap();
+            // Taken out of the slot for the round trip: a call dropped
+            // mid-flight (cancelled query) drops the half-read connection
+            // instead of handing it to the next caller.
+            let mut live = match guard.take() {
+                Some(live) => live,
+                None => self.open().await?,
+            };
             let mut cmd = cmd.clone();
             if live.secondary && read {
                 cmd.insert("$readPreference", doc! { "mode": "primaryPreferred" });
             }
             match live.conn.command(db, cmd).await {
-                Ok(reply) => return check_ok(reply),
+                Ok(reply) => {
+                    *guard = Some(live);
+                    return check_ok(reply);
+                }
                 Err(e) => {
-                    *guard = None;
                     if attempt == 1 || !read {
                         return Err(e);
                     }
@@ -964,6 +969,61 @@ fn project(doc: &Document, columns: &[ColumnMeta]) -> Row {
 
 /// Editor text/typed value → BSON, guided by the column's type label so
 /// an ObjectId stays an ObjectId and a `long` stays a `long`.
+/// The grid's filters as a `find` filter: `{ $and: [ {col: {$op: v}}, … ] }`
+/// (empty when unfiltered). Values convert by the column's BSON type
+/// label like the editor's writes; `contains` is a case-insensitive
+/// `$regex` over the escaped text.
+fn filter_doc(q: &RowQuery) -> Result<Document, String> {
+    if q.filters.is_empty() {
+        return Ok(Document::new());
+    }
+    let mut and = Vec::new();
+    for f in &q.filters {
+        let col = f.column.as_str();
+        let cond = match f.op {
+            FilterOp::IsNull => doc! { col: Bson::Null },
+            FilterOp::NotNull => doc! { col: { "$ne": Bson::Null } },
+            FilterOp::Contains => {
+                let pat: String = f
+                    .value
+                    .display()
+                    .chars()
+                    .flat_map(|c| {
+                        let esc = "\\^$.|?*+()[]{}/".contains(c);
+                        esc.then_some('\\').into_iter().chain(std::iter::once(c))
+                    })
+                    .collect();
+                doc! { col: { "$regex": pat, "$options": "i" } }
+            }
+            op => {
+                let v = cell_to_bson(&f.value, f.kind, &f.type_).map_err(|e| format!("{col}: {e}"))?;
+                // A 24-hex `_id` typed as text matches the ObjectId too.
+                let v = match (&f.value, op, col) {
+                    (Value::Str(s), FilterOp::Eq, "_id") => match ObjectId::parse_str(s.trim()) {
+                        Ok(oid) => {
+                            and.push(Bson::Document(doc! { col: { "$in": [Bson::ObjectId(oid), s.trim()] } }));
+                            continue;
+                        }
+                        Err(_) => v,
+                    },
+                    _ => v,
+                };
+                let key = match op {
+                    FilterOp::Eq => "$eq",
+                    FilterOp::Ne => "$ne",
+                    FilterOp::Lt => "$lt",
+                    FilterOp::Le => "$lte",
+                    FilterOp::Gt => "$gt",
+                    _ => "$gte",
+                };
+                doc! { col: { key: v } }
+            }
+        };
+        and.push(Bson::Document(cond));
+    }
+    Ok(doc! { "$and": and })
+}
+
 fn cell_to_bson(v: &Value, kind: ColumnKind, label: &str) -> Result<Bson, String> {
     Ok(match v {
         Value::Null => Bson::Null,
@@ -1144,18 +1204,33 @@ impl DbSession for MongoSession {
         Ok(Vec::new())
     }
 
-    async fn fetch_rows(&self, table: TableRef, offset: u64, limit: u64) -> Result<Page, DbError> {
+    async fn fetch_rows(
+        &self,
+        table: TableRef,
+        query: RowQuery,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Page, DbError> {
         let t0 = Instant::now();
         let db = table.schema.as_str();
+        let filter = filter_doc(&query).map_err(DbError::new)?;
         // Count (collection metadata, no scan without a filter) and the page
         // side by side on two pool connections.
-        let count = self.run(db, doc! { "count": table.name.as_str() });
-        let cmd = doc! {
+        let mut count_cmd = doc! { "count": table.name.as_str() };
+        if !filter.is_empty() {
+            count_cmd.insert("query", filter.clone());
+        }
+        let count = self.run(db, count_cmd);
+        let mut cmd = doc! {
             "find": table.name.as_str(),
+            "filter": filter,
             "skip": offset as i64,
             "limit": limit as i64,
             "batchSize": limit.min(i32::MAX as u64) as i32,
         };
+        if let Some((col, desc)) = &query.sort {
+            cmd.insert("sort", doc! { col.as_str(): if *desc { -1 } else { 1 } });
+        }
         let page = self.cursor_docs(db, cmd, limit as usize);
         let (count, page) = tokio::join!(count, page);
         let (docs, _) = page
@@ -1187,12 +1262,22 @@ impl DbSession for MongoSession {
         })
     }
 
-    async fn execute(&self, sql: &str, limit: u64) -> Result<QueryPage, DbError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        limit: u64,
+        cancel: &CancelToken,
+    ) -> Result<QueryPage, DbError> {
         let t0 = Instant::now();
         let stmt = shell::parse(sql).map_err(|e| DbError::new(format!("query failed: {e}")))?;
-        let outcome = self
-            .statement(stmt, limit as usize)
-            .await
+        // Stop abandons the call: its connection is dropped (see `run`);
+        // the server finishes the operation on its own.
+        let outcome = cancellable(
+            self.statement(stmt, limit as usize),
+            cancel,
+            None::<std::future::Ready<()>>,
+        )
+        .await
             .map_err(|e| {
                 if e.message().starts_with("query failed") {
                     e
@@ -1372,15 +1457,16 @@ mod tests {
             url: Some(url),
             status: ConnectionStatus::Disconnected,
             latency_ms: 0,
+            ssh: None,
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let s = MongoSession::new(&conn);
             s.ping().await.unwrap();
-            s.execute("db.dbx_live.drop()", 10).await.ok();
-            let ins = s.execute("db.dbx_live.insertMany([{ a: 1, b: 'x' }, { a: 2 }])", 10).await.unwrap();
+            s.execute("db.dbx_live.drop()", 10, &CancelToken::new()).await.ok();
+            let ins = s.execute("db.dbx_live.insertMany([{ a: 1, b: 'x' }, { a: 2 }])", 10, &CancelToken::new()).await.unwrap();
             assert_eq!(ins.rows_affected, 2);
-            let page = s.execute("db.dbx_live.find({ a: { $gte: 1 } }).sort({ a: -1 })", 10).await.unwrap();
+            let page = s.execute("db.dbx_live.find({ a: { $gte: 1 } }).sort({ a: -1 })", 10, &CancelToken::new()).await.unwrap();
             assert_eq!(page.rows.len(), 2);
             let schemas = s.list_schemas().await.unwrap();
             let t = schemas
@@ -1389,7 +1475,7 @@ mod tests {
                 .find(|t| t.name == "dbx_live")
                 .unwrap()
                 .clone();
-            let rows = s.fetch_rows(TableRef::of(&t), 0, 50).await.unwrap();
+            let rows = s.fetch_rows(TableRef::of(&t), RowQuery::default(), 0, 50).await.unwrap();
             assert_eq!(rows.total, 2);
             let id = rows.rows[0][0].clone();
             let pk = vec![CellChange::new("_id", ColumnKind::Text, id)];

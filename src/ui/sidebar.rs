@@ -1,7 +1,7 @@
 //! Narrow vertical toolbar on the far left. Port of the web app's `sidebar.tsx`.
 
 use gpui::prelude::*;
-use gpui::{App, ClickEvent, Context, Div, Hsla, IntoElement, ParentElement, Stateful, Styled, Window, div, px, rgb, svg};
+use gpui::{App, ClickEvent, Context, Div, Hsla, IntoElement, SharedString, ParentElement, Stateful, Styled, Window, div, px, rgb, svg};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{v_flex, Icon, IconName, Sizable, Size};
 
@@ -20,7 +20,7 @@ fn status_color(s: ConnectionStatus, p: &theme::Palette) -> Hsla {
 
 fn tool_btn(
     id: &'static str,
-    label: &'static str,
+    label: SharedString,
     body: impl IntoElement,
     hover_bg: Hsla,
     active: Option<Hsla>,
@@ -45,7 +45,7 @@ fn tool_btn(
                 s
             }
         })
-        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(label)).into())
+        .tooltip(move |_, cx| cx.new(|_| Tooltip::new(label.clone())).into())
         .on_click(on_click)
         .child(body)
 }
@@ -85,7 +85,7 @@ impl DataBridge {
                     .rounded(px(6.))
                     .tooltip({
                         let name = conn.name.clone();
-                        move |_, cx| cx.new(|_| Tooltip::new(format!("Active: {}", name))).into()
+                        move |_, cx| cx.new(|_| Tooltip::new(tr!("sidebar.active", name = name))).into()
                     })
                     .child(
                         svg()
@@ -105,7 +105,7 @@ impl DataBridge {
             )
             .child(tool_btn(
                 "new-conn",
-                "New connection",
+                tr!("sidebar.new_connection"),
                 Icon::new(IconName::Plus).with_size(Size::Size(px(16.))),
                 hover,
                 None,
@@ -114,7 +114,7 @@ impl DataBridge {
             ))
             .child(tool_btn(
                 "refresh",
-                "Refresh",
+                tr!("sidebar.refresh"),
                 Icon::new(IconName::Redo2).with_size(Size::Size(px(16.))),
                 hover,
                 None,
@@ -123,7 +123,7 @@ impl DataBridge {
             ))
             .child(tool_btn(
                 "ai-toggle",
-                "AI assistant",
+                tr!("ai.title"),
                 Icon::new(IconName::Bot).with_size(Size::Size(px(16.))),
                 hover,
                 if self.show_ai { Some(p.accent) } else { None },
@@ -131,30 +131,6 @@ impl DataBridge {
                 cx.listener(|this, _, window, cx| this.toggle_ai(window, cx)),
             ))
             .child(div().flex_1())
-            .child(tool_btn(
-                "grid-view",
-                "Grid view",
-                Icon::new(IconName::LayoutDashboard).with_size(Size::Size(px(15.))),
-                hover,
-                if self.grid_view { Some(p.accent) } else { None },
-                None,
-                cx.listener(|this, _, _, cx| {
-                    this.grid_view = true;
-                    cx.notify();
-                }),
-            ))
-            .child(tool_btn(
-                "list-view",
-                "List view",
-                Icon::new(IconName::Menu).with_size(Size::Size(px(15.))),
-                hover,
-                if !self.grid_view { Some(p.accent) } else { None },
-                None,
-                cx.listener(|this, _, _, cx| {
-                    this.grid_view = false;
-                    cx.notify();
-                }),
-            ))
             .child(
                 div()
                     .my_1()
@@ -165,7 +141,7 @@ impl DataBridge {
             )
             .child(tool_btn(
                 "settings",
-                "Settings",
+                tr!("settings.title"),
                 Icon::new(IconName::Settings).with_size(Size::Size(px(16.))),
                 hover,
                 None,
@@ -177,7 +153,7 @@ impl DataBridge {
             ))
             .child(tool_btn(
                 "disconnect",
-                "Disconnect",
+                tr!("sidebar.disconnect"),
                 Icon::new(IconName::Close).with_size(Size::Size(px(16.))),
                 hover,
                 None,
