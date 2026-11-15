@@ -513,4 +513,36 @@ mod tests {
         mark_rowid_alias(&mut composite);
         assert!(composite.iter().all(|c| !c.auto_increment));
     }
+
+    /// 'Валентин' is 16 UTF-8 bytes — it must read back as text, not as a
+    /// UUID; a JSON-looking string stays a string too.
+    #[test]
+    fn text_is_not_mistaken_for_uuid_or_json() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let conn = DbConnection {
+                id: "t".into(),
+                name: "t".into(),
+                db_type: crate::core::model::DbType::Sqlite,
+                host: String::new(),
+                port: 0,
+                database: ":memory:".into(),
+                user: String::new(),
+                password: String::new(),
+                url: None,
+                status: ConnectionStatus::Disconnected,
+                latency_ms: 0,
+                ssh: None,
+            };
+            let s = SqliteSession::new(&conn);
+            let cancel = crate::core::session::CancelToken::new();
+            let page = s
+                .execute("SELECT 'Валентин' AS name, '[1, 2]' AS tags, 7 AS n", 10, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(page.rows[0][0], crate::core::model::Value::Str("Валентин".into()));
+            assert_eq!(page.rows[0][1], crate::core::model::Value::Str("[1, 2]".into()));
+            assert_eq!(page.rows[0][2], crate::core::model::Value::Int(7));
+        });
+    }
 }

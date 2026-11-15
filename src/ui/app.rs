@@ -11,7 +11,9 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
-use gpui_component::tab::{Tab, TabBar};
+use gpui_component::dock::{
+    DockArea, DockPlacement, DockSkin, InsertTarget, PanelId, PanelStyle, panel_handle,
+};
 use gpui_component::{
     ActiveTheme, Icon, IconName, Sizable, Size, ThemeMode, VirtualListScrollHandle,
     button::{Button, ButtonVariants},
@@ -29,6 +31,7 @@ use crate::core::storage;
 use crate::ui::ai_chat::AiChatView;
 use crate::ui::diagram::SchemaDiagram;
 use crate::ui::nav_tree::{SelectedPath, TreeRow};
+use crate::ui::panes::WorkspacePanel;
 use crate::ui::query::QueryView;
 use crate::ui::theme;
 use crate::ui::workspace::{OpenTab, RecordsView, TabKind};
@@ -82,9 +85,7 @@ pub struct PendingDrop {
     pub error: Option<String>,
 }
 
-/// The workspace view of the active tab: the records grid or the schema
-/// diagram. Recreated on every tab switch (like the web version's keyed
-/// remount).
+/// The view behind one workspace tab (shown in its dock panel).
 #[derive(Clone)]
 pub enum WorkspaceView {
     Records(Entity<RecordsView>),
@@ -103,8 +104,20 @@ pub struct DataBridge {
     /// Schema tree of the active connection (loaded via `list_schemas`).
     pub schemas: Vec<SchemaMeta>,
     pub tabs: Vec<OpenTab>,
+    /// The tab whose panel was activated last (tree highlight, AI
+    /// context, Refresh, where new tabs open).
     pub active_tab: Option<usize>,
-    pub view: Option<WorkspaceView>,
+    /// Views by tab id, kept while the tab is open: switching back shows
+    /// the loaded page / typed statement without a refetch. (The web app
+    /// remounted; on a remote database that meant a round trip per click.)
+    pub views: HashMap<String, WorkspaceView>,
+    /// Dock panels by tab id.
+    pub panels: HashMap<String, Entity<WorkspacePanel>>,
+    /// Tab id of the panel activated last; new tabs join its group.
+    pub last_active: Option<String>,
+    /// The workspace dock (tabs can be dragged into splits); created on
+    /// first use while connected, dropped with the connection.
+    pub dock: Option<Entity<DockArea>>,
     // nav tree state
     pub search: Entity<InputState>,
     pub query: String,
@@ -128,15 +141,6 @@ pub struct DataBridge {
     pub query_seq: u32,
     /// Stale guard of the schema-tree loads (connect + DDL reloads).
     pub schemas_id: u64,
-    /// Live SQL editors by tab id. Diagram views remount on every tab
-    /// switch (web-app parity); a query tab must not — that would drop the
-    /// typed statement and its results.
-    pub query_views: HashMap<String, Entity<QueryView>>,
-    /// Live records grids by tab id: switching back shows the loaded page
-    /// (and its scroll/selection) instead of refetching it — the web app
-    /// remounted, which on a remote database meant a round trip per click.
-    /// Refresh / Run reload explicitly.
-    pub records_views: HashMap<String, Entity<RecordsView>>,
     /// The tree context menu's "Drop table…" awaiting confirmation.
     pub pending_drop: Option<PendingDrop>,
     /// Stale guard of drop requests (a new request / cancel supersedes).
@@ -192,7 +196,10 @@ impl DataBridge {
             schemas: Vec::new(),
             tabs: Vec::new(),
             active_tab: None,
-            view: None,
+            views: HashMap::new(),
+            panels: HashMap::new(),
+            last_active: None,
+            dock: None,
             search,
             query: String::new(),
             expanded: HashSet::new(),
@@ -206,8 +213,6 @@ impl DataBridge {
             show_settings: false,
             query_seq: 0,
             schemas_id: 0,
-            query_views: HashMap::new(),
-            records_views: HashMap::new(),
             pending_drop: None,
             drop_id: 0,
             drag_over: false,
@@ -332,33 +337,34 @@ impl DataBridge {
         self.set_active(ix, window, cx);
     }
 
+    /// Show tab `ix`: build its view and dock panel on first use, else
+    /// select its existing panel. A new panel joins the tab group of the
+    /// active tab (the dock's first group when there is none).
     pub fn set_active(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = Some(ix);
+        let tab = self.tabs[ix].clone();
+        let dock = self.ensure_dock(window, cx);
+        if let Some(panel) = self.panels.get(&tab.id) {
+            let id = PanelId::from(panel.entity_id());
+            dock.update(cx, |d, cx| d.select_panel(id, window, cx));
+            cx.notify();
+            return;
+        }
         let conn = self.active_conn.clone().expect("active connection");
         let session = self.session.clone().expect("active session");
-        let tab = self.tabs[ix].clone();
         let app = cx.entity().downgrade();
-        self.view = Some(match tab.kind {
-            TabKind::Records(ref table) => {
-                let view = self
-                    .records_views
-                    .entry(tab.id.clone())
-                    .or_insert_with(|| {
-                        cx.new(|cx| {
-                            RecordsView::new(
-                                conn.clone(),
-                                session.clone(),
-                                tab.schema.clone(),
-                                table.clone(),
-                                app,
-                                window,
-                                cx,
-                            )
-                        })
-                    })
-                    .clone();
-                WorkspaceView::Records(view)
-            }
+        let view = match tab.kind {
+            TabKind::Records(ref table) => WorkspaceView::Records(cx.new(|cx| {
+                RecordsView::new(
+                    conn.clone(),
+                    session.clone(),
+                    tab.schema.clone(),
+                    table.clone(),
+                    app.clone(),
+                    window,
+                    cx,
+                )
+            })),
             TabKind::Diagram => {
                 // The canvas shows tables and views of the schema.
                 let tables = self
@@ -377,45 +383,116 @@ impl DataBridge {
                     SchemaDiagram::new(conn, session, tab.schema.clone(), tables, cx)
                 }))
             }
-            TabKind::Sql(seed) => {
-                let view = self
-                    .query_views
-                    .entry(tab.id.clone())
-                    .or_insert_with(|| {
-                        cx.new(|cx| QueryView::new(conn, session, seed.clone(), app, window, cx))
-                    })
-                    .clone();
-                WorkspaceView::Query(view)
+            TabKind::Sql(ref seed) => WorkspaceView::Query(cx.new(|cx| {
+                QueryView::new(conn, session, seed.clone(), app.clone(), window, cx)
+            })),
+        };
+        let title: SharedString = match &tab.kind {
+            TabKind::Records(meta) => meta.name.clone().into(),
+            TabKind::Diagram => format!("{} · {}", tab.schema, tr!("app.tab_diagram")).into(),
+            TabKind::Sql(_) => {
+                let n = tab.id.rsplit("__query__").next().unwrap_or("1").to_string();
+                tr!("app.tab_query", n = n)
+            }
+        };
+        let content = match &view {
+            WorkspaceView::Records(v) => v.clone().into(),
+            WorkspaceView::Diagram(v) => v.clone().into(),
+            WorkspaceView::Query(v) => v.clone().into(),
+        };
+        let panel = cx.new(|cx| WorkspacePanel::new(tab.id.clone(), title, content, app, cx));
+        // The group of the tab that was active before this one.
+        let beside = self
+            .panels
+            .values()
+            .find(|p| self.last_active.as_deref() == Some(p.read(cx).tab_id.as_str()))
+            .map(|p| PanelId::from(p.entity_id()));
+        self.views.insert(tab.id.clone(), view);
+        self.panels.insert(tab.id.clone(), panel.clone());
+        let new_id = PanelId::from(panel.entity_id());
+        dock.update(cx, |d, cx| {
+            d.add_panel_view(panel_handle(panel), DockPlacement::Center, None, window, cx);
+            let group = |d: &DockArea, id| d.layout(DockPlacement::Center)?.find_panel_node(id);
+            if let Some(target) = beside.and_then(|b| group(d, b))
+                && group(d, new_id) != Some(target)
+            {
+                d.move_panel(
+                    new_id,
+                    InsertTarget::Tabs { node: target, ix: None, activate: true },
+                    window,
+                    cx,
+                );
             }
         });
+        self.last_active = Some(tab.id);
+        self.sync_lone_tab(cx);
         cx.notify();
     }
 
-    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.tabs.len() {
-            return;
+    /// Tell every panel whether it is the only one left: that tab draws
+    /// its own × (`WorkspacePanel::title`), since the dock refuses to
+    /// close the last panel and so shows no close button for it.
+    fn sync_lone_tab(&mut self, cx: &mut Context<Self>) {
+        let lone = self.panels.len() <= 1;
+        for panel in self.panels.values() {
+            panel.update(cx, |p, cx| p.set_lone(lone, cx));
         }
-        let closed = self.tabs.remove(ix);
-        self.query_views.remove(&closed.id);
-        self.records_views.remove(&closed.id);
-        match self.active_tab {
-            Some(a) if a == ix => {
-                self.view = None;
-                if self.tabs.is_empty() {
-                    self.active_tab = None;
-                } else {
-                    let n = a.min(self.tabs.len() - 1);
-                    self.set_active(n, window, cx);
-                    return;
-                }
-            }
-            Some(a) if a > ix => {
-                self.set_active(a - 1, window, cx);
-                return;
-            }
-            _ => {}
+        if let Some(dock) = &self.dock {
+            dock.update(cx, |_, cx| cx.notify());
         }
+    }
+
+    /// The workspace dock, created on first use.
+    fn ensure_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<DockArea> {
+        if let Some(dock) = &self.dock {
+            return dock.clone();
+        }
+        let (dock, skin) = DockSkin::dock_area("workspace", None, window, cx);
+        // Close buttons on the tabs (hidden by default in the skin).
+        skin.set_close_button_visible(true, cx);
+        // A real tab bar even for one tab: the default plain title has no
+        // tab to drag back and puts Close into its "…" menu.
+        skin.set_panel_style(PanelStyle::TabBar, cx);
+        self.dock = Some(dock.clone());
+        dock
+    }
+
+    /// A panel was activated in the dock (tab click, drag, close of a
+    /// neighbour).
+    pub fn tab_activated(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.id == id) {
+            self.active_tab = Some(ix);
+            self.last_active = Some(id.to_string());
+            cx.notify();
+        }
+    }
+
+    /// A panel left the dock (its close button, or our own removal).
+    pub fn tab_closed(&mut self, id: &str, cx: &mut Context<Self>) {
+        let active_id = self.active_tab.and_then(|i| self.tabs.get(i)).map(|t| t.id.clone());
+        self.tabs.retain(|t| t.id != id);
+        self.views.remove(id);
+        self.panels.remove(id);
+        if self.last_active.as_deref() == Some(id) {
+            self.last_active = None;
+        }
+        // The dock activates a neighbour itself (and reports it); until
+        // then keep pointing at the same tab, or at none.
+        self.active_tab = active_id
+            .filter(|a| a != id)
+            .and_then(|a| self.tabs.iter().position(|t| t.id == a));
+        self.sync_lone_tab(cx);
         cx.notify();
+    }
+
+    /// Drop every tab, view and the dock (disconnect / new connection).
+    fn clear_tabs(&mut self) {
+        self.tabs.clear();
+        self.views.clear();
+        self.panels.clear();
+        self.dock = None;
+        self.active_tab = None;
+        self.last_active = None;
     }
 
     pub fn toggle_node(&mut self, id: &str, _window: &mut Window, cx: &mut Context<Self>) {
@@ -446,11 +523,7 @@ impl DataBridge {
         self.session = None;
         self.schemas_id += 1;
         self.schemas.clear();
-        self.tabs.clear();
-        self.query_views.clear();
-        self.records_views.clear();
-        self.active_tab = None;
-        self.view = None;
+        self.clear_tabs();
         cx.notify();
     }
 
@@ -477,7 +550,8 @@ impl DataBridge {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        match self.view.clone() {
+        let active = self.active_tab.and_then(|i| self.tabs.get(i)).map(|t| t.id.clone());
+        match active.and_then(|id| self.views.get(&id).cloned()) {
             Some(WorkspaceView::Records(rec)) => {
                 rec.update(cx, |v, cx| v.reload(cx));
             }
@@ -524,11 +598,7 @@ impl DataBridge {
         self.active_conn = Some(conn);
         self.session = Some(session.clone());
         self.schemas.clear();
-        self.tabs.clear();
-        self.query_views.clear();
-        self.records_views.clear();
-        self.active_tab = None;
-        self.view = None;
+        self.clear_tabs();
         self.query.clear();
         self.expanded = HashSet::from(["conn".to_string(), "schemas".to_string()]);
         // Fresh tree for the new connection — also resets the tree scroll.
@@ -672,29 +742,26 @@ impl DataBridge {
 
     /// Close every records tab showing `table` (it was just dropped).
     fn close_tabs_of(&mut self, table: &TableRef, window: &mut Window, cx: &mut Context<Self>) {
-        let shows = |t: &OpenTab| {
-            matches!(&t.kind, TabKind::Records(m) if m.schema == table.schema && m.name == table.name)
-        };
-        let active_id = self.active_tab.map(|i| self.tabs[i].id.clone());
-        let active_closed = self
-            .active_tab
-            .is_some_and(|i| shows(&self.tabs[i]));
-        for t in self.tabs.iter().filter(|t| shows(t)) {
-            self.records_views.remove(&t.id);
+        let ids: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| {
+                matches!(&t.kind, TabKind::Records(m) if m.schema == table.schema && m.name == table.name)
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        for id in ids {
+            self.close_tab_id(&id, window, cx);
         }
-        self.tabs.retain(|t| !shows(t));
-        if active_closed {
-            self.view = None;
-            self.active_tab = None;
-            if !self.tabs.is_empty() {
-                let last = self.tabs.len() - 1;
-                self.set_active(last, window, cx);
-            }
-        } else {
-            // The active tab survived; its index may have shifted.
-            self.active_tab = active_id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+    }
+
+    /// Close one tab: its panel leaves the dock (`DockArea::remove_panel`
+    /// may empty it, which the dock's own tab close never does).
+    pub fn close_tab_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(dock), Some(panel)) = (self.dock.clone(), self.panels.get(id).cloned()) {
+            dock.update(cx, |d, cx| d.remove_panel(panel, window, cx));
         }
-        cx.notify();
+        self.tab_closed(id, cx);
     }
 
     fn initial_expanded(schemas: &[SchemaMeta]) -> HashSet<String> {
@@ -735,83 +802,6 @@ impl DataBridge {
     }
 
     // ---------------- layout ----------------
-
-    fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = theme::palette(cx);
-        let mut bar = TabBar::new("tabs");
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            let active = self.active_tab == Some(ix);
-            let (label, icon) = match &tab.kind {
-                TabKind::Records(meta) => (meta.name.clone(), "icons/table.svg"),
-                TabKind::Diagram => (format!("{} · {}", tab.schema, tr!("app.tab_diagram")), "icons/schema.svg"),
-                TabKind::Sql(_) => (tr!("app.tab_query", n = ix + 1).to_string(), "icons/schema.svg"),
-            };
-            bar = bar.child(
-                Tab::new()
-                    .label(label)
-                    // gpui-component only pads the label branch; with a
-                    // prefix/suffix (icon + close button) the base is flush to
-                    // the tab edge — set our own horizontal padding.
-                    .px(px(8.))
-                    .prefix(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .child(
-                                svg()
-                                    .path(icon)
-                                    .size(theme::scaled(14.))
-                                    .text_color(if active { p.primary } else { p.muted_fg }),
-                            ),
-                    )
-                    .suffix(
-                        div()
-                            .id(("tab-close", ix))
-                            .size_4()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(p.tree_hover))
-                            .child(Icon::new(IconName::Close).with_size(Size::Size(px(12.))))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(ix, window, cx);
-                            })),
-                    ),
-            );
-        }
-
-        bar.selected_index(self.active_tab.unwrap_or(0))
-            .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                if *ix < this.tabs.len() {
-                    this.set_active(*ix, window, cx);
-                }
-            }))
-            // New SQL editor tab — always available while connected.
-            .suffix(
-                div()
-                    .id("new-query")
-                    .size(theme::scaled(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(p.tree_hover))
-                    .child(
-                        Icon::new(IconName::SquareTerminal)
-                            .with_size(Size::Size(px(14.)))
-                            .text_color(p.muted_fg),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_query_tab(window, cx);
-                    })),
-            )
-    }
 }
 
 impl Render for DataBridge {
@@ -1018,11 +1008,10 @@ impl DataBridge {
                             .h_full()
                             .rounded_r(px(4.))
                             .overflow_hidden()
-                            .child(self.render_tab_strip(cx))
-                            .child(match self.view.clone() {
-                                Some(WorkspaceView::Records(v)) => v.into_any_element(),
-                                Some(WorkspaceView::Diagram(v)) => v.into_any_element(),
-                                Some(WorkspaceView::Query(v)) => v.into_any_element(),
+                            .child(match self.dock.clone().filter(|_| !self.tabs.is_empty()) {
+                                // Tabs live in the dock: drag one by its
+                                // title to split the workspace.
+                                Some(dock) => div().flex_1().min_h_0().child(dock).into_any_element(),
                                 None => self.render_empty_state(cx).into_any_element(),
                             }),
                     )

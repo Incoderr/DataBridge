@@ -10,7 +10,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, ClickEvent, Context, Entity, FontWeight, SharedString, Window, div, list, px};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState, TabSize};
+use gpui_component::input::{Editor, EditorState, TabSize};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, Size, h_flex, v_flex};
 
@@ -28,7 +28,7 @@ pub(super) enum DocEdit {
 }
 
 pub(super) struct DocEditor {
-    input: Entity<InputState>,
+    input: Entity<EditorState>,
     /// Identity of the edited document; empty = insert.
     pk: Vec<CellChange>,
     title: String,
@@ -78,8 +78,8 @@ impl RecordsView {
             ),
         };
         let input = cx.new(|cx| {
-            let mut s = InputState::new(window, cx)
-                .code_editor("javascript")
+            let mut s = EditorState::new(window, cx)
+                .language("javascript")
                 .tab_size(TabSize { tab_size: 2, hard_tabs: false });
             s.set_value(text, window, cx);
             s
@@ -446,7 +446,7 @@ impl RecordsView {
                             }),
                     ),
             )
-            .child(div().p_2().child(Input::new(&ed.input).h(px(440.))))
+            .child(div().p_2().child(Editor::new(&ed.input).h(px(440.))))
             .child(
                 h_flex()
                     .items_center()

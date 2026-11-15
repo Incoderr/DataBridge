@@ -23,7 +23,7 @@ use gpui::{
     ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::session::CancelToken;
@@ -48,7 +48,7 @@ pub struct AiChatView {
     entries: Vec<Entry>,
     history: Vec<Conversation>,
     show_history: bool,
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     scroll: ScrollHandle,
     streaming: bool,
     /// Statements are being executed (manual Run or an Auto round).
@@ -106,8 +106,7 @@ impl AiChatView {
         let settings = ai::load_settings();
         let cfg = settings.config();
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .auto_grow(2, 10)
                 .placeholder(tr!("ai.placeholder"))
         });
@@ -141,7 +140,7 @@ impl AiChatView {
         // the "new line" gesture). Plain Enter: take that newline back out
         // and send.
         let send_sub = cx.subscribe_in(&input, window, |this, state, ev, window, cx| {
-            if let InputEvent::PressEnter { secondary: false } = ev {
+            if let InputEvent::PressEnter { secondary: false, shift: false } = ev {
                 let (mut text, cursor) = {
                     let s = state.read(cx);
                     (s.value().to_string(), s.cursor())
@@ -763,7 +762,7 @@ impl Render for AiChatView {
                         .child(e),
                 )
             })
-            .child(Input::new(&self.input))
+            .child(Textarea::new(&self.input))
             .child(
                 h_flex()
                     .items_center()

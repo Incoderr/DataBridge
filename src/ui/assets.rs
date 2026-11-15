@@ -62,7 +62,7 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = EXTRA_ICONS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_kit_assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -70,7 +70,7 @@ impl AssetSource for AppAssets {
             .iter()
             .chain(EXTRA_ICONS.iter())
             .map(|(p, _)| SharedString::from(*p))
-            .chain(gpui_component_assets::Assets.list(path)?)
+            .chain(gpui_kit_assets::Assets.list(path)?)
             .collect())
     }
 }

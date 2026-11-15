@@ -20,7 +20,7 @@ mod drivers;
 mod ui;
 
 use gpui::prelude::*;
-use gpui::{Application, Bounds, Point, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{Bounds, Point, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 use gpui_component::{Root, ThemeMode};
 
 use ui::app;
@@ -78,7 +78,7 @@ fn main() {
             .into(),
     ];
 
-    Application::new()
+    gpui_platform::application()
         .with_assets(assets::AppAssets)
         .run(move |cx: &mut gpui::App| {
             core::runtime::init();

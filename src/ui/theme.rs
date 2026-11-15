@@ -248,6 +248,26 @@ fn theme_colors(base: ThemeColor, pal: &Palette) -> ThemeColor {
     c.primary_foreground = pal.primary_fg;
     c.primary_hover = pal.primary_hover;
     c.primary_active = pal.primary_hover;
+    // GPUI Kit 0.9 paints buttons from their own fields (no longer derived
+    // from `primary` / `danger` / `secondary`).
+    c.button_primary = pal.primary;
+    c.button_primary_foreground = pal.primary_fg;
+    c.button_primary_hover = pal.primary_hover;
+    c.button_primary_active = pal.primary_hover;
+    c.button_danger = pal.destructive;
+    c.button_danger_foreground = p(0xFFFFFF);
+    c.button_danger_hover = pal.destructive_hover;
+    c.button_danger_active = pal.destructive_hover;
+    c.button_secondary = pal.secondary;
+    c.button_secondary_foreground = pal.foreground;
+    c.button_secondary_hover = pal.tree_hover;
+    c.button_secondary_active = pal.tree_hover;
+    c.progress_bar = pal.primary;
+    c.slider_bar = pal.primary;
+    c.sidebar_primary = pal.primary;
+    c.sidebar_primary_foreground = pal.primary_fg;
+    c.status_bar = pal.toolbar;
+    c.status_bar_border = pal.toolbar_border;
     c.secondary = pal.secondary;
     c.secondary_foreground = pal.foreground;
     c.secondary_hover = pal.tree_hover;
@@ -322,15 +342,19 @@ pub fn apply(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
         *ThemeColor::light()
     };
     let font_size = crate::ui::settings::font_size(cx);
-    let theme = Theme::global_mut(cx);
-    theme.colors = theme_colors(base, &pal);
-    theme.font_family = SANS_FONT.into();
-    theme.font_size = font_size;
-    theme.mono_font_family = MONO_FONT.into();
-    theme.mono_font_size = font_size;
-    theme.radius = px(6.0);
-    theme.radius_lg = px(10.0);
-    theme.shadow = true;
+    // `Theme::update`, not `global_mut`: since GPUI Kit 0.9 components read
+    // `theme.tokens` (e.g. `tokens.primary`), which `update` reconciles with
+    // the edited `colors`; a raw write leaves them on the stock palette.
+    Theme::update(cx, |theme| {
+        theme.colors = theme_colors(base, &pal);
+        theme.font_family = SANS_FONT.into();
+        theme.font_size = font_size;
+        theme.mono_font_family = MONO_FONT.into();
+        theme.mono_font_size = font_size;
+        theme.radius = px(6.0);
+        theme.radius_lg = px(10.0);
+        theme.shadow = true;
+    });
     if let Some(window) = window {
         window.refresh();
     }

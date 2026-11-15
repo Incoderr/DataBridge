@@ -17,7 +17,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, Bounds, ClickEvent, Context, DispatchPhase, ElementId, FontWeight, Hsla,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder,
-    Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Window, canvas, div,
+    Pixels, Render, ScrollDelta, ScrollEvent, SharedString, Styled, Window, canvas, div,
     point, px, svg,
 };
 
@@ -526,7 +526,7 @@ impl Render for SchemaDiagram {
                 }
             }))
             // Zoom anchored at the cursor (bounds come from the edges layer).
-            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
                 let dy = match e.delta {
                     ScrollDelta::Pixels(d) => f32::from(d.y),
                     ScrollDelta::Lines(d) => d.y * 40.,

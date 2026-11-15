@@ -6,13 +6,13 @@ use gpui::prelude::*;
 use gpui::{
     canvas, AnyElement, App, ClickEvent, ClipboardItem, Context, DispatchPhase, Div, Entity,
     FontWeight, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Corner, ParentElement, Render, SharedString, Stateful, Styled, Subscription, Window, div, px,
+    Anchor, ParentElement, Render, SharedString, Stateful, Styled, Subscription, Window, div, px,
     svg,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_component::table::{Column, ColumnSort, Table, TableDelegate, TableState};
+use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
@@ -295,8 +295,8 @@ impl TableDelegate for RecordsDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.cols[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.cols[col_ix].clone()
     }
 
     fn loading(&self, _: &App) -> bool {
@@ -331,9 +331,6 @@ impl TableDelegate for RecordsDelegate {
         self.load(cx);
     }
 
-    fn is_eof(&self, _: &App) -> bool {
-        true
-    }
 
     fn render_tr(
         &mut self,
@@ -1262,7 +1259,7 @@ impl RecordsView {
                                     .icon(IconName::ChevronDown)
                                     .loading(f.loading)
                                     .disabled(f.loading || options.is_empty())
-                                    .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
+                                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                                         let mut menu = menu.scrollable(true).max_h(px(320.));
                                         for (value, label) in options.iter() {
                                             let input = input.clone();
@@ -2209,7 +2206,7 @@ impl Render for RecordsView {
                     .min_h_0()
                     .relative()
                     .when(!cards, |t| {
-                        t.child(Table::new(&self.state).stripe(true).bordered(false).with_size(Size::Large))
+                        t.child(DataTable::new(&self.state).stripe(true).bordered(false).with_size(Size::Large))
                     })
                     .when(cards, |t| t.child(self.render_doc_cards(cx)))
                     .child(

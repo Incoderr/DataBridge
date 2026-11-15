@@ -104,6 +104,9 @@ app.drop:
 app.tab_diagram:
   en: "diagram"
   ru: "диаграмма"
+app.close_tab:
+  en: "Close tab"
+  ru: "Закрыть вкладку"
 app.tab_query:
   en: "query %{n}"
   ru: "запрос %{n}"

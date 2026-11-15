@@ -8,6 +8,7 @@ pub mod completion;
 pub mod connect;
 pub mod diagram;
 pub mod nav_tree;
+pub mod panes;
 pub mod query;
 pub mod settings;
 pub mod sidebar;

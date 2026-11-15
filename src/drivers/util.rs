@@ -8,12 +8,18 @@
 /// [`Value::Null`]. Dates, UUIDs and JSON are stringified; raw byte
 /// arrays become [`Value::Bytes`].
 ///
+/// UUID and JSON decoding is gated on the column's type name: SQLite
+/// hands any 16-byte TEXT to `Uuid` (so 'Валентин' — 16 UTF-8 bytes —
+/// came back as `d092d0b0-…`) and any JSON-looking TEXT to
+/// `serde_json::Value`.
+///
 /// This is a macro (not a generic fn) on purpose: `Row::try_get` bounds
 /// (`T: Decode<DB> + Type<DB>`) can only be proven per concrete database,
 /// so the ladder must expand against each driver's row type.
 macro_rules! dyn_cell {
     ($row:expr, $i:expr) => {{
-        use sqlx::Row;
+        use sqlx::{Column as _, Row, TypeInfo as _};
+        let type_name = $row.column($i).type_info().name().to_ascii_uppercase();
         if let Ok(v) = $row.try_get::<Option<i64>, _>($i) {
             v.map($crate::core::model::Value::Int)
                 .unwrap_or($crate::core::model::Value::Null)
@@ -47,10 +53,14 @@ macro_rules! dyn_cell {
         } else if let Ok(v) = $row.try_get::<Option<chrono::NaiveTime>, _>($i) {
             v.map(|t| $crate::core::model::Value::Str(t.to_string()))
                 .unwrap_or($crate::core::model::Value::Null)
-        } else if let Ok(v) = $row.try_get::<Option<uuid::Uuid>, _>($i) {
+        } else if let Some(Ok(v)) = (type_name == "UUID")
+            .then(|| $row.try_get::<Option<uuid::Uuid>, _>($i))
+        {
             v.map(|u| $crate::core::model::Value::Str(u.to_string()))
                 .unwrap_or($crate::core::model::Value::Null)
-        } else if let Ok(v) = $row.try_get::<Option<serde_json::Value>, _>($i) {
+        } else if let Some(Ok(v)) = (type_name == "JSON" || type_name == "JSONB")
+            .then(|| $row.try_get::<Option<serde_json::Value>, _>($i))
+        {
             v.map(|j| $crate::core::model::Value::Str(j.to_string()))
                 .unwrap_or($crate::core::model::Value::Null)
         } else if let Ok(v) = $row.try_get::<Option<String>, _>($i) {

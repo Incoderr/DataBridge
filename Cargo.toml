@@ -1,6 +1,6 @@
 [package]
 name = "databridge-gpui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "DataBridge — database explorer UI built with GPUI"
 
@@ -15,9 +15,14 @@ mysql = ["dep:sqlx", "sqlx/mysql"]
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 
 [dependencies]
-gpui = "0.2.2"
-gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
-gpui-component-assets = "0.5.1"
+# GPUI Kit 0.9 runs on the gpui-pre snapshot it pins exactly; the
+# package is renamed so the code keeps importing `gpui::`.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = { version = "0.9.1", features = ["tree-sitter-languages"] }
+gpui-kit-assets = "0.9.1"
+# gpui-pre keeps the platforms in their own crate (`gpui_platform::application()`);
+# features as gpui-kit enables them.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 async-trait = "0.1"
@@ -32,7 +37,7 @@ keyring = { version = "3", features = ["windows-native", "apple-native", "linux-
 rfd = "0.15"
 # UI translations (locales/app.yml). Already in the tree via gpui-component,
 # which shares the same process-wide locale for its own strings.
-rust-i18n = "3"
+rust-i18n = "4"
 # Types of gpui-component's `CompletionProvider` (SQL editor autocompletion);
 # keep in step with the version gpui-component depends on.
 lsp-types = "0.97"

@@ -2,29 +2,34 @@
 //! results grid below. One Run per statement — SELECT-like statements go
 //! through the fetch path, everything else reports affected rows. The
 //! editor autocompletes tables, columns and keywords and shows the
-//! predicted next step as ghost text (`ui/completion.rs`, Tab accepts);
-//! Enter after `(` indents, Ctrl+wheel zooms the editor font. Ctrl+Enter
-//! runs; while a statement runs, Run turns into Stop (`CancelToken`:
-//! the server is asked to cancel it where the driver can).
+//! predicted next step as ghost text (`ui/completion.rs`, Tab or →
+//! accepts); the editor's smart indent handles Enter after `(`, Ctrl+wheel
+//! zooms the editor font. Ctrl+Enter runs; while a statement runs, Run
+//! turns into Stop (`CancelToken`: the server is asked to cancel it where
+//! the driver can). A result set or an error opens a results pane below
+//! the editor behind a draggable divider (`v_resizable`); until then, and
+//! for DDL/DML (the toolbar status reports them), the editor fills the tab.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
     App, Context, DispatchPhase, Div, Entity, IntoElement, KeyBinding, ParentElement, Render,
-    ScrollWheelEvent, Styled, Subscription, WeakEntity, Window, actions, canvas, div, px,
+    ScrollEvent, Styled, Subscription, WeakEntity, Window, actions, canvas, div, px,
     relative,
 };
 
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState, Position, TabSize};
-use gpui_component::table::{Column, Table, TableDelegate, TableState};
+use gpui_component::input::{Editor, EditorState, Enter, Escape, MoveRight, TabSize};
+use gpui_component::resizable::{ResizableState, resizable_panel, v_resizable};
+use gpui_component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
 
 use crate::core::model::{group_digits, DbConnection, QueryPage, Row};
 use crate::core::session::{CancelToken, SessionHandle};
 use crate::ui::app::DataBridge;
-use crate::ui::completion::SqlCompletions;
+use crate::ui::completion::{GhostSlot, MenuSlot, SqlCompletions};
 use crate::ui::{settings, theme};
 
 /// One indentation level in the SQL editor.
@@ -34,7 +39,7 @@ const INDENT: &str = "    ";
 /// version's `QUERY_LIMIT`).
 pub const RESULT_LIMIT: u64 = 500;
 
-actions!(query, [RunQuery]);
+actions!(query, [RunQuery, AcceptGhostOrRight]);
 
 /// Key context of the SQL editor pane (scopes Ctrl+Enter to it — the AI
 /// chat's input keeps Ctrl+Enter as a newline).
@@ -43,12 +48,16 @@ const EDITOR_CONTEXT: &str = "SqlEditor";
 /// Ctrl+Enter (Cmd+Enter on macOS) runs the statement. Registered after
 /// `gpui_component::init`, so it wins over the input's own
 /// "secondary-enter" (newline) binding inside the SQL editor only.
+///
+/// → confirms the open completion menu's item, or accepts the grey ghost
+/// suggestion at the cursor (else it moves right as usual).
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "secondary-enter",
-        RunQuery,
-        Some(&format!("{EDITOR_CONTEXT} > Input")),
-    )]);
+    let keys = if cx.platform_info().is_mac() { "cmd-enter" } else { "ctrl-enter" };
+    let context = format!("{EDITOR_CONTEXT} > Input");
+    cx.bind_keys([
+        KeyBinding::new(keys, RunQuery, Some(&context)),
+        KeyBinding::new("right", AcceptGhostOrRight, Some(&context)),
+    ]);
 }
 
 /// Statements that change the schema tree (SQL DDL, mongosh collection
@@ -91,17 +100,14 @@ impl TableDelegate for QueryDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.cols[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.cols[col_ix].clone()
     }
 
     fn loading(&self, _: &App) -> bool {
         false
     }
 
-    fn is_eof(&self, _: &App) -> bool {
-        true
-    }
 
     fn render_th(
         &mut self,
@@ -175,7 +181,13 @@ pub struct QueryView {
     session: SessionHandle,
     /// The root entity — successful DDL reloads its schema tree.
     app: WeakEntity<DataBridge>,
-    editor: Entity<InputState>,
+    editor: Entity<EditorState>,
+    /// The ghost suggestion the completion provider last offered.
+    ghost: GhostSlot,
+    /// Where the completion menu last opened (→ confirms its item).
+    menu: MenuSlot,
+    /// Editor / results split (sizes survive re-renders).
+    split: Entity<ResizableState>,
     /// Rebuilt after every run; `None` until the first statement.
     table: Option<Entity<TableState<QueryDelegate>>>,
     running: bool,
@@ -189,7 +201,6 @@ pub struct QueryView {
     error: Option<String>,
     last: Option<RunSummary>,
     _obs: Option<Subscription>,
-    _enter: Subscription,
 }
 
 impl QueryView {
@@ -201,9 +212,13 @@ impl QueryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let ghost: GhostSlot = Rc::new(RefCell::new(None));
+        let menu: MenuSlot = Rc::new(RefCell::new(None));
         let editor = cx.new(|cx| {
-            let mut s = InputState::new(window, cx)
-                .code_editor("sql")
+            // Smart indent (structural brackets) and bracket auto-closing
+            // come with the editor: Enter after `(` indents one level.
+            let mut s = EditorState::new(window, cx)
+                .language("sql")
                 .tab_size(TabSize {
                     tab_size: INDENT.len(),
                     hard_tabs: false,
@@ -215,22 +230,22 @@ impl QueryView {
             // Attached after the seed: `set_value` fires the completion
             // trigger, and the provider reads `DataBridge`, which is being
             // updated while this view is created.
-            s.lsp.completion_provider = Some(Rc::new(SqlCompletions {
+            s.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
                 app: app.clone(),
                 dialect: conn.db_type,
+                ghost: ghost.clone(),
+                menu: menu.clone(),
             }));
             s
-        });
-        let enter = cx.subscribe_in(&editor, window, |_, state, event, window, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                state.update(cx, |s, cx| indent_after_open_paren(s, window, cx));
-            }
         });
         Self {
             conn,
             session,
             app,
             editor,
+            ghost,
+            menu,
+            split: cx.new(|_| ResizableState::default()),
             table: None,
             running: false,
             run_id: 0,
@@ -240,7 +255,6 @@ impl QueryView {
             error: None,
             last: None,
             _obs: None,
-            _enter: enter,
         }
     }
 
@@ -306,6 +320,34 @@ impl QueryView {
         .detach();
     }
 
+    /// →: confirm the completion menu's selected item if the menu is open
+    /// (as Enter does), else insert the ghost suggestion if it was computed
+    /// for exactly this text and cursor, else move right.
+    fn accept_ghost_or_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, cursor) = {
+            let s = self.editor.read(cx);
+            (s.value(), s.cursor())
+        };
+        let menu_open = self
+            .menu
+            .borrow_mut()
+            .take_if(|m| m.offset == cursor && m.text.as_str() == text.as_ref())
+            .is_some();
+        if menu_open {
+            // The editor routes Enter to its open completion menu first.
+            window.dispatch_action(Box::new(Enter { secondary: false, shift: false }), cx);
+            return;
+        }
+        let ghost = self
+            .ghost
+            .borrow_mut()
+            .take_if(|g| g.offset == cursor && g.text.as_str() == text.as_ref());
+        match ghost {
+            Some(g) => self.editor.update(cx, |s, cx| s.insert(g.insert, window, cx)),
+            None => window.dispatch_action(Box::new(MoveRight), cx),
+        }
+    }
+
     /// Stop the running statement. The run ends once the driver reports
     /// back (at most `CANCEL_GRACE` after the server was asked to stop).
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -326,8 +368,8 @@ impl QueryView {
         });
         self.error = None;
         if page.columns.is_empty() {
-            // DDL / DML without RETURNING: the toolbar status is the whole
-            // result — no grid, the editor keeps the full height.
+            // DDL / DML without RETURNING: the results pane shows the
+            // outcome instead of a grid.
             self.table = None;
             self._obs = None;
             return;
@@ -346,7 +388,7 @@ impl QueryView {
 }
 
 impl Render for QueryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(cx);
 
         let status: String = match (&self.last, self.running) {
@@ -406,7 +448,7 @@ impl Render for QueryView {
                     .child(if let Some(e) = &self.error {
                         e.clone()
                     } else {
-                        status
+                        status.clone()
                     }),
             )
             .child(div().flex_1())
@@ -417,25 +459,27 @@ impl Render for QueryView {
                     .child(tr!("query.limit", n = RESULT_LIMIT)),
             );
 
-        // The editor pane: fixed share of the view; the code-editor input
-        // scrolls internally. The Input widget's own `h_full` (not Styled's
-        // `.h`) is what makes a multi-line editor actually grow.
-        let has_results = self.table.is_some();
+        // The editor pane; the code editor scrolls internally.
         let editor_pane = v_flex()
             .key_context(EDITOR_CONTEXT)
             .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
-            .flex_1()
-            .min_h(theme::scaled(120.))
-            .when(has_results, |this| this.border_b_1())
-            .border_color(p.toolbar_border)
+            .on_action(cx.listener(|this, _: &AcceptGhostOrRight, window, cx| {
+                this.accept_ghost_or_right(window, cx)
+            }))
+            // Escape hides the menu and the ghost: forget them too (capture: the editor
+            // still handles the key).
+            .capture_action(cx.listener(|this, _: &Escape, _, _| {
+                this.ghost.borrow_mut().take();
+                this.menu.borrow_mut().take();
+            }))
+            .size_full()
             .bg(p.card)
             .p_2()
             .relative()
             .child(
-                Input::new(&self.editor)
-                    .h_full()
-                    .text_size(theme::scaled(settings::editor_font_size(cx)))
-                    .line_height(relative(1.45)),
+                Editor::new(&self.editor)
+                    .h(relative(1.))
+                    .text_size(theme::scaled(settings::editor_font_size(cx))),
             )
             // Ctrl+wheel zoom: captured before the editor scrolls itself.
             // Pinned, last child (see AGENTS.md gotchas); no hitbox, so the
@@ -444,9 +488,9 @@ impl Render for QueryView {
                 canvas(
                     |_, _, _| {},
                     |bounds, _, window, _| {
-                        window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                        window.on_mouse_event(move |e: &ScrollEvent, phase, window, cx| {
                             if phase != DispatchPhase::Capture
-                                || !e.modifiers.secondary()
+                                || !e.modifiers.secondary(cx)
                                 || !bounds.contains(&e.position)
                             {
                                 return;
@@ -467,78 +511,58 @@ impl Render for QueryView {
                 .size_full(),
             );
 
-        // Only result sets get a grid; until then the editor is full height.
-        let results: Option<Div> = self.table.as_ref().map(|state| {
-            div()
-                .flex_1()
-                .min_h_0()
-                .relative()
-                .child(Table::new(state).stripe(true).bordered(false).with_size(Size::Large))
-        });
+        // The results pane — only for a result set or an error; otherwise
+        // (nothing run yet, DDL/DML: the toolbar status says it) the
+        // editor keeps the whole tab.
+        let results: Option<Div> = if let Some(e) = self.error.clone() {
+            Some(div().size_full().p_2().child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(8.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(p.conn_err.opacity(0.4))
+                    .bg(p.conn_err.opacity(0.1))
+                    .text_color(p.conn_err)
+                    .text_size(theme::scaled(theme::TEXT_MD))
+                    .child(Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(15.))))
+                    .child(e),
+            ))
+        } else {
+            self.table.as_ref().map(|state| {
+                div()
+                    .size_full()
+                    .relative()
+                    .child(DataTable::new(state).stripe(true).bordered(false).with_size(Size::Large))
+            })
+        };
+
+        let body = match results {
+            Some(results) => v_resizable("query-split")
+                .with_state(&self.split)
+                .child(
+                    resizable_panel()
+                        .size_range(theme::scaled(80.).to_pixels(window.rem_size())..px(f32::MAX))
+                        .child(editor_pane),
+                )
+                .child(
+                    resizable_panel()
+                        .size(theme::scaled(260.).to_pixels(window.rem_size()))
+                        .size_range(theme::scaled(60.).to_pixels(window.rem_size())..px(f32::MAX))
+                        .child(results),
+                )
+                .into_any_element(),
+            None => editor_pane.into_any_element(),
+        };
 
         v_flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .child(toolbar)
-            .child(editor_pane)
-            .children(results)
-            .when_some(self.error.clone(), |this, e| {
-                this.child(
-                    h_flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .m_2()
-                        .px_2()
-                        .py(px(8.))
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(p.conn_err.opacity(0.4))
-                        .bg(p.conn_err.opacity(0.1))
-                        .text_color(p.conn_err)
-                        .text_size(theme::scaled(theme::TEXT_MD))
-                        .child(
-                            Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(15.))),
-                        )
-                        .child(e),
-                )
-            })
-    }
-}
-
-/// JetBrains-style Enter after `(`: one level deeper than the opening
-/// line; when the cursor sits right before `)`, the paren moves to its own
-/// line at the outer level. Runs after the editor inserted the newline and
-/// the copied indent.
-fn indent_after_open_paren(s: &mut InputState, window: &mut Window, cx: &mut Context<InputState>) {
-    let text = s.value();
-    let cursor = s.cursor();
-    let Some(nl) = text[..cursor].rfind('\n') else {
-        return;
-    };
-    let base = text[nl + 1..cursor].to_string();
-    if !base.chars().all(|c| c == ' ' || c == '\t') {
-        return;
-    }
-    let prev_line_start = text[..nl].rfind('\n').map_or(0, |i| i + 1);
-    if !text[prev_line_start..nl].trim_end().ends_with('(') {
-        return;
-    }
-    let closes = text[cursor..].trim_start_matches([' ', '\t']).starts_with(')');
-    let pos = s.cursor_position();
-    if closes {
-        s.insert(format!("{INDENT}\n{base}"), window, cx);
-        s.set_cursor_position(
-            Position {
-                line: pos.line,
-                character: pos.character + INDENT.len() as u32,
-            },
-            window,
-            cx,
-        );
-    } else {
-        s.insert(INDENT, window, cx);
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
 

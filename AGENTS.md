@@ -8,7 +8,10 @@ DataBridge is a desktop database explorer built with **GPUI**
 (Zed's UI framework) and **gpui-component**. The web frontend (Tauri + React) was
 removed; the GPUI Rust app is the only product code in this repo.
 
-- Rust edition 2024, `gpui = "0.2.2"`, `gpui-component = "0.5.1"`
+- Rust edition 2024, GPUI Kit 0.9: `gpui-component = "0.9.1"` on the
+  `gpui-pre =0.3.12` snapshot (renamed to `gpui` in Cargo.toml, so code
+  imports `gpui::`), `gpui_platform` (`gpui-pre-platform`, starts the app:
+  `gpui_platform::application()`), `gpui-kit-assets` for the icon fallback
 - Package `databridge-gpui`, binary `databridge`
 - Repo layout:
   - `/src` — the application (layered tree below; `core::session` / `registry` /
@@ -77,14 +80,15 @@ src/
     connect.rs    # connection wizard renders (impl DataBridge)
     sidebar.rs    # sidebar chrome
     nav_tree.rs   # explorer tree (virtualized: flat row model + v_virtual_list + overlay Scrollbar)
-    workspace.rs  # tabs + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
+    workspace.rs  # tab model + records grid (RecordsView entity, RecordsDelegate) + the simplified record editor modal
+    panes.rs      # workspace tabs as dock panels (WorkspacePanel in a gpui-component DockArea)
     workspace/documents.rs # document stores: JSON cards, field tree, whole-document editor
-    query.rs      # SQL editor tab (Stage 5): code-editor input, run button, results grid
+    query.rs      # SQL editor tab (Stage 5): `Editor`/`EditorState` (sql), run/stop button, results grid
     completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
     ai_chat.rs    # right-hand AI chat panel (AiChatView entity), toggled from the left rail
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
-    assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-component-assets
+    assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-kit-assets
 ```
 
 ### Hard rules
@@ -283,10 +287,27 @@ wizard list).
   (drop zone on the shared `window-root` shell in `app.rs`), Browse…
   (`rfd`), or New… (save dialog → empty file → connect; existing files
   are never truncated).
-- Tabs: `TabKind::{Records, Diagram, Sql(seed)}`. Diagram views remount
-  on every switch (web-app parity); records grids (`records_views`) and
-  SQL tabs (`query_views`) are cached by tab id, so a switch back shows
-  the loaded page / text and results without a refetch (Refresh reloads).
+- Tabs: `TabKind::{Records, Diagram, Sql(seed)}`, shown as panels of
+  one GPUI Kit `DockArea` (`ui/panes.rs`, `WorkspacePanel` wraps the
+  view): drag a tab by its title to split the workspace left / right /
+  top / bottom, IDE-style. `DataBridge` still owns the tab list and the
+  views (`views`, `panels` by tab id; created once per tab — diagrams no
+  longer remount); the dock only arranges them. Panels report back
+  deferred (they are called inside the dock's update): `set_active` →
+  `tab_activated` (`active_tab` / `last_active`: tree highlight, AI
+  context, Refresh; new tabs join the last active panel's group via
+  `move_panel`), `on_removed` → `tab_closed`. The dock refuses to close
+  the last panel from its tab, so a lone tab draws its own × inside its
+  tab title (`DataBridge::sync_lone_tab` flags it; its `tab_name` turns
+  `None` so the TabBar renders `WorkspacePanel::title` — the skin's
+  close-button look, `close_tab_id` → `DockArea::remove_panel`); the other tabs
+  show the skin's close buttons (`set_close_button_visible`, off by
+  default). `PanelStyle::TabBar`: a one-tab group still draws a tab bar —
+  the default plain title offers no tab to drag back and hides Close in
+  its "…" menu. New SQL editors open from the records toolbar and the empty
+  workspace, not the tab bar. The dock is created lazily
+  (`ensure_dock`) and dropped with the connection (`clear_tabs`); layouts
+  are not persisted yet.
 - SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
   `run_id`; Ctrl+Enter runs (`RunQuery`, bound in `query::init` to
   `SqlEditor > Input` after gpui-component's init, so other inputs keep
@@ -298,8 +319,10 @@ wizard list).
   `run` takes a connection out of its slot for the round trip, so a
   dropped call never returns a half-read socket to the pool. The AI
   chat's Stop cancels its statement the same way. `--mock` honours
-  `sleep(n)` / `pg_sleep(n)` so Stop is demoable. The editor fills the tab; a results grid appears (and takes
-  half) only for result sets — DDL/DML report in the toolbar status. `model::is_select_like` (first keyword after comments, plus
+  `sleep(n)` / `pg_sleep(n)` so Stop is demoable. A result set or an error opens a results pane under the
+  editor behind a draggable divider (`v_resizable`, state in
+  `QueryView::split`); otherwise the editor fills the tab and DDL/DML
+  report in the toolbar status. `model::is_select_like` (first keyword after comments, plus
   DML `RETURNING`) picks fetch vs execute. "New table" (tree row per
   schema + the empty workspace) seeds a dialect `CREATE TABLE`; DDL runs
   reload the tree via `DataBridge::reload_schemas` (stale-guarded by
@@ -314,10 +337,15 @@ wizard list).
   REFERENCES, columns in `INTO t (` / `REFERENCES t (`). `predict` gives
   the grey ghost "next step" (`FROM` after `SELECT *`, `ON a.fk = b.pk`
   guessed from `<table>_id` names, the INSERT column list, …; Tab
-  accepts). Menu items carry no `detail` — the gpui-component popover is
+  or → accepts — → via `AcceptGhostOrRight`: an open completion menu
+  first (→ = Enter on its selected item), else the ghost. gpui-component
+  exposes neither, so the provider records where the menu opened
+  (`completion::MenuSlot`) and the ghost it offered (`GhostSlot`); each
+  counts only while text and cursor are unchanged, Escape forgets both). Menu items carry no `detail` — the gpui-component popover is
   fixed at 120 px min and doesn't grow — descriptions go to
   `documentation` (side popover). Editor: 4-space indent, Enter after `(`
-  indents (`indent_after_open_paren`), Ctrl+wheel font zoom
+  indents (the editor's own smart indent — structural brackets — since
+  GPUI Kit 0.9), Ctrl+wheel font zoom
   (`settings::EditorFontSize`, captured by a canvas before the editor
   scrolls). `ui/completion.rs` reads `DataBridge::schemas` per request —
   attach the provider only after `set_value` (it fires the trigger while
@@ -379,6 +407,10 @@ wizard list).
   "reply in Russian" note (`language_hint`) — small models ignore the
   system prompt. Conversations persist in `ai_history.json`
   (≤50, history list in the panel header).
+- sqlx cell decoding (`drivers::util::dyn_cell`) tries UUID / JSON only
+  for columns whose type name says so: SQLite decodes any 16-byte TEXT as
+  a UUID ('Валентин' read back as `d092d0b0-…`) and JSON-looking TEXT as
+  JSON (`text_is_not_mistaken_for_uuid_or_json`).
 - Driver errors carry the server message (`drivers::util::query_error`:
   "query failed: no such table: dual"), not a bare "query failed".
 - Settings dialog (gear in the left rail, `render_settings_dialog`):
@@ -469,7 +501,7 @@ wizard list).
   features `ring` + `rsa`: no aws-lc-rs, no flate2). It brings ~60 small
   RustCrypto crates (ed25519/curve25519, p256/384/521, ssh-key, …) — the
   price of in-process SSH with key/agent auth and known_hosts checks.
-- UI translations: `rust-i18n` 3 (already in the tree via gpui-component,
+- UI translations: `rust-i18n` 4 (already in the tree via gpui-component,
   which reads the same global locale).
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
@@ -487,6 +519,16 @@ wizard list).
   `text_size(px(..))`; control heights, icon and card sizes use `scaled` too.
   Only hairlines/splitters stay `px`; virtual-list heights multiply by `palette.scale`.
 - Pin `gpui`/`gpui-component` to the versions in `Cargo.toml`; their APIs move fast
+  (GPUI Kit pins `gpui-pre` exactly — bump `gpui`, `gpui_platform`,
+  `gpui-component` and `gpui-kit-assets` together; `rust-i18n` must match
+  the kit's major version or the shared locale splits in two).
+  Kit 0.9 notes: inputs are three types — `InputState` (single line),
+  `TextareaState` + `Textarea` (AI chat), `EditorState` + `Editor` (SQL /
+  document editors; `.language(..)`, `lsp_mut().completion_provider`);
+  `PressEnter { secondary, shift }`; tables render with `DataTable::new`
+  and `TableDelegate::column` returns an owned `Column`; `KeyBinding::new`
+  takes a `'static` keystroke (`ctrl-enter` / `cmd-enter` by platform, no
+  `secondary-`); `Modifiers::secondary(cx)`; `ScrollEvent` / `on_scroll`.
   (component lib is pre-1.0). Upgrades are deliberate, isolated changes.
 - **Pin absolute overlays with explicit insets (`top_0().left_0()`), keep
   absolute `canvas` elements as the last child.** In gpui 0.2 / taffy 0.9 an
@@ -503,6 +545,11 @@ wizard list).
   behind it) out of the hover set. See `render_editor` in `workspace.rs` and
   `render_settings_dialog` in `app.rs`: backdrop + card are siblings under a
   transparent layer, the card occludes.
+- **Theme edits go through `Theme::update`, never `Theme::global_mut`.**
+  Kit 0.9 components read `theme.tokens` (checkbox fill, buttons), which
+  only `update` reconciles with edited `colors`; buttons also have their
+  own `button_*` color fields (`theme::theme_colors` sets them) — a raw
+  write leaves the stock white primary.
 - **Striped tables need `query::settle_stripes` after creating a
   `TableState`.** gpui-component sizes the stripe filler rows from the
   previous frame's bounds, so a fresh table paints without them until an
