@@ -33,9 +33,8 @@ pub fn is_supported(t: DbType) -> bool {
         DbType::PostgreSql => cfg!(feature = "postgres"),
         DbType::MySql | DbType::MariaDb => cfg!(feature = "mysql"),
         DbType::Sqlite => cfg!(feature = "sqlite"),
-        DbType::MongoDb => true,
+        DbType::MongoDb | DbType::ClickHouse => true,
         DbType::Redis
-        | DbType::ClickHouse
         | DbType::Cassandra
         | DbType::ScyllaDb => false,
     }
@@ -72,6 +71,7 @@ fn driver(conn: &DbConnection) -> Result<Arc<dyn DbSession>, DbError> {
         #[cfg(feature = "sqlite")]
         DbType::Sqlite => Arc::new(crate::drivers::sqlite::SqliteSession::new(conn)),
         DbType::MongoDb => Arc::new(crate::drivers::mongo::MongoSession::new(conn)),
+        DbType::ClickHouse => Arc::new(crate::drivers::clickhouse::ClickHouseSession::new(conn)),
         // No driver for this type (Stage 4 types, or a build without
         // the feature): fail loudly. Falling back to the mock would show
         // fake demo tables as if they were the user's database.

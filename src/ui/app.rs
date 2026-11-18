@@ -34,6 +34,7 @@ use crate::ui::nav_tree::{SelectedPath, TreeRow};
 use crate::ui::panes::WorkspacePanel;
 use crate::ui::query::QueryView;
 use crate::ui::theme;
+use crate::ui::update::UpdateState;
 use crate::ui::workspace::{OpenTab, RecordsView, TabKind};
 
 /// Wizard phase: pick type/existing → fill form → connecting.
@@ -72,6 +73,8 @@ pub struct WizardState {
     pub phase: Phase,
     pub draft: Draft,
     pub error: Option<String>,
+    /// The last Test connection succeeded (green notice; `error` wins).
+    pub test_ok: bool,
     pub testing: bool,
     pub chosen_existing: Option<String>,
 }
@@ -155,6 +158,10 @@ pub struct DataBridge {
     /// reconnects (it reads the active schema on every send).
     pub ai_chat: Option<Entity<AiChatView>>,
     pub show_ai: bool,
+    /// Self-update (`ui/update.rs`): state, stale guard, card dismissed.
+    pub update: UpdateState,
+    pub update_id: u64,
+    pub update_hidden: bool,
 }
 
 impl DataBridge {
@@ -175,6 +182,7 @@ impl DataBridge {
             phase: Phase::Choose,
             draft: Draft::new(DbType::PostgreSql, window, cx),
             error: None,
+            test_ok: false,
             testing: false,
             chosen_existing: None,
         };
@@ -184,7 +192,7 @@ impl DataBridge {
         // the real recent connections (most recently used first).
         let demo = registry::is_mock();
 
-        Self {
+        let mut this = Self {
             mock: demo,
             connections: if demo {
                 mock::seed_connections()
@@ -219,7 +227,12 @@ impl DataBridge {
             wizard,
             ai_chat: None,
             show_ai: false,
-        }
+            update: UpdateState::default(),
+            update_id: 0,
+            update_hidden: false,
+        };
+        this.startup_update_check(cx);
+        this
     }
 
     pub fn toggle_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -859,6 +872,7 @@ impl Render for DataBridge {
                 this.child(self.render_drop_dialog(cx))
             })
             .when(drag_over, |this| this.child(self.render_drop_hint(cx)))
+            .children(self.render_update_notice(cx))
             .child(
                 canvas(
                     |_, _, _| {},
@@ -1388,7 +1402,9 @@ impl DataBridge {
                     .child(section(t!("settings.theme").into_owned()))
                     .child(themes)
                     .child(section(t!("settings.language").into_owned()))
-                    .child(langs),
+                    .child(langs)
+                    .child(section(t!("update.section").into_owned()))
+                    .child(self.render_update_settings(cx)),
             );
 
         // Transparent event-passing layer: the backdrop handles outside
@@ -1430,9 +1446,17 @@ fn create_table_template(t: DbType, schema: &str) -> Option<String> {
              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\n);",
             schema.replace('`', "``")
         ),
+        DbType::ClickHouse => format!(
+            "CREATE TABLE `{}`.new_table (\n    \
+             id UInt64,\n    \
+             name String,\n    \
+             created_at DateTime DEFAULT now()\n\
+             ) ENGINE = MergeTree\n\
+             ORDER BY id;",
+            schema.replace('\\', "\\\\").replace('`', "\\`")
+        ),
         DbType::MongoDb
         | DbType::Redis
-        | DbType::ClickHouse
         | DbType::Cassandra
         | DbType::ScyllaDb => return None,
     };

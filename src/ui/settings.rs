@@ -1,4 +1,4 @@
-//! Interface settings (scale, theme, language, SQL editor font), shared app-wide via
+//! Interface settings (scale, theme, language, SQL editor font, update check), shared app-wide via
 //! Globals and persisted in `settings.json` (`core::storage::AppSettings`):
 //! loaded once in `main` (`restore`), written on every change (`persist`).
 
@@ -134,7 +134,21 @@ pub fn restore(cx: &mut App) -> bool {
         .find(|l| l.key() == s.language)
         .unwrap_or(Language::En);
     rust_i18n::set_locale(lang.key());
+    cx.set_global(CheckUpdates(s.check_updates));
     s.dark
+}
+
+/// "Check for updates at startup" (Settings dialog, `core::update`).
+pub struct CheckUpdates(pub bool);
+impl Global for CheckUpdates {}
+
+pub fn check_updates(cx: &App) -> bool {
+    cx.try_global::<CheckUpdates>().is_none_or(|g| g.0)
+}
+
+pub fn set_check_updates(on: bool, cx: &mut App) {
+    cx.set_global(CheckUpdates(on));
+    persist(cx);
 }
 
 /// Write the current settings to `settings.json`.
@@ -145,6 +159,7 @@ pub fn persist(cx: &App) {
         dark: cx.theme().is_dark(),
         editor_font: editor_font_size(cx),
         language: Language::current().key().into(),
+        check_updates: check_updates(cx),
     });
 }
 

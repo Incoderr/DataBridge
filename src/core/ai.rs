@@ -306,13 +306,7 @@ pub enum AiEvent {
 }
 
 fn client() -> Result<reqwest::Client, DbError> {
-    // reqwest is built without a bundled crypto provider; sqlx already
-    // links rustls+ring, so reuse it. Ignored when already installed.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| DbError::with_source("cannot create the HTTP client", e))
+    runtime::http_client()
 }
 
 fn authed(req: reqwest::RequestBuilder, cfg: &AiConfig) -> reqwest::RequestBuilder {

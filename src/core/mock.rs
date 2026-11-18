@@ -382,17 +382,22 @@ fn find_meta(conn: &DbConnection, schema: &str, name: &str) -> Option<Arc<TableM
 }
 
 // ---------- Deterministic record generator ----------
+//
+// Demo rows are a pure function of (table, column, row_id) — no storage,
+// any page of a million-row table is instant. The values are shaped like
+// real data so the grid and the charts have something to show: skewed
+// categories (more page views than purchases), log-normal money with a
+// long tail, a year of timestamps that grows towards the end and dips on
+// weekends, a `daily_events` series with trend + weekly seasonality, a
+// funnel whose steps thin out, sequential integer ids.
 
+/// Java-style string hash (seeds `_id`s of the demo documents).
 fn md5(s: &str) -> i32 {
     let mut h: i32 = 0;
     for c in s.chars() {
         h = h.wrapping_mul(31).wrapping_add(c as i32);
     }
     h
-}
-
-fn pick<'a>(arr: &'a [&'a str], seed: i32) -> &'a str {
-    arr[(seed.unsigned_abs() as usize) % arr.len()]
 }
 
 fn pad(n: u64, w: usize) -> String {
@@ -413,99 +418,249 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-const EMAILS: &[&str] = &[
-    "runner@acme.io",
-    "maria.d@example.com",
-    "freddie@bies.eu",
-    "lu@pp.dev",
-    "alex@host.ru",
-    "kai@null.cloud",
-];
-const NAMES: &[&str] = &[
-    "Ada Lovelace",
-    "Alan Turing",
-    "Edsger Dijkstra",
-    "Grace Hopper",
-    "Knuth",
-    "Guido",
-    "Linus",
-];
-const STATUSES: &[&str] = &["open", "paid", "shipped", "refunded", "cancelled", "pending"];
-const TITLES: &[&str] = &[
-    "The Pragmatic Programmer",
-    "Refactoring",
-    "Clean Code",
-    "DDD",
-    "The Phoenix Project",
-    "PostgreSQL Up & Running",
-];
-const AUTHORS: &[&str] = &["Sandi Metz", "Robert Martin", "Kathy Sierra", "Brian Goetz"];
-const COUNTRIES: &[&str] = &["RU", "US", "DE", "JP", "BR", "FR"];
-const ACTIONS: &[&str] = &["login", "logout", "update", "create", "delete", "refresh"];
-const ACTORS: &[&str] = &["app_reader", "staging_reader", "cron_worker", "frontend"];
-const PROVIDERS: &[&str] = &["google", "github", "email", "apple"];
-const EVENT_TYPES: &[&str] = &["click", "view", "purchase", "signup", "error", "page_view"];
+/// The demo's "today": 2026-11-15 as days since 1970-01-01.
+const DEMO_END_DAY: i64 = 20_772;
+/// Timestamps span the last year.
+const DEMO_SPAN_DAYS: i64 = 365;
 
-fn gen_value(c: &ColumnMeta, row_seed: i64) -> Value {
-    let s = md5(&format!("{}:{}", c.name, row_seed));
-    let abs = s.unsigned_abs() as u64;
+/// SplitMix64 finalizer — well-spread bits from a weak seed.
+fn mix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Uniform [0, 1) for one (table, column, row, salt).
+fn unit(table: &str, column: &str, row: i64, salt: u64) -> f64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in table.bytes().chain([b'.']).chain(column.bytes()) {
+        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    (mix(h ^ mix(row as u64 ^ salt.rotate_left(32))) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Standard normal from two uniforms (Box–Muller).
+fn normal(u1: f64, u2: f64) -> f64 {
+    (-2.0 * (1.0 - u1).ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// Weighted choice.
+fn pick_w<'a>(items: &[(&'a str, u32)], u: f64) -> &'a str {
+    let total: u32 = items.iter().map(|i| i.1).sum();
+    let mut x = (u * total as f64) as u32;
+    for (s, w) in items {
+        if x < *w {
+            return s;
+        }
+        x -= w;
+    }
+    items[items.len() - 1].0
+}
+
+fn pick<'a>(arr: &[&'a str], u: f64) -> &'a str {
+    arr[((u * arr.len() as f64) as usize).min(arr.len() - 1)]
+}
+
+fn money(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+const EMAIL_USERS: &[&str] = &["ada", "alan", "grace", "edsger", "linus", "guido", "maria", "kai", "lu", "alex"];
+const EMAIL_HOSTS: &[(&str, u32)] =
+    &[("gmail.com", 40), ("yandex.ru", 15), ("outlook.com", 14), ("icloud.com", 10), ("acme.io", 8), ("proton.me", 6), ("example.com", 7)];
+const NAMES: &[&str] = &[
+    "Ada Lovelace", "Alan Turing", "Edsger Dijkstra", "Grace Hopper", "Donald Knuth", "Guido van Rossum",
+    "Linus Torvalds", "Barbara Liskov", "Ken Thompson", "Margaret Hamilton", "Niklaus Wirth", "Frances Allen",
+];
+const STATUSES: &[(&str, u32)] =
+    &[("paid", 44), ("shipped", 24), ("open", 11), ("pending", 8), ("refunded", 7), ("cancelled", 6)];
+const TITLES: &[&str] = &[
+    "The Pragmatic Programmer", "Refactoring", "Clean Code", "Domain-Driven Design", "The Phoenix Project",
+    "PostgreSQL Up & Running", "Designing Data-Intensive Applications", "Structure and Interpretation of Computer Programs",
+    "The Mythical Man-Month", "Code Complete", "Working Effectively with Legacy Code", "Site Reliability Engineering",
+];
+const AUTHORS: &[(&str, u32)] = &[
+    ("Martin Kleppmann", 18), ("Robert Martin", 16), ("Martin Fowler", 15), ("Kent Beck", 12),
+    ("Sandi Metz", 10), ("Kathy Sierra", 9), ("Brian Goetz", 8), ("Eric Evans", 7), ("Fred Brooks", 5),
+];
+const COUNTRIES: &[(&str, u32)] = &[
+    ("US", 29), ("DE", 13), ("RU", 12), ("BR", 10), ("GB", 9), ("FR", 8), ("IN", 7), ("JP", 6), ("CA", 4), ("PL", 2),
+];
+const ACTIONS: &[(&str, u32)] =
+    &[("login", 38), ("refresh", 24), ("update", 16), ("logout", 12), ("create", 7), ("delete", 3)];
+const ACTORS: &[(&str, u32)] = &[("frontend", 52), ("app_reader", 23), ("cron_worker", 17), ("staging_reader", 8)];
+const PROVIDERS: &[(&str, u32)] = &[("google", 46), ("email", 27), ("github", 18), ("apple", 9)];
+const EVENT_TYPES: &[(&str, u32)] =
+    &[("page_view", 41), ("view", 21), ("click", 19), ("signup", 7), ("purchase", 6), ("error", 6)];
+const PRODUCT_WORDS: &[&str] = &["Desk", "Lamp", "Chair", "Monitor", "Keyboard", "Mouse", "Headphones", "Webcam", "Dock", "Cable"];
+const PRODUCT_ADJ: &[&str] = &["Pro", "Mini", "Ergo", "Studio", "Air", "Max", "Lite", "Classic"];
+
+/// A day of the last year: denser towards the end (growth), thinner on
+/// weekends.
+fn demo_day(u: f64, weekend_skip: f64) -> i64 {
+    let mut day = DEMO_END_DAY - DEMO_SPAN_DAYS + (u.sqrt() * DEMO_SPAN_DAYS as f64) as i64;
+    // 1970-01-01 was a Thursday: (day + 3) % 7 → 0 = Monday … 5/6 = weekend.
+    let dow = (day + 3).rem_euclid(7);
+    if dow >= 5 && weekend_skip < 0.45 {
+        day -= dow - 4; // moved to Friday
+    }
+    day.min(DEMO_END_DAY)
+}
+
+fn date_text(day: i64) -> String {
+    let (y, m, d) = civil_from_days(day);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `daily_events` values for one day index (0 = a year ago).
+fn daily_series(row: i64) -> (i64, i64) {
+    let day = DEMO_END_DAY - DEMO_SPAN_DAYS + 1 + row;
+    let dow = (day + 3).rem_euclid(7);
+    let trend = 1_800.0 + 5.5 * row as f64;
+    let weekly = if dow >= 5 { 0.68 } else { 1.0 + 0.04 * (2 - (dow - 2).abs()) as f64 };
+    // Holiday season bump in the last ~6 weeks.
+    let season = 1.0 + 0.25 * ((row as f64 - 320.0) / 45.0).clamp(0.0, 1.0);
+    let noise = 1.0 + 0.07 * normal(unit("daily_events", "n1", row, 1), unit("daily_events", "n2", row, 2));
+    let events = (trend * weekly * season * noise).max(0.0) as i64;
+    let share = 0.31 + 0.03 * normal(unit("daily_events", "u1", row, 3), unit("daily_events", "u2", row, 4));
+    (events, (events as f64 * share) as i64)
+}
+
+/// The funnel step a `funnel_steps` row reached: each step rarer than the last.
+fn funnel_step(t: &TableMeta, row: i64) -> i64 {
+    pick_w(&[("1", 40), ("2", 25), ("3", 17), ("4", 11), ("5", 7)], unit(&t.name, "step", row, 1))
+        .parse()
+        .unwrap_or(1)
+}
+
+fn gen_value(t: &TableMeta, c: &ColumnMeta, row: i64) -> Value {
+    let u = |salt: u64| unit(&t.name, &c.name, row, salt);
+    // Nullable, non-key columns are sometimes empty.
+    if c.nullable && !c.primary_key && u(99) < 0.04 {
+        return Value::Null;
+    }
+    let lognormal = |median: f64, sigma: f64| median * (sigma * normal(u(1), u(2))).exp();
+
+    // The daily series view: one row per day, ascending.
+    if t.name == "daily_events" {
+        let (events, users) = daily_series(row);
+        return match c.name.as_str() {
+            "day" => Value::Str(date_text(DEMO_END_DAY - DEMO_SPAN_DAYS + 1 + row)),
+            "event_count" => Value::Int(events),
+            "unique_users" => Value::Int(users),
+            _ => Value::Null,
+        };
+    }
+
     match c.kind {
-        ColumnKind::Int => Value::Int((abs % 100_000) as i64),
-        ColumnKind::Float => Value::Float((abs % 100_000) as f64 / 100.0),
-        ColumnKind::Bool => Value::Bool(abs % 2 == 1),
+        // Integer keys are sequential (unique, and editable by key).
+        ColumnKind::Int if c.primary_key || c.name == "id" => Value::Int(row + 1),
+        ColumnKind::Int => Value::Int(match c.name.as_str() {
+            // Power users: low ids are much more active.
+            "user_id" => (24_812.0 * u(1).powf(2.2)) as i64 + 1,
+            "step" => funnel_step(t, row),
+            "in_stock" if u(3) < 0.08 => 0,
+            "in_stock" => lognormal(60.0, 0.8).round() as i64,
+            "order_count" => lognormal(4.0, 0.9).round() as i64,
+            "year" => 2024 - (29.0 * u(1).powi(2)) as i64,
+            "birth_year" => (1966.0 + 14.0 * normal(u(1), u(2))).clamp(1925.0, 2001.0) as i64,
+            _ => (lognormal(120.0, 1.0)).round() as i64,
+        }),
+        ColumnKind::Float => Value::Float(match c.name.as_str() {
+            "price" => (lognormal(35.0, 0.75).floor() + 0.99).min(4_999.99),
+            "total" => money(lognormal(64.0, 0.85)),
+            "balance" => money(lognormal(120.0, 1.1)),
+            "lifetime_value" => money(lognormal(380.0, 1.0)),
+            "rating" => ((4.05 + 0.5 * normal(u(1), u(2))).clamp(1.0, 5.0) * 10.0).round() / 10.0,
+            // Funnel revenue grows with the step reached.
+            "value" => {
+                let step = funnel_step(t, row) as f64;
+                ((lognormal(12.0, 0.6) * step) * 10_000.0).round() / 10_000.0
+            }
+            _ => money(lognormal(50.0, 0.9)),
+        }),
+        ColumnKind::Bool => Value::Bool(u(1) < if c.name == "is_active" { 0.82 } else { 0.5 }),
         ColumnKind::Date => {
-            let days = (abs % 1800) as i64;
-            let (y, m, d) = civil_from_days(days + 18_262); // 1970-01-01 + 18262 = 2020-01-01
-            let hh = (abs >> 4) % 24;
-            let mm = (abs >> 8) % 60;
-            let ss = (abs >> 12) % 60;
-            Value::Str(format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}"))
+            let day = if c.name == "expires_at" {
+                DEMO_END_DAY + (u(1) * 30.0) as i64 // sessions expire within a month
+            } else {
+                demo_day(u(1), u(2))
+            };
+            if c.type_ == "date" {
+                return Value::Str(date_text(day));
+            }
+            // Busy hours: a bell around 14:00.
+            let hh = (14.0 + 4.0 * normal(u(3), u(4))).clamp(0.0, 23.0) as u64;
+            let mm = (u(5) * 60.0) as u64;
+            let ss = (u(6) * 60.0) as u64;
+            Value::Str(format!("{} {hh:02}:{mm:02}:{ss:02}", date_text(day)))
         }
         ColumnKind::Uuid => {
-            let b = |shift: u32, mask: u64, w: usize| pad((abs >> shift) & mask, w);
+            let a = mix(row as u64 ^ 0xA5A5);
+            let b = mix(a);
             Value::Str(format!(
-                "{}{}{}-{}-{}-{}-{}{}",
-                b(0, 0xff, 2),
-                b(8, 0xff, 2),
-                b(16, 0xff, 2),
-                b(4, 0xf, 1),
-                b(7, 0xff, 2),
-                b(12, 0xff, 2),
-                b(2, 0xffff, 4),
-                b(18, 0xffff, 4),
+                "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+                a >> 32,
+                (a >> 16) & 0xffff,
+                a & 0xfff,
+                0x8000 | (b >> 48) & 0x3fff,
+                b & 0xffff_ffff_ffff
             ))
         }
-        ColumnKind::Json => Value::Str(format!(
-            "{{\"k1\":\"{}\",\"n\":{},\"ok\":{}}}",
-            pick(&["alpha", "beta", "gamma"], s),
-            abs % 100,
-            abs % 2 == 1
-        )),
-        ColumnKind::Binary => Value::Str(format!("0x{}{}", pad(abs & 0xff, 2), pad((abs >> 8) & 0xff, 2))),
-        ColumnKind::Text => {
-            let v: String = match c.name.as_str() {
-                "email" => pick(EMAILS, s).to_string(),
-                "name" => pick(NAMES, s).to_string(),
-                "status" => pick(STATUSES, s).to_string(),
-                "title" => pick(TITLES, s).to_string(),
-                "sku" => pick(
-                    &[&*format!("SKU-{}", pad(abs % 9999, 4)), &*format!("PRD-{}", pad((abs >> 8) % 9999, 4))],
-                    s,
-                )
-                .to_string(),
-                "author" => pick(AUTHORS, s).to_string(),
-                "country" => pick(COUNTRIES, s).to_string(),
-                "action" => pick(ACTIONS, s).to_string(),
-                "actor" => pick(ACTORS, s).to_string(),
-                "provider" => pick(PROVIDERS, s).to_string(),
-                "provider_uid" => format!("{}{}", pick(&["gid:", "ghid:", "email:", "aid:"], s), abs),
-                "token" => format!("tok-{}{}", pad(abs, 6), pad((abs >> 8) & 0xffffff, 6)),
-                "event_type" => pick(EVENT_TYPES, s).to_string(),
-                "password_hash" => format!("$2b$12${}{}", pad(abs, 6), pad((abs >> 8) & 0xffff, 4)),
-                _ => format!("{}-{}", c.name, abs),
-            };
-            Value::Str(v)
-        }
+        ColumnKind::Json => Value::Str(match t.name.as_str() {
+            "events" => format!(
+                "{{\"path\":\"/{}\",\"device\":\"{}\",\"ms\":{}}}",
+                pick(&["", "pricing", "docs", "blog", "checkout", "account"], u(1)),
+                pick_w(&[("desktop", 58), ("mobile", 36), ("tablet", 6)], u(2)),
+                lognormal(180.0, 0.6) as i64
+            ),
+            "audit_log" => format!(
+                "{{\"ip\":\"10.{}.{}.{}\",\"ok\":{}}}",
+                (u(1) * 255.0) as u8,
+                (u(2) * 255.0) as u8,
+                (u(3) * 255.0) as u8,
+                u(4) < 0.96
+            ),
+            _ => format!(
+                "{{\"color\":\"{}\",\"weight_kg\":{:.1}}}",
+                pick(&["black", "white", "graphite", "silver", "blue"], u(1)),
+                lognormal(1.2, 0.7)
+            ),
+        }),
+        ColumnKind::Binary => Value::Str(format!("0x{:04x}", mix(row as u64) & 0xffff)),
+        ColumnKind::Text => Value::Str(match c.name.as_str() {
+            "email" => format!(
+                "{}{}@{}",
+                pick(EMAIL_USERS, u(1)),
+                row % 1000,
+                pick_w(EMAIL_HOSTS, u(2))
+            ),
+            "name" => pick(NAMES, u(1)).to_string(),
+            "status" => pick_w(STATUSES, u(1)).to_string(),
+            "title" if t.name == "products" => {
+                format!("{} {}", pick(PRODUCT_WORDS, u(1)), pick(PRODUCT_ADJ, u(2)))
+            }
+            "title" => pick(TITLES, u(1)).to_string(),
+            "sku" => format!("SKU-{}", pad(10_000 + row as u64, 5)),
+            "author" => pick_w(AUTHORS, u(1)).to_string(),
+            "country" => pick_w(COUNTRIES, u(1)).to_string(),
+            "action" => pick_w(ACTIONS, u(1)).to_string(),
+            "actor" => pick_w(ACTORS, u(1)).to_string(),
+            "provider" => pick_w(PROVIDERS, u(1)).to_string(),
+            "provider_uid" => format!("{}:{}", pick_w(PROVIDERS, u(1)), mix(row as u64) % 10_000_000),
+            "token" => format!("tok_{:016x}", mix(row as u64 ^ 0x70)),
+            "event_type" => pick_w(EVENT_TYPES, u(1)).to_string(),
+            "password_hash" => format!("$2b$12${:022x}", mix(row as u64 ^ 0xbc) as u128 * 7919),
+            "session_id" => format!("s_{:012x}", mix(row as u64 ^ 0x5e) & 0xffff_ffff_ffff),
+            "tags" => {
+                let all = ["architecture", "testing", "databases", "career", "devops", "classic"];
+                let a = pick(&all, u(1));
+                let b = pick(&all, u(2));
+                if a == b { a.to_string() } else { format!("{a},{b}") }
+            }
+            _ => format!("{}-{}", c.name, row + 1),
+        }),
     }
 }
 
@@ -552,7 +707,7 @@ impl MockSession {
         meta.columns
             .iter()
             .filter(|c| c.primary_key)
-            .map(|c| gen_value(c, row_id).display())
+            .map(|c| gen_value(meta, c, row_id).display())
             .collect::<Vec<_>>()
             .join("|")
     }
@@ -564,6 +719,13 @@ impl MockSession {
             .map(|c| c.value.display())
             .collect::<Vec<_>>()
             .join("|");
+        // Integer keys are `row_id + 1` (`gen_value`): check that row first.
+        if let [CellChange { value: Value::Int(n), .. }] = pk {
+            let id = n - 1;
+            if (0..meta.row_count as i64).contains(&id) && Self::pk_of(meta, id) == want {
+                return Some(id);
+            }
+        }
         (0..meta.row_count as i64).find(|&id| Self::pk_of(meta, id) == want)
     }
 }
@@ -662,8 +824,35 @@ impl DbSession for MockSession {
             None::<std::future::Ready<()>>,
         )
         .await?;
-        // The mock cannot really run SQL; it reports a plausible outcome
-        // so the editor flow is demoable end-to-end.
+        // `SELECT * FROM [schema.]table [LIMIT n]` is served from the
+        // generated rows, so the results grid and its chart have real data.
+        if let Some((schema, name, n)) = simple_select(sql) {
+            let tree = tree_for(&self.conn);
+            let meta = tree.and_then(|t| {
+                t.schemas
+                    .iter()
+                    .filter(|s| schema.as_ref().is_none_or(|want| s.name.eq_ignore_ascii_case(want)))
+                    .flat_map(|s| s.tables.iter().chain(s.views.iter()))
+                    .find(|t| t.name.eq_ignore_ascii_case(&name))
+                    .cloned()
+            });
+            let Some(meta) = meta else {
+                return Err(DbError::new(format!("query failed: relation \"{name}\" does not exist")));
+            };
+            let take = n.unwrap_or(limit).min(limit);
+            let edits = self.edits.lock().unwrap();
+            let page = mock_page(&edits, &meta, &TableRef::of(&meta), ms, 0, take);
+            return Ok(QueryPage {
+                columns: meta.columns.clone(),
+                rows: page.rows,
+                rows_affected: 0,
+                // More rows exist than the editor keeps.
+                truncated: n.is_none_or(|n| n > limit) && page.total > take,
+                elapsed_ms: ms,
+            });
+        }
+        // Anything else cannot run here; report a plausible outcome so the
+        // editor flow is demoable end-to-end.
         if is_select_like(sql) {
             Ok(QueryPage {
                 columns: vec![ColumnMeta {
@@ -723,7 +912,7 @@ impl DbSession for MockSession {
             .unwrap_or_else(|| {
                 meta.columns
                     .iter()
-                    .map(|c| gen_value(c, row_id))
+                    .map(|c| gen_value(&meta, c, row_id))
                     .collect()
             });
         for ch in &changes {
@@ -902,7 +1091,7 @@ fn mock_page_rows(
                 .updated
                 .get(&(key.clone(), row_id))
                 .cloned()
-                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(c, row_id)).collect())
+                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(t, c, row_id)).collect())
         } else {
             let ins = edits.inserted.get(&key).unwrap();
             ins[(virtual_ix - gen_count) as usize].clone()
@@ -943,7 +1132,7 @@ fn mock_query_page(
                 .updated
                 .get(&(key.clone(), id))
                 .cloned()
-                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(c, id)).collect())
+                .unwrap_or_else(|| t.columns.iter().map(|c| gen_value(t, c, id)).collect())
         })
         .chain(edits.inserted.get(&key).cloned().unwrap_or_default())
         .collect();
@@ -975,6 +1164,33 @@ fn mock_query_page(
     }
 }
 
+/// `SELECT * FROM [schema.]table [LIMIT n][;]` → (schema, table, n);
+/// identifiers may be quoted with `"` or backticks. Anything richer is
+/// `None` (the mock does not interpret SQL).
+fn simple_select(sql: &str) -> Option<(Option<String>, String, Option<u64>)> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let (target, rest) = match words.as_slice() {
+        [s, "*", f, target, rest @ ..]
+            if s.eq_ignore_ascii_case("select") && f.eq_ignore_ascii_case("from") =>
+        {
+            (*target, rest)
+        }
+        _ => return None,
+    };
+    let n = match rest {
+        [] => None,
+        [l, n] if l.eq_ignore_ascii_case("limit") => Some(n.parse::<u64>().ok()?),
+        _ => return None,
+    };
+    let unquote = |s: &str| s.trim_matches(|c| c == '"' || c == '`').to_string();
+    let (schema, name) = match target.split_once('.') {
+        Some((s, t)) => (Some(unquote(s)), unquote(t)),
+        None => (None, unquote(target)),
+    };
+    (!name.is_empty()).then_some((schema, name, n))
+}
+
 /// Seconds of a `sleep(n)` / `pg_sleep(n)` call in a mock statement, as
 /// milliseconds (capped at a minute).
 fn mock_sleep_ms(sql: &str) -> u32 {
@@ -999,5 +1215,62 @@ mod tests {
         assert_eq!(super::mock_sleep_ms("select SLEEP( 0.5 )"), 500);
         assert_eq!(super::mock_sleep_ms("SELECT 1"), 0);
         assert_eq!(super::mock_sleep_ms("SELECT sleep(9999)"), 60_000);
+    }
+
+    #[test]
+    fn demo_data_looks_real() {
+        use super::*;
+        let tree = trees().iter().find(|t| t.connection_id == "mysql-analytics").unwrap();
+        let wh = &tree.schemas[0];
+        let events = wh.tables.iter().find(|t| t.name == "events").unwrap();
+        let col = |t: &TableMeta, n: &str| t.columns.iter().find(|c| c.name == n).unwrap().clone();
+
+        // Deterministic, sequential keys.
+        let id = col(events, "id");
+        assert_eq!(gen_value(events, &id, 41), Value::Int(42));
+        let et = col(events, "event_type");
+        assert_eq!(gen_value(events, &et, 7), gen_value(events, &et, 7));
+
+        // Skewed categories: page views far outnumber purchases.
+        let mut views = 0;
+        let mut purchases = 0;
+        for r in 0..5_000 {
+            match gen_value(events, &et, r) {
+                Value::Str(s) if s == "page_view" => views += 1,
+                Value::Str(s) if s == "purchase" => purchases += 1,
+                _ => {}
+            }
+        }
+        assert!(views > 4 * purchases, "{views} vs {purchases}");
+
+        // Timestamps fall in the demo year.
+        let ts = col(events, "ts");
+        for r in 0..500 {
+            let Value::Str(s) = gen_value(events, &ts, r) else { panic!() };
+            assert!(s.as_str() >= "2025-11-15" && s.as_str() <= "2026-11-15 23:59:59", "{s}");
+        }
+
+        // The daily series trends upward and dips on weekends.
+        let daily = wh.views.iter().find(|t| t.name == "daily_events").unwrap();
+        let ev = col(daily, "event_count");
+        let n = |r: i64| match gen_value(daily, &ev, r) { Value::Int(n) => n, _ => 0 };
+        let first: i64 = (0..28).map(n).sum();
+        let last: i64 = (300..328).map(n).sum();
+        assert!(last > first * 3 / 2, "{first} → {last}");
+        let day = col(daily, "day");
+        assert_eq!(gen_value(daily, &day, 364), Value::Str("2026-11-15".into()));
+    }
+
+    #[test]
+    fn simple_selects_are_recognised() {
+        use super::simple_select;
+        assert_eq!(simple_select("SELECT * FROM events LIMIT 100"), Some((None, "events".into(), Some(100))));
+        assert_eq!(
+            simple_select("select * from \"public\".`users`;"),
+            Some((Some("public".into()), "users".into(), None))
+        );
+        assert_eq!(simple_select("SELECT id FROM events"), None);
+        assert_eq!(simple_select("SELECT * FROM events WHERE id = 1"), None);
+        assert_eq!(simple_select("SELECT * FROM events LIMIT x"), None);
     }
 }

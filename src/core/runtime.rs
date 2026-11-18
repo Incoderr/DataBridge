@@ -63,3 +63,14 @@ where
     });
     rx
 }
+
+/// A reqwest client for the HTTP users (AI chat, updater, ClickHouse).
+/// reqwest is built without a bundled crypto provider; sqlx already links
+/// rustls+ring, so reuse it (installing twice is a no-op).
+pub fn http_client() -> Result<reqwest::Client, crate::core::error::DbError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| crate::core::error::DbError::with_source("cannot create the HTTP client", e))
+}

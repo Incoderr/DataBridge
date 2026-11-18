@@ -50,6 +50,10 @@ static EXTRA_ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/play.svg", include_bytes!("../../assets/icons/play.svg")),
     ("icons/stop.svg", include_bytes!("../../assets/icons/stop.svg")),
+    // Results pane chart toggle / kinds (chart-pie is in the kit's set).
+    ("icons/chart-column.svg", include_bytes!("../../assets/icons/chart-column.svg")),
+    ("icons/chart-line.svg", include_bytes!("../../assets/icons/chart-line.svg")),
+    ("icons/chart-area.svg", include_bytes!("../../assets/icons/chart-area.svg")),
 ];
 
 pub struct AppAssets;

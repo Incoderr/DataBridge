@@ -3,6 +3,7 @@
 
 pub mod ai_chat;
 pub mod app;
+pub mod chart;
 pub mod assets;
 pub mod completion;
 pub mod connect;
@@ -13,4 +14,5 @@ pub mod query;
 pub mod settings;
 pub mod sidebar;
 pub mod theme;
+pub mod update;
 pub mod workspace;

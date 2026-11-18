@@ -3,6 +3,7 @@
 //! the Stage-3 recent-connections store.
 
 pub mod ai;
+pub mod chart;
 pub mod completion;
 pub mod error;
 pub mod mock;
@@ -11,3 +12,4 @@ pub mod registry;
 pub mod runtime;
 pub mod session;
 pub mod storage;
+pub mod update;

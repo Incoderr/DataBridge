@@ -50,6 +50,8 @@ fn main() {
         eprintln!("DataBridge: unknown argument {a} (see --help)");
     }
     core::registry::init(args.iter().any(|a| a == "--mock"));
+    // Leftovers of a previous self-update (the replaced exe).
+    core::update::cleanup();
 
     let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
         include_bytes!("../assets/fonts/PublicSans-Regular.ttf")

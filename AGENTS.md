@@ -65,7 +65,9 @@ src/
     mock.rs       # deterministic mock (the original mock layer, ported from the web app)
     storage.rs    # Stage-3 recent-connections store: connections.json + OS keyring secrets
     completion.rs # SQL autocompletion engine (pure: text + cursor + schema tree -> suggestions)
+    chart.rs      # result-set charts (pure): axis suggestion, grouping/aggregation, caps
     ai.rs         # Stage 6: OpenAI-compatible chat client (SSE streaming), providers + presets in ai.json, keys in keyring, schema prompt
+    update.rs     # self-update: latest GitHub release check, exe download + SHA-256, rename-swap of the running exe
   drivers/
     postgres.rs   # sqlx, feature "postgres"
     mysql.rs      # sqlx, feature "mysql"
@@ -73,6 +75,7 @@ src/
     mongo/        # own light client, always compiled: mod.rs (DbSession), wire.rs (OP_MSG + TLS),
                   #   scram.rs (SCRAM-SHA-256/1), uri.rs (mongodb[+srv]:// parse), dns.rs (SRV/TXT),
                   #   shell.rs (mongosh subset)
+    clickhouse.rs # HTTP interface via reqwest (always compiled): JSONCompactEachRow stream, query parameters
     ssh.rs        # SSH tunnels (russh, always compiled): TunneledSession wraps any driver
     redis.rs      # feature "redis"   (stage 4 — later)
   ui/
@@ -86,6 +89,8 @@ src/
     query.rs      # SQL editor tab (Stage 5): `Editor`/`EditorState` (sql), run/stop button, results grid
     completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
     ai_chat.rs    # right-hand AI chat panel (AiChatView entity), toggled from the left rail
+    chart.rs      # draws core::chart data with gpui-component charts (bar/line/area/pie)
+    update.rs     # updater UI: startup check, bottom-right "update available" card, Settings → Updates
     theme.rs      # dark/light palettes, Palette struct, MONO_FONT
     settings.rs   # UiScale global
     assets.rs     # AssetSource: brand icons, extra lucide icons, fallback to gpui-kit-assets
@@ -180,7 +185,8 @@ default = ["postgres", "mysql", "sqlite"]
 
 MongoDB has **no** feature: it is our own client on top of `bson` (all
 its other crates are already in the tree via sqlx/reqwest), so it is
-always compiled in. A `redis` feature is declared only when implemented
+always compiled in. Neither has ClickHouse: it talks to the HTTP
+interface through the `reqwest` the AI chat already needs. A `redis` feature is declared only when implemented
 (stage 4); its `DbType` variant already exists as a stub (see below). The mock is
 always available; `cargo check --no-default-features` must always pass
 (mock-only demo build).
@@ -248,6 +254,26 @@ SRV name's parent domain; TXT may set only `authSource`/`replicaSet`/
 `loadBalanced`; TLS defaults on. Not supported: x.509/LDAP/Kerberos,
 compression, relations (diagram is empty).
 
+**Works for real (HTTP):** ClickHouse (`drivers/clickhouse.rs`) over
+the HTTP interface — 8123, TLS 8443 (`clickhouse://`, `clickhouses://`
+or `?secure=true`; plain `http(s)://` URLs keep ports 80/443, e.g. a
+proxy or `https://explorer@play.clickhouse.com`). Native ports
+9000/9440 are refused with a hint. One POST per statement, answered in
+`JSONCompactEachRowWithNamesAndTypes` and read as a stream: the read
+stops at the editor's limit and drops the socket (the server aborts), so
+an unbounded SELECT never buffers everything; a body in another format
+(user `FORMAT CSV`) becomes one `result` column. Filter values go as
+ClickHouse query parameters (`{f0:Int64}` + `param_f0`, TSV-escaped),
+inserts as `FORMAT JSONEachRow` data — never spliced into SQL. Tree:
+`system.databases/tables/columns` in three parallel queries (system DBs
+and `.inner` MV tables hidden); MATERIALIZED / ALIAS / EPHEMERAL columns
+are left out because `SELECT *` skips them. No column is `primary_key`
+(sorting keys are not unique), so the record editor inserts only — no
+edit / delete. Totals: `system.tables.total_rows` (exact, MergeTree)
+when unfiltered, else `count()`. Stop = `KILL QUERY WHERE query_id = …
+ASYNC`. No relations (diagram empty). Live test against a server:
+`CLICKHOUSE_URL=… cargo test clickhouse_live -- --ignored`.
+
 **SSH tunnels** (`drivers/ssh.rs`, russh with ring crypto): a connection
 with `DbConnection::ssh` (`SshConfig`: host, port, user, `SshAuth::{Password,
 Key, Agent}`, key path; the password / passphrase is keyring-only) gets a
@@ -267,14 +293,20 @@ seed lists and `+srv` URLs; TLS that verifies the server name sees
 `127.0.0.1`. Tested end-to-end against an in-process russh server
 (`tunnel_forwards_and_checks_host_keys`).
 
-**Stubs:** Redis, ClickHouse, Cassandra, ScyllaDB exist in
+**Stubs:** Redis, Cassandra, ScyllaDB exist in
 `DbType` (brand icons, ports, URL placeholders) but have no driver.
 `registry::open` returns a "not supported in this build" error for them
 (and for drivers compiled out) — never the mock: fake demo tables must not
 pass for the user's database. `registry::is_supported` mirrors that: the
 wizard's Choose screen lists every type and dims the unsupported ones. Only `--mock` serves every type from
-`core/mock.rs` (deterministic md5-seeded rows, simulated latency, seeded
-wizard list).
+`core/mock.rs` (deterministic rows — a pure function of table, column
+and row id, shaped like real data for the charts: skewed categories,
+log-normal money, a year of timestamps ending 2026-11-15 with growth
+and weekend dips, `daily_events` = trend + weekly seasonality, funnel
+steps thinning out, sequential integer keys; simulated latency, seeded
+wizard list). Its SQL tab answers `SELECT * FROM [schema.]table [LIMIT n]`
+with the generated rows (`simple_select`); any other statement gets a
+"demo mode" note row.
 
 **Behaviors worth knowing:**
 - Recents (`core/storage.rs`): `connections.json` in the platform config
@@ -327,6 +359,23 @@ wizard list).
   schema + the empty workspace) seeds a dialect `CREATE TABLE`; DDL runs
   reload the tree via `DataBridge::reload_schemas` (stale-guarded by
   `schemas_id`).
+- Charts of query results (`core/chart.rs` + `ui/chart.rs`, header of
+  the SQL tab's results pane): Table / Chart switch; `chart::suggest`
+  picks X (first date-like column, else first non-numeric, else first)
+  and up to `MAX_SERIES` numeric Y columns (typed Int/Float, or ≥90 % of
+  text cells parse as numbers — ClickHouse 64-bit / SQLite text);
+  dates → line, categories → bar, nothing numeric → row count. Repeated
+  X values aggregate (sum/avg/min/max/count); timestamps bucket by day,
+  by month past `MAX_DAYS` (120) distinct days; date and number axes sort,
+  bar / pie categories rank by value with the tail folded into "other"
+  after `MAX_CATEGORIES`, line / area keep the first `MAX_POINTS`. Kind,
+  X, Y (multi for line/area, single for bar/pie) and aggregation are
+  dropdowns; the spec survives re-runs with the same column names.
+  Drawn with gpui-component's `chart` module (no new crates), colors
+  `palette.chart_1..5`; Lucide chart glyphs live in `assets/icons`
+  (only `chart-pie` is in the kit's embedded default set). Charts cover
+  the ≤ `RESULT_LIMIT` rows the query returned — aggregate in SQL for
+  more.
 - SQL autocompletion (`core/completion.rs`, DataGrip-style, tested in
   core): tables after FROM/JOIN/INTO/UPDATE/TABLE, columns after
   `alias.` (aliases resolved from the whole statement, so `SELECT c.|
@@ -425,6 +474,18 @@ wizard list).
   translated on purpose: driver/server error messages, SQL, brand names,
   `PK`/`FK`/`NULL`. Text already sitting in an input (placeholders of
   open views) updates when the view is recreated.
+- Self-update (`core/update.rs` + `ui/update.rs`): release builds ask
+  `api.github.com/repos/Incoderr/DataBridge/releases/latest` at startup
+  (Settings → Updates: toggle + "Check now"; `AppSettings::check_updates`).
+  A newer tag (`is_newer`, `v` prefix optional) shows a bottom-right card.
+  Install (Windows release builds only, `can_install`): downloads the
+  release assets `databridge-windows-x64.exe` + `.sha256` (published by
+  CI — keep the names in step), verifies the hash, renames the running exe
+  to `*.old` and moves the download in its place (rolled back on failure),
+  then "Restart now" spawns the new exe and quits; `update::cleanup` in
+  `main` removes the `.old`. Releases without those assets (≤ v0.2.0) and
+  other platforms get a link to the release page. Stale-guarded by
+  `update_id`. Version bumps: `Cargo.toml` `version` must match the tag.
 - Theme (`ui/theme.rs`): use `theme::palette(cx)`; no hardcoded colors
   except `DbType::brand_color()` and grid type tokens (`kind_color`).
   Brand glyphs must be registered in `ui/assets.rs` (`brand/*.svg`).
@@ -456,7 +517,8 @@ wizard list).
   font — `ui::settings::restore` in `main`, `persist` on every change).
   **Done.**
 - **Stage 4 — Mongo + Redis.** **Mongo done** — own client instead of
-  the `mongodb` crate (see Current state). Next: Redis (`redis` with
+  the `mongodb` crate (see Current state). **ClickHouse done** (HTTP
+  interface, no new crates). Next: Redis (`redis` with
   `tokio-comp`).
 - **Stage 5 — query editor.** `execute(sql)`, result tabs, cancellation (reuse the
   stale-guard/load_id mechanism). **Mostly done.** `execute` + the simplified
@@ -555,5 +617,10 @@ wizard list).
   previous frame's bounds, so a fresh table paints without them until an
   unrelated repaint (mouse move). Used by `RecordsView::new` and
   `QueryView::apply_result`.
+- **Windows main-thread stack is 8 MB (`build.rs`, `/STACK`).** The
+  default 1 MB overflowed in debug builds once the SQL results pane grew
+  its chart header ("thread 'main' has overflowed its stack" — GPUI
+  renders the element tree recursively, debug frames are large). Keep
+  the build script; deep new views are not a reason to shrink it.
 - `/site` has its own ignore rules and lockfile (pnpm). The root `.gitignore` only
   lists `/target` — that is intentional.

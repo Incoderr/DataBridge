@@ -99,11 +99,13 @@ pub struct AppSettings {
     pub editor_font: f32,
     /// UI language: `"en"` or `"ru"`.
     pub language: String,
+    /// Look for a newer GitHub release at startup (`core::update`).
+    pub check_updates: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { ui_scale: "normal".into(), dark: true, editor_font: 14.0, language: "en".into() }
+        Self { ui_scale: "normal".into(), dark: true, editor_font: 14.0, language: "en".into(), check_updates: true }
     }
 }
 

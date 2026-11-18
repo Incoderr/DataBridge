@@ -4,7 +4,9 @@
 # - every push to main / PR: tests, the mock-only build, a release build;
 #   the zipped exe is kept as a workflow artifact for 14 days.
 # - a pushed tag `v*` (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
-#   the same build, attached to a GitHub Release for that tag.
+#   the same build, attached to a GitHub Release for that tag: the zip plus
+#   the bare `databridge-windows-x64.exe` and its `.sha256` — the in-app
+#   updater (src/core/update.rs) downloads those two; keep the names.
 name: Windows build
 
 on:
@@ -52,11 +54,19 @@ jobs:
           Copy-Item target/release/databridge.exe dist/
           Compress-Archive -Path dist/databridge.exe -DestinationPath "$name.zip" -Force
           "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Self-update assets (names fixed in src/core/update.rs).
+          $exe = "databridge-windows-x64.exe"
+          Copy-Item target/release/databridge.exe $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  $exe" | Out-File -FilePath "$exe.sha256" -Encoding ascii -NoNewline
 
       - uses: actions/upload-artifact@v4
         with:
           name: databridge-windows-x64
-          path: ${{ env.ZIP }}
+          path: |
+            ${{ env.ZIP }}
+            databridge-windows-x64.exe
+            databridge-windows-x64.exe.sha256
           retention-days: 14
 
   release:
@@ -72,5 +82,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: "*.zip"
+          files: |
+            *.zip
+            databridge-windows-x64.exe
+            databridge-windows-x64.exe.sha256
           generate_release_notes: true

@@ -87,9 +87,9 @@ impl DbType {
             DbType::Sqlite => 0,
             DbType::MongoDb => 27017,
             DbType::Redis => 6379,
-            // ClickHouse native protocol; the HTTP interface is 8123.
             DbType::MariaDb => 3306,
-            DbType::ClickHouse => 9000,
+            // The HTTP interface (drivers/clickhouse.rs); TLS is 8443.
+            DbType::ClickHouse => 8123,
             DbType::Cassandra => 9042,
             DbType::ScyllaDb => 9042,
         }
@@ -679,8 +679,7 @@ impl FilterOp {
         !matches!(self, FilterOp::IsNull | FilterOp::NotNull)
     }
 
-    #[cfg_attr(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")), allow(dead_code))]
-    fn sql(self) -> &'static str {
+    pub(crate) fn sql(self) -> &'static str {
         match self {
             FilterOp::Eq => "=",
             FilterOp::Ne => "<>",

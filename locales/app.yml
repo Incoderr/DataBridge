@@ -32,6 +32,67 @@ settings.language:
   en: Language
   ru: Язык
 
+update.section:
+  en: Updates
+  ru: Обновления
+update.version:
+  en: "DataBridge %{current}"
+  ru: "DataBridge %{current}"
+update.check_now:
+  en: "Check now"
+  ru: "Проверить"
+update.checking:
+  en: "Checking for updates…"
+  ru: "Проверка обновлений…"
+update.up_to_date:
+  en: "You have the latest version."
+  ru: "Установлена последняя версия."
+update.available_short:
+  en: "Version %{new} is available."
+  ru: "Доступна версия %{new}."
+update.auto_check:
+  en: "Check for updates at startup"
+  ru: "Проверять обновления при запуске"
+update.available:
+  en: "Update available"
+  ru: "Доступно обновление"
+update.available_body:
+  en: "DataBridge %{new} is out (you have %{current})."
+  ru: "Вышла DataBridge %{new} (у вас %{current})."
+update.downloading:
+  en: "Downloading update…"
+  ru: "Загрузка обновления…"
+update.progress:
+  en: "%{done} of %{total} MB"
+  ru: "%{done} из %{total} МБ"
+update.progress_unknown:
+  en: "%{done} MB"
+  ru: "%{done} МБ"
+update.ready:
+  en: "Update installed"
+  ru: "Обновление установлено"
+update.ready_body:
+  en: "Restart DataBridge to run version %{new}."
+  ru: "Перезапустите DataBridge, чтобы перейти на версию %{new}."
+update.failed:
+  en: "Update failed"
+  ru: "Не удалось обновить"
+update.release_page:
+  en: "Release notes"
+  ru: "Что нового"
+update.install:
+  en: "Download and install"
+  ru: "Скачать и установить"
+update.retry:
+  en: "Try again"
+  ru: "Повторить"
+update.restart:
+  en: "Restart now"
+  ru: "Перезапустить"
+update.later:
+  en: "Later"
+  ru: "Позже"
+
 sidebar.new_connection:
   en: "New connection"
   ru: "Новое подключение"
@@ -683,3 +744,52 @@ filter.is_null:
 filter.not_null:
   en: "is not null"
   ru: "не пусто"
+
+chart.table:
+  en: "Table"
+  ru: "Таблица"
+chart.title:
+  en: "Chart"
+  ru: "График"
+chart.nothing:
+  en: "Nothing to plot: the result has no rows."
+  ru: "Нечего строить: в результате нет строк."
+chart.bar:
+  en: "Bar chart"
+  ru: "Столбцы"
+chart.line:
+  en: "Line chart"
+  ru: "Линии"
+chart.area:
+  en: "Area chart"
+  ru: "Области"
+chart.pie:
+  en: "Pie chart"
+  ru: "Круговая"
+chart.agg_hint:
+  en: "How rows with the same X value combine"
+  ru: "Как объединять строки с одинаковым X"
+chart.agg_sum:
+  en: "Sum"
+  ru: "Сумма"
+chart.agg_avg:
+  en: "Average"
+  ru: "Среднее"
+chart.agg_min:
+  en: "Minimum"
+  ru: "Минимум"
+chart.agg_max:
+  en: "Maximum"
+  ru: "Максимум"
+chart.agg_count:
+  en: "Row count"
+  ru: "Число строк"
+chart.other:
+  en: "other"
+  ru: "прочее"
+chart.clipped_categories:
+  en: "top %{n}, the rest in “other”"
+  ru: "топ-%{n}, остальное в «прочее»"
+chart.clipped_points:
+  en: "first %{n} points"
+  ru: "первые %{n} точек"

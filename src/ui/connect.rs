@@ -411,7 +411,12 @@ impl DataBridge {
         let d = &self.wizard.draft;
         let is_embedded = d.db_type == DbType::Sqlite;
         let url_mode = d.url_mode;
-        let error = self.wizard.error.clone();
+        // (message, success): an error wins over a stale success notice.
+        let notice = match &self.wizard.error {
+            Some(e) => Some((e.clone(), false)),
+            None if self.wizard.test_ok => Some((tr!("connect.test_ok").to_string(), true)),
+            None => None,
+        };
         let chosen = self
             .wizard
             .chosen_existing
@@ -541,8 +546,7 @@ impl DataBridge {
                     })
             })
             .when(!is_embedded, |this| this.child(ssh_section(d, cx)))
-            .when_some(error, |this, e| {
-                let success = e.to_lowercase().contains("success");
+            .when_some(notice, |this, (e, success)| {
                 let (border, bg, fg) = if success {
                     (p.conn_ok, p.conn_ok, p.conn_ok)
                 } else {
@@ -635,6 +639,7 @@ impl DataBridge {
                             this.wizard.phase = Phase::Choose;
                             this.wizard.chosen_existing = None;
                             this.wizard.error = None;
+                            this.wizard.test_ok = false;
                             cx.notify();
                         })),
                 )
@@ -665,6 +670,7 @@ impl DataBridge {
     pub fn pick_type(&mut self, t: DbType, window: &mut Window, cx: &mut Context<Self>) {
         self.wizard.draft = Draft::new(t, window, cx);
         self.wizard.error = None;
+        self.wizard.test_ok = false;
         self.wizard.phase = Phase::Form;
         cx.notify();
     }
@@ -715,6 +721,7 @@ impl DataBridge {
         self.wizard.draft = draft;
         self.wizard.chosen_existing = Some(id.to_string());
         self.wizard.error = None;
+        self.wizard.test_ok = false;
         self.wizard.phase = Phase::Form;
         cx.notify();
     }
@@ -733,6 +740,7 @@ impl DataBridge {
         };
         self.wizard.testing = true;
         self.wizard.error = None;
+        self.wizard.test_ok = false;
         if final_connect {
             self.wizard.phase = Phase::Testing;
         }
@@ -759,7 +767,7 @@ impl DataBridge {
                         if final_connect {
                             db.on_connected(conn, cx);
                         } else {
-                            db.wizard.error = Some(tr!("connect.test_ok").into());
+                            db.wizard.test_ok = true;
                         }
                     }
                     Ok(Err(e)) => {
@@ -827,6 +835,7 @@ impl DataBridge {
         self.wizard.draft = draft;
         self.wizard.chosen_existing = None;
         self.wizard.error = None;
+        self.wizard.test_ok = false;
         self.wizard.phase = Phase::Form;
         cx.notify();
         self.run_test(true, window, cx);
@@ -1298,7 +1307,7 @@ impl Draft {
             DbType::MongoDb => "mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/database",
             DbType::Redis => "redis://localhost:6379",
             DbType::MariaDb => "mariadb://user:password@localhost:3306/database",
-            DbType::ClickHouse => "clickhouse://user:password@localhost:9000/database",
+            DbType::ClickHouse => "clickhouse://user:password@localhost:8123/database",
             DbType::Cassandra => "cassandra://user:password@localhost:9042/keyspace",
             DbType::ScyllaDb => "scylla://user:password@localhost:9042/keyspace",
         };

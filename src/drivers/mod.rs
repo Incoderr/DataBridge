@@ -2,13 +2,15 @@
 //!
 //! The sqlx drivers are gated behind their cargo features (`postgres` /
 //! `mysql` / `sqlite`); MongoDB is our own light client (only `bson`
-//! beyond crates already in the tree) and always compiled in. Drivers are
+//! beyond crates already in the tree) and ClickHouse speaks its HTTP
+//! interface through `reqwest` — both always compiled in. Drivers are
 //! reachable only through `core::registry` — the UI never imports them.
 //! `ssh` wraps any of them in an SSH tunnel (russh). Stage 4 next: Redis.
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
 mod util;
 
+pub mod clickhouse;
 pub mod mongo;
 pub mod ssh;
 #[cfg(feature = "mysql")]
