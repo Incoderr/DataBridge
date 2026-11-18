@@ -11,7 +11,7 @@ use gpui::{Context, Entity, IntoElement, ParentElement, Styled, Subscription, Wi
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::{Icon, IconName, Sizable, h_flex, v_flex};
+use gpui_component::{Icon, IconName, h_flex, v_flex};
 
 use crate::core::model::{ColumnKind, Filter, FilterOp, parse_filter_value};
 use crate::ui::theme;
@@ -146,12 +146,11 @@ impl RecordsView {
         let view = cx.entity().downgrade();
         let columns: Vec<String> = self.table.columns.iter().map(|c| c.name.clone()).collect();
 
-        let mut rows = v_flex().gap_1();
+        let mut rows = v_flex().gap_2();
         for (ix, r) in self.filter_rows.iter().enumerate() {
             let col_menu = {
                 let (view, columns) = (view.clone(), columns.clone());
                 Button::new(("flt-col", ix))
-                    .xsmall()
                     .outline()
                     .label(if r.column.is_empty() { tr!("filter.column").to_string() } else { r.column.clone() })
                     .dropdown_menu(move |menu, _, _| {
@@ -168,7 +167,6 @@ impl RecordsView {
             let op_menu = {
                 let view = view.clone();
                 Button::new(("flt-op", ix))
-                    .xsmall()
                     .outline()
                     .label(op_label(r.op))
                     .dropdown_menu(move |menu, _, _| {
@@ -188,22 +186,21 @@ impl RecordsView {
                     .items_center()
                     .child(
                         div()
-                            .w(theme::scaled(34.))
+                            .w(theme::scaled(48.))
                             .flex_none()
-                            .text_size(theme::scaled(theme::TEXT_XS))
+                            .text_size(theme::scaled(theme::TEXT_SM))
                             .text_color(p.muted_fg)
                             .child(if ix == 0 { tr!("filter.where") } else { tr!("filter.and") }),
                     )
                     .child(col_menu)
                     .child(op_menu)
                     .child(if r.op.takes_value() {
-                        div().flex_1().min_w_0().child(Input::new(&r.input).xsmall()).into_any_element()
+                        div().flex_1().min_w_0().child(Input::new(&r.input)).into_any_element()
                     } else {
                         div().flex_1().into_any_element()
                     })
                     .child(
                         Button::new(("flt-del", ix))
-                            .xsmall()
                             .ghost()
                             .icon(Icon::new(IconName::Close))
                             .tooltip(tr!("filter.remove"))
@@ -219,7 +216,6 @@ impl RecordsView {
             .items_center()
             .child(
                 Button::new("flt-add")
-                    .xsmall()
                     .ghost()
                     .icon(Icon::new(IconName::Plus))
                     .label(tr!("filter.add"))
@@ -229,21 +225,19 @@ impl RecordsView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(theme::scaled(theme::TEXT_XS))
+                    .text_size(theme::scaled(theme::TEXT_SM))
                     .text_color(p.conn_err)
                     .truncate()
                     .children(self.filter_error.clone()),
             )
             .child(
                 Button::new("flt-clear")
-                    .xsmall()
                     .ghost()
                     .label(tr!("filter.clear"))
                     .on_click(cx.listener(|this, _, window, cx| this.clear_filters(window, cx))),
             )
             .child(
                 Button::new("flt-apply")
-                    .xsmall()
                     .primary()
                     .label(tr!("filter.apply"))
                     .on_click(cx.listener(|this, _, _, cx| this.apply_filters(cx))),
@@ -251,7 +245,7 @@ impl RecordsView {
 
         v_flex()
             .flex_none()
-            .gap_1()
+            .gap_2()
             .px_3()
             .py_2()
             .border_b_1()

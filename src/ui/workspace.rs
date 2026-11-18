@@ -1651,7 +1651,7 @@ impl Render for RecordsView {
         let exporting = self.exporting;
 
         let toolbar = h_flex()
-            .h(theme::scaled(36.))
+            .h(theme::scaled(theme::TOOLBAR_H))
             .flex_none()
             .items_center()
             .gap_1()
@@ -1661,8 +1661,8 @@ impl Render for RecordsView {
             .bg(p.toolbar)
             .child(icon_btn(
                 "stop",
-                32.,
-                svg().path("icons/stop.svg").size_3p5().text_color(if loading { p.conn_err } else { p.muted_fg }),
+                theme::CONTROL_H,
+                svg().path("icons/stop.svg").size_4().text_color(if loading { p.conn_err } else { p.muted_fg }),
                 loading,
                 hover,
                 None,
@@ -1676,8 +1676,8 @@ impl Render for RecordsView {
             ))
             .child(icon_btn(
                 "reload",
-                32.,
-                svg().path("icons/redo-2.svg").size_3p5().text_color(p.muted_fg),
+                theme::CONTROL_H,
+                svg().path("icons/redo-2.svg").size_4().text_color(p.muted_fg),
                 !loading,
                 hover,
                 None,
@@ -1690,8 +1690,8 @@ impl Render for RecordsView {
             // Simplified editor: insert / edit / delete the selected row.
             .child(icon_btn(
                 "row-insert",
-                32.,
-                svg().path("icons/plus.svg").size_3p5().text_color(p.foreground),
+                theme::CONTROL_H,
+                svg().path("icons/plus.svg").size_4().text_color(p.foreground),
                 !editor_open,
                 hover,
                 None,
@@ -1699,8 +1699,8 @@ impl Render for RecordsView {
             ))
             .child(icon_btn(
                 "row-edit",
-                32.,
-                svg().path("icons/pencil.svg").size_3p5().text_color(if sel_some { p.primary } else { p.muted_fg }),
+                theme::CONTROL_H,
+                svg().path("icons/pencil.svg").size_4().text_color(if sel_some { p.primary } else { p.muted_fg }),
                 sel_some && has_pk && !editor_open,
                 hover,
                 None,
@@ -1708,8 +1708,8 @@ impl Render for RecordsView {
             ))
             .child(icon_btn(
                 "row-delete",
-                32.,
-                svg().path("icons/trash-2.svg").size_3p5().text_color(if sel_some { p.conn_err } else { p.muted_fg }),
+                theme::CONTROL_H,
+                svg().path("icons/trash.svg").size_4().text_color(if sel_some { p.conn_err } else { p.muted_fg }),
                 sel_some && has_pk && !editor_open,
                 hover,
                 None,
@@ -1718,8 +1718,8 @@ impl Render for RecordsView {
             .child(sep(&p))
             .child(icon_btn(
                 "view-data",
-                32.,
-                svg().path("icons/table.svg").size_3p5().text_color(p.foreground),
+                theme::CONTROL_H,
+                svg().path("icons/table.svg").size_4().text_color(p.foreground),
                 true,
                 hover,
                 (!cards).then_some(p.accent),
@@ -1732,8 +1732,8 @@ impl Render for RecordsView {
             .when(has_docs, |t| {
                 t.child(icon_btn(
                     "view-json",
-                    32.,
-                    svg().path("icons/braces.svg").size_3p5().text_color(p.foreground),
+                    theme::CONTROL_H,
+                    svg().path("icons/braces.svg").size_4().text_color(p.foreground),
                     true,
                     hover,
                     cards.then_some(p.accent),
@@ -1745,8 +1745,8 @@ impl Render for RecordsView {
             })
             .child(icon_btn(
                 "sql",
-                32.,
-                Icon::new(IconName::SquareTerminal).with_size(Size::Size(px(14.))),
+                theme::CONTROL_H,
+                Icon::new(IconName::SquareTerminal).size_4(),
                 true,
                 hover,
                 None,
@@ -1764,10 +1764,10 @@ impl Render for RecordsView {
             .child(
                 icon_btn(
                     "filter",
-                    32.,
+                    theme::CONTROL_H,
                     svg()
                         .path("icons/filter.svg")
-                        .size_3p5()
+                        .size_4()
                         .text_color(if filters > 0 || self.show_filter { p.primary } else { p.muted_fg }),
                     true,
                     hover,
@@ -1786,8 +1786,8 @@ impl Render for RecordsView {
             .child(
                 icon_btn(
                     "export",
-                    32.,
-                    svg().path("icons/download.svg").size_3p5().text_color(if self.exporting { p.primary } else { p.muted_fg }),
+                    theme::CONTROL_H,
+                    svg().path("icons/download.svg").size_4().text_color(if self.exporting { p.primary } else { p.muted_fg }),
                     true,
                     hover,
                     self.exporting.then_some(p.accent),
@@ -1812,9 +1812,9 @@ impl Render for RecordsView {
             .child(div().flex_1())
             .child(icon_btn(
                 "detail",
-                32.,
+                theme::CONTROL_H,
                 Icon::new(IconName::Info)
-                    .with_size(Size::Size(px(14.)))
+                    .size_4()
                     .text_color(if self.show_detail { p.primary } else { p.muted_fg }),
                 true,
                 hover,
@@ -1985,11 +1985,11 @@ impl Render for RecordsView {
                                         .child(
                                             if is_copied {
                                                 Icon::new(IconName::Check)
-                                                    .with_size(Size::Size(px(13.)))
+                                                    .size_4()
                                                     .text_color(p.conn_ok)
                                             } else {
                                                 Icon::new(IconName::Copy)
-                                                    .with_size(Size::Size(px(13.)))
+                                                    .size_4()
                                                     .text_color(p.muted_fg)
                                             },
                                         )
@@ -2104,7 +2104,7 @@ impl Render for RecordsView {
             .child(icon_btn(
                 "prev",
                 24.,
-                Icon::new(IconName::ChevronLeft).with_size(Size::Size(px(13.))),
+                Icon::new(IconName::ChevronLeft).size_4(),
                 page > 0,
                 p.tree_hover,
                 None,
@@ -2116,7 +2116,7 @@ impl Render for RecordsView {
             .child(icon_btn(
                 "next",
                 24.,
-                Icon::new(IconName::ChevronRight).with_size(Size::Size(px(13.))),
+                Icon::new(IconName::ChevronRight).size_4(),
                 has_next,
                 p.tree_hover,
                 None,
@@ -2137,7 +2137,7 @@ impl Render for RecordsView {
                 .text_color(p.conn_err)
                 .text_size(theme::scaled(theme::TEXT_MD))
                 .gap_2()
-                .child(Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(16.))))
+                .child(Icon::new(IconName::TriangleAlert).size(theme::scaled(theme::ICON_LG)))
                 .child(e)
         });
 
@@ -2291,7 +2291,6 @@ impl crate::ui::app::DataBridge {
                                 this.child(
                                     Button::new("empty-new-table")
                                         .primary()
-                                        .small()
                                         .icon(IconName::Plus)
                                         .label(tr!("common.new_table"))
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -2302,7 +2301,6 @@ impl crate::ui::app::DataBridge {
                             .child(
                                 Button::new("empty-new-query")
                                     .ghost()
-                                    .small()
                                     .icon(IconName::SquareTerminal)
                                     .label(tr!("ws.new_query"))
                                     .on_click(cx.listener(|this, _, window, cx| {

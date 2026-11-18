@@ -324,10 +324,10 @@ fn canvas_btn(
     hover: Hsla,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
-    use gpui_component::{Icon, Sizable, Size};
+    use gpui_component::Icon;
     div()
         .id(id)
-        .size(px(28.))
+        .size(theme::scaled(theme::CONTROL_H))
         .flex()
         .flex_none()
         .items_center()
@@ -335,7 +335,7 @@ fn canvas_btn(
         .rounded(px(4.))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
-        .child(Icon::new(icon).with_size(Size::Size(px(14.))))
+        .child(Icon::new(icon).size_4())
         .on_click(on_click)
 }
 
@@ -353,7 +353,7 @@ impl Render for SchemaDiagram {
         // ---------------- toolbar ----------------
         let hover = p.tree_hover;
         let toolbar = h_flex()
-            .h(px(36.))
+            .h(theme::scaled(theme::TOOLBAR_H))
             .flex_none()
             .items_center()
             .gap_2()
@@ -364,7 +364,7 @@ impl Render for SchemaDiagram {
             .child(
                 svg()
                     .path("icons/schema.svg")
-                    .size_3p5()
+                    .size_4()
                     .flex_none()
                     .text_color(p.muted_fg),
             )

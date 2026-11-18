@@ -8,6 +8,8 @@ pub mod assets;
 pub mod completion;
 pub mod connect;
 pub mod diagram;
+pub mod editing;
+pub mod keymap;
 pub mod nav_tree;
 pub mod panes;
 pub mod query;

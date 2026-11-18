@@ -238,7 +238,7 @@ impl DataBridge {
                             .gap(px(6.))
                             .child(
                                 Icon::new(IconName::File)
-                                    .with_size(Size::Size(px(13.)))
+                                    .size_4()
                                     .text_color(p.muted_fg),
                             )
                             .child(
@@ -379,7 +379,7 @@ impl DataBridge {
                                                     )
                                                     .child(
                                                         Icon::new(IconName::Delete)
-                                                            .with_size(Size::Size(px(13.))),
+                                                            .size_4(),
                                                     )
                                                     .on_click(cx.listener(
                                                         move |this, _, _, cx| {
@@ -393,7 +393,7 @@ impl DataBridge {
                                                     .flex_none()
                                                     .child(
                                                         Icon::new(IconName::ArrowRight)
-                                                            .with_size(Size::Size(px(15.)))
+                                                            .size(theme::scaled(theme::ICON_LG))
                                                             .text_color(p.muted_fg),
                                                     ),
                                             )
@@ -570,7 +570,7 @@ impl DataBridge {
                             } else {
                                 Icon::new(IconName::TriangleAlert)
                             }
-                            .with_size(Size::Size(px(15.))),
+                            .size(theme::scaled(theme::ICON_LG)),
                         )
                         .child(e),
                 )
@@ -1088,7 +1088,6 @@ fn file_field(
                 .child(
                     Button::new("new-sqlite")
                         .ghost()
-                        .small()
                         .label(tr!("connect.new_file"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.create_sqlite_file(window, cx);
@@ -1097,7 +1096,6 @@ fn file_field(
                 .child(
                     Button::new("browse-sqlite")
                         .ghost()
-                        .small()
                         .label(tr!("connect.browse"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.browse_sqlite_file(window, cx);
@@ -1169,7 +1167,6 @@ fn ssh_section(d: &Draft, cx: &mut Context<DataBridge>) -> Div {
                             .child(
                                 Button::new("browse-ssh-key")
                                     .ghost()
-                                    .small()
                                     .label(tr!("connect.browse"))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.browse_ssh_key(window, cx);

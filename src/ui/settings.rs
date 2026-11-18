@@ -1,4 +1,5 @@
-//! Interface settings (scale, theme, language, SQL editor font, update check), shared app-wide via
+//! Interface settings (scale, theme, language, SQL editor font, update check,
+//! keyboard preset — `ui::keymap`), shared app-wide via
 //! Globals and persisted in `settings.json` (`core::storage::AppSettings`):
 //! loaded once in `main` (`restore`), written on every change (`persist`).
 
@@ -135,6 +136,12 @@ pub fn restore(cx: &mut App) -> bool {
         .unwrap_or(Language::En);
     rust_i18n::set_locale(lang.key());
     cx.set_global(CheckUpdates(s.check_updates));
+    // After gpui-component's init: the keymap captures its bindings.
+    crate::ui::keymap::init(
+        crate::ui::keymap::Preset::from_key(&s.keymap),
+        vec![crate::ui::query::fixed_bindings],
+        cx,
+    );
     s.dark
 }
 
@@ -160,6 +167,7 @@ pub fn persist(cx: &App) {
         editor_font: editor_font_size(cx),
         language: Language::current().key().into(),
         check_updates: check_updates(cx),
+        keymap: crate::ui::keymap::preset(cx).key().into(),
     });
 }
 

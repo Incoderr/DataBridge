@@ -4,8 +4,10 @@
 //! editor autocompletes tables, columns and keywords and shows the
 //! predicted next step as ghost text (`ui/completion.rs`, Tab or →
 //! accepts); the editor's smart indent handles Enter after `(`, Ctrl+wheel
-//! zooms the editor font. Ctrl+Enter runs; while a statement runs, Run
-//! turns into Stop (`CancelToken`: the server is asked to cancel it where
+//! zooms the editor font. Keys come from `ui::keymap` (preset + keymap.json):
+//! Run executes the selection, else the statement under the cursor
+//! (`model::statement_at`); line commands (comment, duplicate, move…) are
+//! `ui::editing`. While a statement runs, Run turns into Stop (`CancelToken`: the server is asked to cancel it where
 //! the driver can). A result set or an error opens a results pane below
 //! the editor behind a draggable divider (`v_resizable`); until then, and
 //! for DDL/DML (the toolbar status reports them), the editor fills the tab.
@@ -35,6 +37,10 @@ use crate::core::model::{group_digits, ColumnMeta, DbConnection, QueryPage, Row}
 use crate::core::session::{CancelToken, SessionHandle};
 use crate::ui::app::DataBridge;
 use crate::ui::completion::{GhostSlot, MenuSlot, SqlCompletions};
+use crate::ui::keymap::{
+    DeleteLine, DuplicateLine, MoveLineDown, MoveLineUp, NewLineAbove, NewLineBelow, RunQuery,
+    SQL_EDITOR, ToggleComment,
+};
 use crate::ui::{settings, theme};
 
 /// One indentation level in the SQL editor.
@@ -44,25 +50,49 @@ const INDENT: &str = "    ";
 /// version's `QUERY_LIMIT`).
 pub const RESULT_LIMIT: u64 = 500;
 
-actions!(query, [RunQuery, AcceptGhostOrRight]);
+actions!(query, [AcceptGhostOrRight]);
 
-/// Key context of the SQL editor pane (scopes Ctrl+Enter to it — the AI
-/// chat's input keeps Ctrl+Enter as a newline).
-const EDITOR_CONTEXT: &str = "SqlEditor";
+/// The SQL editor's bindings outside the customizable table
+/// (`keymap::init` registers them after it): → confirms the open
+/// completion menu's item, or accepts the grey ghost suggestion at the
+/// cursor (else it moves right as usual).
+pub fn fixed_bindings(_: &App) -> Vec<KeyBinding> {
+    let context = format!("{SQL_EDITOR} > Input");
+    vec![KeyBinding::new("right", AcceptGhostOrRight, Some(&context))]
+}
 
-/// Ctrl+Enter (Cmd+Enter on macOS) runs the statement. Registered after
-/// `gpui_component::init`, so it wins over the input's own
-/// "secondary-enter" (newline) binding inside the SQL editor only.
-///
-/// → confirms the open completion menu's item, or accepts the grey ghost
-/// suggestion at the cursor (else it moves right as usual).
-pub fn init(cx: &mut App) {
-    let keys = if cx.platform_info().is_mac() { "cmd-enter" } else { "ctrl-enter" };
-    let context = format!("{EDITOR_CONTEXT} > Input");
-    cx.bind_keys([
-        KeyBinding::new(keys, RunQuery, Some(&context)),
-        KeyBinding::new("right", AcceptGhostOrRight, Some(&context)),
-    ]);
+/// The line commands of `ui::editing` on an editor pane (shared by the
+/// SQL tab and its key tests). `comment` is the line-comment prefix.
+pub fn line_commands<T: 'static>(
+    el: Div,
+    editor: &Entity<EditorState>,
+    comment: &'static str,
+    cx: &mut Context<T>,
+) -> Div {
+    use crate::ui::editing as ed;
+    type Cmd = fn(&str, std::ops::Range<usize>) -> Option<ed::Edit>;
+    let on = |f: Cmd| {
+        let editor = editor.clone();
+        move |window: &mut Window, cx: &mut Context<T>| ed::run(&editor, f, window, cx)
+    };
+    let (dup, del, up, down, below, above) = (
+        on(ed::duplicate),
+        on(ed::delete_lines),
+        on(|t, s| ed::move_lines(t, s, true)),
+        on(|t, s| ed::move_lines(t, s, false)),
+        on(ed::line_below),
+        on(ed::line_above),
+    );
+    let comment_editor = editor.clone();
+    el.on_action(cx.listener(move |_, _: &ToggleComment, window, cx| {
+        ed::run(&comment_editor, |t, s| ed::toggle_comment(t, s, comment), window, cx)
+    }))
+    .on_action(cx.listener(move |_, _: &DuplicateLine, window, cx| dup(window, cx)))
+    .on_action(cx.listener(move |_, _: &DeleteLine, window, cx| del(window, cx)))
+    .on_action(cx.listener(move |_, _: &MoveLineUp, window, cx| up(window, cx)))
+    .on_action(cx.listener(move |_, _: &MoveLineDown, window, cx| down(window, cx)))
+    .on_action(cx.listener(move |_, _: &NewLineBelow, window, cx| below(window, cx)))
+    .on_action(cx.listener(move |_, _: &NewLineAbove, window, cx| above(window, cx)))
 }
 
 /// Statements that change the schema tree (SQL DDL, mongosh collection
@@ -181,7 +211,6 @@ struct RunSummary {
 }
 
 pub struct QueryView {
-    #[allow(dead_code)]
     conn: DbConnection,
     session: SessionHandle,
     /// The root entity — successful DDL reloads its schema tree.
@@ -308,10 +337,27 @@ impl QueryView {
         }
     }
 
-    /// Run the editor's statement (stale-guarded: only the latest Run
-    /// applies, mirroring `RecordsDelegate::load`).
+    /// Put the keyboard focus into the editor (a new tab is ready to type).
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    /// The editor's line-comment prefix: mongosh is JavaScript.
+    fn comment_prefix(&self) -> &'static str {
+        if self.conn.db_type == crate::core::model::DbType::MongoDb { "//" } else { "--" }
+    }
+
+    /// Run the selection, else the statement under the cursor
+    /// (stale-guarded: only the latest Run applies, mirroring
+    /// `RecordsDelegate::load`).
     pub fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = self.editor.read(cx).value().to_string();
+        let sql = {
+            let s = self.editor.read(cx);
+            let text = s.value();
+            crate::core::model::statement_at(text.as_ref(), s.selected_range())
+                .map(|r| text[r].to_string())
+                .unwrap_or_default()
+        };
         if sql.trim().is_empty() {
             self.error = Some(tr!("query.empty").into());
             cx.notify();
@@ -469,11 +515,11 @@ impl QueryView {
         let p = theme::palette(cx);
         let view = cx.entity().downgrade();
         let icon = |path: &'static str, active: bool| {
-            svg().path(path).size_3p5().text_color(if active { p.primary } else { p.muted_fg })
+            svg().path(path).size_4().flex_none().text_color(if active { p.primary } else { p.muted_fg })
         };
-        let sep = || div().mx_1().h(theme::scaled(18.)).w(px(1.)).bg(p.toolbar_border);
+        let sep = || div().mx_1().h(theme::scaled(20.)).w(px(1.)).flex_none().bg(p.toolbar_border);
         let mut bar = h_flex()
-            .h(theme::scaled(34.))
+            .h(theme::scaled(theme::TOOLBAR_H))
             .flex_none()
             .items_center()
             .gap_1()
@@ -483,7 +529,6 @@ impl QueryView {
             .bg(p.toolbar)
             .child(
                 Button::new("res-table")
-                    .xsmall()
                     .ghost()
                     .selected(!self.show_chart)
                     .child(icon("icons/table.svg", !self.show_chart))
@@ -495,7 +540,6 @@ impl QueryView {
             )
             .child(
                 Button::new("res-chart")
-                    .xsmall()
                     .ghost()
                     .selected(self.show_chart)
                     .disabled(self.chart.is_none())
@@ -515,7 +559,6 @@ impl QueryView {
         for k in ChartKind::ALL {
             bar = bar.child(
                 Button::new(SharedString::from(format!("chart-kind-{k:?}")))
-                    .xsmall()
                     .ghost()
                     .selected(spec.kind == k)
                     .tooltip(kind_label(k))
@@ -532,7 +575,6 @@ impl QueryView {
             let (view, names) = (view.clone(), names.clone());
             let current = spec.x;
             Button::new("chart-x")
-                .xsmall()
                 .outline()
                 .label(format!("X: {}", names.get(current).cloned().unwrap_or_default()))
                 .dropdown_menu(move |menu, _, _| {
@@ -572,7 +614,6 @@ impl QueryView {
             let numeric = numeric.clone();
             let single = spec.kind.single_series();
             Button::new("chart-y")
-                .xsmall()
                 .outline()
                 .label(format!("Y: {y_label}"))
                 .disabled(numeric.is_empty() || spec.agg == Agg::Count)
@@ -598,7 +639,6 @@ impl QueryView {
             let has_numeric = !numeric.is_empty();
             let first_num = numeric.iter().copied().find(|&i| i != spec.x);
             Button::new("chart-agg")
-                .xsmall()
                 .outline()
                 .label(agg_label(current))
                 .tooltip(tr!("chart.agg_hint"))
@@ -649,9 +689,6 @@ impl QueryView {
                     }),
             );
         }
-        if !spec.kind.single_series() && self.chart_data.series.len() > 1 {
-            bar = bar.child(crate::ui::chart::legend(&self.chart_data, cx));
-        }
         bar.into_any_element()
     }
 
@@ -659,7 +696,24 @@ impl QueryView {
         let p = theme::palette(cx);
         match &self.chart {
             Some(spec) if !self.chart_data.is_empty() => {
-                crate::ui::chart::chart_element(&self.chart_data, spec.kind, self.chart_seq, cx)
+                let chart = crate::ui::chart::chart_element(&self.chart_data, spec.kind, self.chart_seq, cx);
+                // Several series: the legend sits above the plot (in the
+                // header it wrapped into the toolbar).
+                if spec.kind.single_series() || self.chart_data.series.len() < 2 {
+                    return chart;
+                }
+                v_flex()
+                    .size_full()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .justify_end()
+                            .px_3()
+                            .pt_2()
+                            .child(crate::ui::chart::legend(&self.chart_data, cx)),
+                    )
+                    .child(div().flex_1().min_h_0().child(chart))
+                    .into_any_element()
             }
             _ => div()
                 .size_full()
@@ -716,7 +770,7 @@ impl Render for QueryView {
         };
 
         let toolbar = h_flex()
-            .h(theme::scaled(38.))
+            .h(theme::scaled(theme::TOOLBAR_H))
             .flex_none()
             .items_center()
             .gap_2()
@@ -727,8 +781,7 @@ impl Render for QueryView {
             .child(if self.running {
                 Button::new("stop")
                     .danger()
-                    .small()
-                    .icon(IconName::CircleX)
+                    .icon(Icon::empty().path("icons/stop.svg"))
                     .label(tr!("query.stop"))
                     .tooltip(tr!("query.stop_hint"))
                     .disabled(self.cancelling)
@@ -736,9 +789,9 @@ impl Render for QueryView {
             } else {
                 Button::new("run")
                     .primary()
-                    .small()
+                    .icon(Icon::empty().path("icons/play.svg"))
                     .label(tr!("common.run"))
-                    .tooltip(tr!("query.run_hint"))
+                    .tooltip(crate::ui::keymap::with_shortcut(tr!("query.run_hint"), "sql.run", cx))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.run(window, cx);
                     }))
@@ -766,9 +819,12 @@ impl Render for QueryView {
             );
 
         // The editor pane; the code editor scrolls internally.
-        let editor_pane = v_flex()
-            .key_context(EDITOR_CONTEXT)
-            .on_action(cx.listener(|this, _: &RunQuery, window, cx| this.run(window, cx)))
+        let editor_pane = line_commands(v_flex(), &self.editor, self.comment_prefix(), cx)
+            .key_context(SQL_EDITOR)
+            .on_action(cx.listener(|this, _: &RunQuery, window, cx| {
+                // Run while running stops (one key for both, like the button).
+                if this.running { this.stop(cx) } else { this.run(window, cx) }
+            }))
             .on_action(cx.listener(|this, _: &AcceptGhostOrRight, window, cx| {
                 this.accept_ghost_or_right(window, cx)
             }))
@@ -833,7 +889,7 @@ impl Render for QueryView {
                     .bg(p.conn_err.opacity(0.1))
                     .text_color(p.conn_err)
                     .text_size(theme::scaled(theme::TEXT_MD))
-                    .child(Icon::new(IconName::TriangleAlert).with_size(Size::Size(px(15.))))
+                    .child(Icon::new(IconName::TriangleAlert).size(theme::scaled(theme::ICON_LG)))
                     .child(e),
             ))
         } else {
@@ -896,4 +952,100 @@ pub fn settle_stripes<D: TableDelegate>(
             state.update(cx, |_, cx| cx.notify()).ok();
         });
     });
+}
+
+#[cfg(test)]
+mod key_tests {
+    //! Keys → actions → edits, through gpui's real keymap (both presets).
+    use super::*;
+    use crate::ui::keymap::{self, Preset};
+    use gpui::{TestAppContext, VisualTestContext};
+    use std::cell::Cell;
+
+    struct Probe {
+        editor: Entity<EditorState>,
+        runs: Rc<Cell<u32>>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let runs = self.runs.clone();
+            line_commands(v_flex(), &self.editor, "--", cx)
+                .key_context(SQL_EDITOR)
+                .on_action(cx.listener(move |_, _: &RunQuery, _, _| runs.set(runs.get() + 1)))
+                .size_full()
+                .child(Editor::new(&self.editor).h(px(200.)))
+        }
+    }
+
+    /// An editor holding `text` with the cursor at its end, under `preset`.
+    fn setup<'a>(
+        preset: Preset,
+        text: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<EditorState>, Rc<Cell<u32>>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            keymap::init(preset, vec![fixed_bindings], cx);
+        });
+        let runs = Rc::new(Cell::new(0));
+        let mut state = None;
+        let r = runs.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| EditorState::new(window, cx).language("sql"));
+            state = Some(editor.clone());
+            Probe { editor, runs: r }
+        });
+        let state = state.unwrap();
+        let text = text.to_string();
+        VisualTestContext::update(cx, |window, cx| {
+            state.update(cx, |s, cx| {
+                s.set_value(text.clone(), window, cx);
+                s.set_selected_range(text.len()..text.len(), cx);
+                s.focus(window, cx);
+            });
+        });
+        VisualTestContext::update(cx, |window, cx| window.draw(cx).clear(cx));
+        (state, runs, cx)
+    }
+
+    fn text(state: &Entity<EditorState>, cx: &mut VisualTestContext) -> String {
+        cx.read(|cx| state.read(cx).text().to_string())
+    }
+
+    #[gpui::test]
+    fn jetbrains_keys(cx: &mut TestAppContext) {
+        let (state, runs, cx) = setup(Preset::JetBrains, "select 1", cx);
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!((text(&state, cx), runs.get()), ("select 1".into(), 1));
+        cx.simulate_keystrokes("f5");
+        assert_eq!(runs.get(), 2);
+        cx.simulate_keystrokes("ctrl-/");
+        assert_eq!(text(&state, cx), "-- select 1");
+        cx.simulate_keystrokes("ctrl-d");
+        assert_eq!(text(&state, cx), "-- select 1
+-- select 1");
+        cx.simulate_keystrokes("ctrl-y");
+        assert_eq!(text(&state, cx), "-- select 1");
+        // Undo / redo stay usable (redo moved to Ctrl+Shift+Z).
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(text(&state, cx), "-- select 1
+-- select 1");
+        cx.simulate_keystrokes("ctrl-shift-z");
+        assert_eq!(text(&state, cx), "-- select 1");
+    }
+
+    #[gpui::test]
+    fn vscode_keys(cx: &mut TestAppContext) {
+        let (state, runs, cx) = setup(Preset::VsCode, "select 1", cx);
+        // Ctrl+Enter starts a new line below, F5 runs.
+        cx.simulate_keystrokes("ctrl-enter");
+        assert_eq!((text(&state, cx), runs.get()), ("select 1
+".into(), 0));
+        cx.simulate_keystrokes("f5");
+        assert_eq!(runs.get(), 1);
+        cx.simulate_keystrokes("x alt-up");
+        assert_eq!(text(&state, cx), "x
+select 1");
+    }
 }

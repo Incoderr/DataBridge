@@ -668,56 +668,13 @@ pub fn upsert(list: &mut Vec<Conversation>, conv: Conversation) {
 
 // ---------------- execution ----------------
 
-/// Split a script on `;` outside quotes ('…', "…", `…`) and `--` / `/* */`
-/// comments; empty pieces are dropped.
+/// Split a script on `;` outside quotes and comments
+/// (`model::statement_ranges`); empty pieces are dropped.
 pub fn split_statements(sql: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(c) = chars.next() {
-        cur.push(c);
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' | '`' => quote = Some(c),
-                '-' if chars.peek() == Some(&'-') => {
-                    for n in chars.by_ref() {
-                        cur.push(n);
-                        if n == '\n' {
-                            break;
-                        }
-                    }
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    let mut prev = '\0';
-                    for n in chars.by_ref() {
-                        cur.push(n);
-                        if prev == '*' && n == '/' {
-                            break;
-                        }
-                        prev = n;
-                    }
-                }
-                ';' => {
-                    cur.pop();
-                    if !cur.trim().is_empty() {
-                        out.push(cur.trim().to_string());
-                    }
-                    cur.clear();
-                }
-                _ => {}
-            },
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
-    }
-    out
+    crate::core::model::statement_ranges(sql)
+        .into_iter()
+        .map(|r| sql[r].to_string())
+        .collect()
 }
 
 /// Statements Auto mode never runs on its own: dropping/truncating

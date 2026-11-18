@@ -87,10 +87,8 @@ fn main() {
             cx.text_system().add_fonts(fonts).expect("failed to register fonts");
 
             gpui_component::init(cx);
-            // After gpui-component: its "secondary-enter" binding must lose
-            // inside the SQL editor.
-            ui::query::init(cx);
-            // Saved interface settings (scale, theme, editor font).
+            // Saved interface settings (scale, theme, editor font) and the
+            // keymap — after gpui-component, whose bindings it captures.
             let dark = ui::settings::restore(cx);
             theme::apply(if dark { ThemeMode::Dark } else { ThemeMode::Light }, None, cx);
 

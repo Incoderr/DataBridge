@@ -8,7 +8,7 @@
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, ClickEvent, Context, FontWeight, IntoElement, ParentElement, Styled};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{h_flex, v_flex, Disableable, Icon, IconName, Sizable, Size};
+use gpui_component::{h_flex, v_flex, Disableable, Icon, IconName};
 
 use crate::core::update::{self, InstallEvent, Release};
 use crate::ui::app::DataBridge;
@@ -178,7 +178,6 @@ impl DataBridge {
                 actions = actions.child(
                     Button::new("update-notes")
                         .ghost()
-                        .small()
                         .label(tr!("update.release_page"))
                         .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&page)),
                 );
@@ -187,7 +186,6 @@ impl DataBridge {
                     actions = actions.child(
                         Button::new("update-install")
                             .primary()
-                            .small()
                             .label(if retry { tr!("update.retry") } else { tr!("update.install") })
                             .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
                     );
@@ -198,7 +196,6 @@ impl DataBridge {
                     .child(
                         Button::new("update-later")
                             .ghost()
-                            .small()
                             .label(tr!("update.later"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.update_hidden = true;
@@ -208,7 +205,6 @@ impl DataBridge {
                     .child(
                         Button::new("update-restart")
                             .primary()
-                            .small()
                             .label(tr!("update.restart"))
                             .on_click(cx.listener(|this, _, _, cx| this.restart_after_update(cx))),
                     );
@@ -237,7 +233,7 @@ impl DataBridge {
                     .gap_2()
                     .child(
                         Icon::new(IconName::ArrowDown)
-                            .with_size(Size::Size(px(14.)))
+                            .size_4()
                             .text_color(p.primary),
                     )
                     .child(
@@ -251,7 +247,6 @@ impl DataBridge {
                     .when(!downloading, |this| {
                         this.child(
                             Button::new("update-close")
-                                .xsmall()
                                 .ghost()
                                 .icon(Icon::new(IconName::Close))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -309,7 +304,6 @@ impl DataBridge {
                     )
                     .child(
                         Button::new("update-check-now")
-                            .small()
                             .outline()
                             .label(tr!("update.check_now"))
                             .disabled(checking)
@@ -347,7 +341,7 @@ impl DataBridge {
                     .when(auto, |this| {
                         this.child(
                             Icon::new(IconName::Check)
-                                .with_size(Size::Size(px(14.)))
+                                .size_4()
                                 .text_color(p.primary),
                         )
                     })

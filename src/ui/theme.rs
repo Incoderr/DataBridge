@@ -78,6 +78,22 @@ pub const TEXT_MD: f32 = 13.; // body: tree rows, tabs, cells, menus
 pub const TEXT_LG: f32 = 14.; // emphasis, card titles
 pub const TEXT_XL: f32 = 16.; // dialog and screen titles
 
+/// Control sizing — one look for every toolbar (records, SQL, results,
+/// AI chat, tree header). In design px at the Normal scale, via [`scaled`].
+///
+/// - Strips (toolbars, pane headers, the AI composer bar): `TOOLBAR_H`.
+/// - Every control on them — buttons with or without a label, icon
+///   buttons, dropdown triggers, toggles, inputs: `CONTROL_H`, which is
+///   gpui-component's `Size::Medium` (h_8 = 2 rem at the 14 px base), i.e.
+///   the kit's default size. Never `.xsmall()` / `.small()` on a control.
+/// - Chips (tag-like pick lists: providers, models, presets): `Size::Small`.
+/// - Icons on controls and strips: `size_4()` (1 rem = 14 px, the kit's
+///   Medium icon), never a fixed `px(..)` — those ignore the interface scale.
+pub const TOOLBAR_H: f32 = 40.;
+pub const CONTROL_H: f32 = 28.;
+/// Icons in the left rail and other large hit targets.
+pub const ICON_LG: f32 = 16.;
+
 /// A design-px size that follows the interface scale. Rems are relative to
 /// `theme.font_size` (= `BASE_FONT_SIZE * factor`), so `scaled(n)` renders
 /// as `n` px at Normal and grows / shrinks with Compact / Large.

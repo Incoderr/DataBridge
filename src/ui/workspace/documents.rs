@@ -12,7 +12,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Editor, EditorState, TabSize};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{Disableable as _, Icon, IconName, Sizable as _, Size, h_flex, v_flex};
+use gpui_component::{Disableable as _, Icon, IconName, h_flex, v_flex};
 
 use super::{PAGE, RecordsView};
 use crate::core::model::{CellChange, DocNode, TableRef, format_document};
@@ -187,7 +187,7 @@ impl RecordsView {
                     .when(is_container, |t| {
                         t.child(
                             Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                                .with_size(Size::Size(px(12.)))
+                                .size_3p5()
                                 .text_color(p.muted_fg),
                         )
                     }),

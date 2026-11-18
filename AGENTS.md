@@ -43,7 +43,10 @@ Release. Release builds on Windows use the GUI subsystem (no console —
 
 Tests live in `core` (`storage`: URL sanitizing, JSON round-trip). More
 belong there (model mapping, mock determinism); driver integration tests
-require a live DB and must be `#[ignore]`d.
+require a live DB and must be `#[ignore]`d. UI behavior that goes through
+gpui's keymap is tested with `#[gpui::test]` + `TestAppContext`
+(`ui/query.rs` `key_tests`: real keystrokes → actions → editor text, per
+keymap preset) — that is what the `test-support` dev-dependency is for.
 
 ## Architecture (decided — do not deviate without asking)
 
@@ -88,6 +91,8 @@ src/
     workspace/documents.rs # document stores: JSON cards, field tree, whole-document editor
     query.rs      # SQL editor tab (Stage 5): `Editor`/`EditorState` (sql), run/stop button, results grid
     completion.rs # CompletionProvider adapter: core::completion -> the code editor's menu
+    keymap.rs     # shortcuts: command table, DataGrip/VS Code presets, keymap.json overrides
+    editing.rs    # SQL editor line commands (comment, duplicate/delete/move line, new line), pure + tested
     ai_chat.rs    # right-hand AI chat panel (AiChatView entity), toggled from the left rail
     chart.rs      # draws core::chart data with gpui-component charts (bar/line/area/pie)
     update.rs     # updater UI: startup check, bottom-right "update available" card, Settings → Updates
@@ -341,9 +346,13 @@ with the generated rows (`simple_select`); any other statement gets a
   (`ensure_dock`) and dropped with the connection (`clear_tabs`); layouts
   are not persisted yet.
 - SQL editor (`ui/query.rs`): one statement per Run, stale-guarded by
-  `run_id`; Ctrl+Enter runs (`RunQuery`, bound in `query::init` to
-  `SqlEditor > Input` after gpui-component's init, so other inputs keep
-  Ctrl+Enter = newline). While running, Run becomes Stop: a
+  `run_id`. Run executes the selection, else the statement under the
+  cursor (`model::statement_at` over `statement_ranges`: `;` outside
+  quotes / comments; a cursor right after `;` or on the blank line after a
+  statement still means that statement), else the whole text. Its keys
+  come from the keymap (below); pressing Run's key while running stops.
+  A new SQL tab gets the keyboard focus (`QueryView::focus`, deferred in
+  `set_active`). While running, Run becomes Stop: a
   `CancelToken` → `pg_cancel_backend(pid)` / `KILL QUERY id` (the
   statement runs on a dedicated pool connection whose pid / id is read
   first), then `CANCEL_GRACE` (3 s) before the call is dropped; SQLite
@@ -443,8 +452,9 @@ with the generated rows (`simple_select`); any other statement gets a
   models). The system prompt carries the
   dialect and a compact schema listing (names/types, capped at 12k chars).
   Answers stream over SSE (`mpsc` from the sidecar, stale-guarded by
-  `send_id`; Stop drops the task and cancels the request). Enter sends,
-  Ctrl+Enter is a newline. Modes: **Manual** — code blocks get Run / Open
+  `send_id`; Stop drops the task and cancels the request). Enter (and
+  Ctrl+Enter) sends, Shift+Enter is a newline (`submit_on_enter` on the
+  textarea — no newline to strip). Modes: **Manual** — code blocks get Run / Open
   in SQL tab / Copy; **Auto** — the answer's statements run in order (stop
   on first error), outcomes go back as `[ok]`/`[error]` user messages
   (`describe_outcome`: ≤20 rows TSV — so in Auto mode result rows *do*
@@ -462,9 +472,11 @@ with the generated rows (`simple_select`); any other statement gets a
   JSON (`text_is_not_mistaken_for_uuid_or_json`).
 - Driver errors carry the server message (`drivers::util::query_error`:
   "query failed: no such table: dual"), not a bare "query failed".
-- Settings dialog (gear in the left rail, `render_settings_dialog`):
-  interface size, light/dark theme (`theme::set`), language
-  (`settings::set_language`). **Every user-facing string is translated**:
+- Settings dialog (gear in the left rail or `app.settings`,
+  `render_settings_dialog`): tabs (`SettingsTab`) — Interface (size,
+  light/dark theme `theme::set`, language `settings::set_language`),
+  Keyboard (preset, every command with its keys and id, Open / Reload
+  `keymap.json`, its errors), Updates. **Every user-facing string is translated**:
   `tr!("key")` / `tr!("key", n = x)` (macro in `main.rs`, returns
   `SharedString`; `%{n}` placeholders) from `locales/app.yml`
   (`_version: 2`: every language next to its key, missing ones fall back
@@ -486,6 +498,36 @@ with the generated rows (`simple_select`); any other statement gets a
   `main` removes the `.old`. Releases without those assets (≤ v0.2.0) and
   other platforms get a link to the release page. Stale-guarded by
   `update_id`. Version bumps: `Cargo.toml` `version` must match the tag.
+- Keymap (`ui/keymap.rs`): every customizable shortcut is a row of
+  `COMMANDS` — id (`sql.run`, `sql.toggle_comment`, `app.new_query`, …),
+  scope (`SqlEditor > Input`, every `Input`, or the app root `DataBridge`),
+  keys for the two presets (`Preset::JetBrains` = DataGrip / DBeaver:
+  Ctrl+Enter / F5 run, Ctrl+D duplicate, Ctrl+Y delete line, Ctrl+Shift+Z
+  redo; `Preset::VsCode`: Ctrl+Enter new line below, F5 / Ctrl+Shift+E
+  run, Alt+↑/↓ move lines, Ctrl+Shift+K delete line), and the action.
+  `AppSettings::keymap` holds the preset; `keymap.json` (config dir, next
+  to `settings.json`) overrides keys per id (`[]` unbinds, `_`-keys are
+  notes, errors listed in Settings → Keyboard, the rest applies). gpui's
+  keymap only grows, so `keymap::apply` rebuilds it: gpui-component's
+  bindings captured once after its init (minus actions the table owns,
+  e.g. Undo / Redo) + ours (+ `query::fixed_bindings`: → accepts the
+  ghost). Bindings load with key equivalents: punctuation means the US
+  layout's key (Ctrl+/ works on a Russian layout). App-wide commands need
+  a focused element under the root's key context: the root
+  (`window-root`) tracks `DataBridge::focus` and takes focus when nothing
+  is focused. Tooltips show keys via `keymap::with_shortcut`. A new
+  command needs a row, a `keys.<id>` label in both languages
+  (`command_table_is_consistent`) and a handler in its scope.
+- Control sizing (`ui/theme.rs` constants): strips (toolbars, pane
+  headers) are `TOOLBAR_H` (40); every control on them — buttons, icon
+  buttons, dropdown triggers, toggles, inputs — is gpui-component's
+  default `Size::Medium`, which is `CONTROL_H` (28 = 2 rem at the 14 px
+  base). Never `.xsmall()` / `.small()` on a control; `.small()` only for
+  chips (provider / model / preset pick lists). Icons: `size_4()` (1 rem),
+  rail icons `ICON_LG`; never a fixed `Size::Size(px(..))` — it ignores the
+  interface scale. Every `"icons/….svg"` the UI names must load
+  (`every_icon_path_in_the_ui_loads`): glyphs outside the kit's embedded
+  default set go into `assets/icons` + `EXTRA_ICONS`.
 - Theme (`ui/theme.rs`): use `theme::palette(cx)`; no hardcoded colors
   except `DbType::brand_color()` and grid type tokens (`kind_color`).
   Brand glyphs must be registered in `ui/assets.rs` (`brand/*.svg`).
@@ -524,9 +566,9 @@ with the generated rows (`simple_select`); any other statement gets a
   stale-guard/load_id mechanism). **Mostly done.** `execute` + the simplified
   record editor (`update_row`/`insert_row`/`delete_row`) land on all drivers
   and the mock; `QueryView` renders the editor tab with highlighting.
-  Cancellation (Stop) and Ctrl+Enter are done. Remaining niceties: result
-  tabs inside one query view, run the selection / statement under the
-  cursor.
+  Cancellation (Stop), run the selection / statement under the cursor and
+  configurable shortcuts are done. Remaining niceties: result tabs inside
+  one query view, run a whole script statement by statement.
 
 - **Stage 6 — AI assistant.** OpenAI-compatible only (cloud vendor SDKs
   deferred). **Started:** side chat with schema context, streaming, model
@@ -565,6 +607,8 @@ with the generated rows (`simple_select`); any other statement gets a
   price of in-process SSH with key/agent auth and known_hosts checks.
 - UI translations: `rust-i18n` 4 (already in the tree via gpui-component,
   which reads the same global locale).
+- Tests: `gpui-pre`'s `test-support` feature as a dev-dependency (same
+  crate, test builds only) for `#[gpui::test]` keymap / editor tests.
 - Deprecate nothing silently: when a stage changes a rule in this file, update it
   in the same PR.
 

@@ -15,7 +15,7 @@ use gpui_component::dock::{
     DockArea, DockPlacement, DockSkin, InsertTarget, PanelId, PanelStyle, panel_handle,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Sizable, Size, ThemeMode, VirtualListScrollHandle,
+    ActiveTheme, Icon, IconName, ThemeMode, VirtualListScrollHandle,
     button::{Button, ButtonVariants},
 };
 
@@ -30,6 +30,7 @@ use crate::core::session::SessionHandle;
 use crate::core::storage;
 use crate::ui::ai_chat::AiChatView;
 use crate::ui::diagram::SchemaDiagram;
+use crate::ui::keymap;
 use crate::ui::nav_tree::{SelectedPath, TreeRow};
 use crate::ui::panes::WorkspacePanel;
 use crate::ui::query::QueryView;
@@ -138,8 +139,13 @@ pub struct DataBridge {
     /// Scroll state of the virtualized tree body. Held on the entity so
     /// the position survives repaints; reset when a connection opens.
     pub tree_scroll: VirtualListScrollHandle,
-    /// Settings dialog visibility (interface scale chooser).
+    /// Settings dialog visibility.
     pub show_settings: bool,
+    /// Settings dialog tab.
+    pub settings_tab: SettingsTab,
+    /// The window root's focus: app-wide shortcuts (`keymap::Scope::App`)
+    /// need a focused element under the root's key context.
+    pub focus: gpui::FocusHandle,
     /// Counter for query tab ids (multiple SQL tabs per connection).
     pub query_seq: u32,
     /// Stale guard of the schema-tree loads (connect + DDL reloads).
@@ -219,6 +225,8 @@ impl DataBridge {
             nav_rows: Vec::new(),
             tree_scroll: VirtualListScrollHandle::new(),
             show_settings: false,
+            settings_tab: SettingsTab::Interface,
+            focus: cx.focus_handle(),
             query_seq: 0,
             schemas_id: 0,
             pending_drop: None,
@@ -437,6 +445,11 @@ impl DataBridge {
                 );
             }
         });
+        // A new SQL tab is ready to type into (after the dock settled
+        // focus on the new panel).
+        if let Some(WorkspaceView::Query(q)) = self.views.get(&tab.id).cloned() {
+            window.defer(cx, move |window, cx| q.update(cx, |q, cx| q.focus(window, cx)));
+        }
         self.last_active = Some(tab.id);
         self.sync_lone_tab(cx);
         cx.notify();
@@ -846,8 +859,36 @@ impl Render for DataBridge {
         // out after it (observed empirically with gpui 0.2 / taffy 0.9),
         // so it must stay LAST — behind the settings overlay and the
         // drop hint.
+        // Nothing focused (startup, after a dialog closed): the root takes
+        // focus so app-wide shortcuts still have a key context to match.
+        if window.focused(cx).is_none() {
+            self.focus.focus(window, cx);
+        }
         div()
             .id("window-root")
+            .key_context(keymap::APP)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &keymap::NewQuery, window, cx| {
+                if this.active_conn.is_some() {
+                    this.open_query_tab(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::CloseTab, window, cx| {
+                let id = this.active_tab.and_then(|i| this.tabs.get(i)).map(|t| t.id.clone());
+                if let Some(id) = id {
+                    this.close_tab_id(&id, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::RefreshData, _, cx| this.refresh(cx)))
+            .on_action(cx.listener(|this, _: &keymap::ToggleAiChat, window, cx| {
+                if this.active_conn.is_some() {
+                    this.toggle_ai(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &keymap::OpenSettings, _, cx| {
+                this.show_settings = !this.show_settings;
+                cx.notify();
+            }))
             .relative()
             .size_full()
             .when(resizing, |this| this.cursor_col_resize())
@@ -1183,7 +1224,7 @@ impl DataBridge {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 Icon::new(IconName::TriangleAlert)
-                                    .with_size(Size::Size(px(16.)))
+                                    .size(theme::scaled(theme::ICON_LG))
                                     .text_color(p.destructive),
                             )
                             .child(tr!("app.drop_title", what = what)),
@@ -1243,98 +1284,55 @@ impl DataBridge {
     }
 
     fn render_settings_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::ui::settings::{Language, UiScale};
-        use gpui::{ClickEvent, FontWeight};
+        use gpui::FontWeight;
         let p = theme::palette(cx);
-        let scale = crate::ui::settings::current(cx);
-        let dark = cx.theme().is_dark();
-        let lang = Language::current();
+        let tab = self.settings_tab;
 
-        // One selectable option; `hint` sits right-aligned in muted text.
-        let option = |id: String, label: String, hint: String, active: bool| {
-            h_flex()
-                .id(SharedString::from(id))
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py(px(7.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .border_1()
-                .border_color(if active { p.primary } else { p.border })
-                .bg(if active { p.accent } else { gpui::transparent_black() })
-                .hover(move |st| st.bg(p.accent))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(theme::scaled(theme::TEXT_MD))
-                        .text_color(p.foreground)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(theme::scaled(theme::TEXT_SM))
-                        .text_color(p.muted_fg)
-                        .child(hint),
-                )
-                .when(active, |this| {
-                    this.child(
-                        Icon::new(IconName::Check)
-                            .with_size(Size::Size(px(14.)))
-                            .text_color(p.primary),
-                    )
-                })
-        };
-        let section = |title: String| {
-            div()
-                .pt_1()
-                .text_size(theme::scaled(theme::TEXT_SM))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.muted_fg)
-                .child(title)
-        };
-
-        let mut scales = v_flex().gap_2();
-        for s in UiScale::ALL {
-            scales = scales.child(
-                option(format!("scale-{}", s.key()), s.label(), format!("{}%", s.percent()), s == scale)
-                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
-                        crate::ui::settings::set(s, Some(window), cx);
-                        cx.notify();
-                    })),
-            );
-        }
-
-        let mut themes = h_flex().gap_2();
-        for (mode, icon, label) in [
-            (ThemeMode::Light, IconName::Sun, t!("settings.theme_light")),
-            (ThemeMode::Dark, IconName::Moon, t!("settings.theme_dark")),
+        let mut tabs = v_flex()
+            .flex_none()
+            .w(theme::scaled(180.))
+            .gap_1()
+            .p_2()
+            .border_r_1()
+            .border_color(p.border)
+            .bg(p.toolbar);
+        for (t, icon, label) in [
+            (SettingsTab::Interface, Icon::new(IconName::Palette), t!("settings.tab_interface")),
+            (SettingsTab::Keyboard, Icon::empty().path("icons/keyboard.svg"), t!("settings.tab_keyboard")),
+            (SettingsTab::Updates, Icon::empty().path("icons/refresh-cw.svg"), t!("update.section")),
         ] {
-            let active = mode.is_dark() == dark;
-            themes = themes.child(
-                option(format!("theme-{}", mode.is_dark()), label.into_owned(), String::new(), active)
-                    .child(Icon::new(icon).with_size(Size::Size(px(14.))).text_color(p.muted_fg))
-                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
-                        theme::set(mode, window, cx);
+            let active = t == tab;
+            tabs = tabs.child(
+                h_flex()
+                    .id(SharedString::from(format!("settings-tab-{t:?}")))
+                    .h(theme::scaled(theme::CONTROL_H + 4.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(theme::scaled(theme::TEXT_MD))
+                    .text_color(if active { p.foreground } else { p.muted_fg })
+                    .when(active, |d| d.bg(p.accent).font_weight(FontWeight::MEDIUM))
+                    .hover(move |st| st.bg(p.accent))
+                    .child(icon.size_4().text_color(if active { p.primary } else { p.muted_fg }))
+                    .child(label.into_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_tab = t;
                         cx.notify();
                     })),
             );
         }
 
-        let mut langs = h_flex().gap_2();
-        for l in Language::ALL {
-            langs = langs.child(
-                option(format!("lang-{}", l.key()), l.label().into(), String::new(), l == lang)
-                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        crate::ui::settings::set_language(l, cx);
-                        cx.notify();
-                    })),
-            );
-        }
+        let body = match tab {
+            SettingsTab::Interface => self.render_settings_interface(cx).into_any_element(),
+            SettingsTab::Keyboard => self.render_settings_keyboard(cx).into_any_element(),
+            SettingsTab::Updates => v_flex()
+                .gap_2()
+                .child(settings_section(t!("update.section").into_owned(), &p))
+                .child(self.render_update_settings(cx))
+                .into_any_element(),
+        };
 
         // Click on the backdrop closes the dialog. The backdrop and the
         // card are SIBLINGS under a transparent layer so clicks inside
@@ -1356,7 +1354,10 @@ impl DataBridge {
 
         let card = v_flex()
             .id("settings-dialog")
-            .w(theme::scaled(400.))
+            .w(theme::scaled(720.))
+            .h(theme::scaled(560.))
+            .max_w(gpui::relative(0.94))
+            .max_h(gpui::relative(0.9))
             // BlockMouse: clicks over the card never count as backdrop
             // clicks (see the record editor modal in workspace.rs).
             .occlude()
@@ -1369,9 +1370,9 @@ impl DataBridge {
             .child(
                 h_flex()
                     .flex_none()
+                    .h(theme::scaled(theme::TOOLBAR_H + 8.))
                     .items_center()
                     .px_4()
-                    .py_3()
                     .border_b_1()
                     .border_color(p.border)
                     .child(
@@ -1383,9 +1384,9 @@ impl DataBridge {
                     )
                     .child(
                         Button::new("settings-close")
-                            .xsmall()
                             .ghost()
                             .icon(Icon::new(IconName::Close))
+                            .tooltip(keymap::with_shortcut(t!("common.close"), "app.settings", cx))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_settings = false;
                                 cx.notify();
@@ -1393,18 +1394,20 @@ impl DataBridge {
                     ),
             )
             .child(
-                v_flex()
-                    .flex_none()
-                    .p_4()
-                    .gap_2()
-                    .child(section(t!("settings.scale").into_owned()))
-                    .child(scales)
-                    .child(section(t!("settings.theme").into_owned()))
-                    .child(themes)
-                    .child(section(t!("settings.language").into_owned()))
-                    .child(langs)
-                    .child(section(t!("update.section").into_owned()))
-                    .child(self.render_update_settings(cx)),
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(tabs)
+                    .child(
+                        div()
+                            .id("settings-body")
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .p_4()
+                            .child(body),
+                    ),
             );
 
         // Transparent event-passing layer: the backdrop handles outside
@@ -1420,6 +1423,268 @@ impl DataBridge {
             .child(backdrop)
             .child(card)
     }
+
+    /// Settings → Interface: scale, theme, language.
+    fn render_settings_interface(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::ui::settings::{Language, UiScale};
+        use gpui::ClickEvent;
+        let p = theme::palette(cx);
+        let scale = crate::ui::settings::current(cx);
+        let dark = cx.theme().is_dark();
+        let lang = Language::current();
+
+        let mut scales = v_flex().gap_2();
+        for s in UiScale::ALL {
+            scales = scales.child(
+                settings_option(format!("scale-{}", s.key()), s.label(), format!("{}%", s.percent()), s == scale, &p)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                        crate::ui::settings::set(s, Some(window), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut themes = h_flex().gap_2();
+        for (mode, icon, label) in [
+            (ThemeMode::Light, IconName::Sun, t!("settings.theme_light")),
+            (ThemeMode::Dark, IconName::Moon, t!("settings.theme_dark")),
+        ] {
+            let active = mode.is_dark() == dark;
+            themes = themes.child(
+                settings_option(format!("theme-{}", mode.is_dark()), label.into_owned(), String::new(), active, &p)
+                    .child(Icon::new(icon).size_4().text_color(p.muted_fg))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, window, cx| {
+                        theme::set(mode, window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut langs = h_flex().gap_2();
+        for l in Language::ALL {
+            langs = langs.child(
+                settings_option(format!("lang-{}", l.key()), l.label().into(), String::new(), l == lang, &p)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        crate::ui::settings::set_language(l, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        v_flex()
+            .gap_2()
+            .child(settings_section(t!("settings.scale").into_owned(), &p))
+            .child(scales)
+            .child(settings_section(t!("settings.theme").into_owned(), &p))
+            .child(themes)
+            .child(settings_section(t!("settings.language").into_owned(), &p))
+            .child(langs)
+    }
+
+    /// Settings → Keyboard: the preset, every command with its keys, and
+    /// the way into `keymap.json`.
+    fn render_settings_keyboard(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::ClickEvent;
+        let p = theme::palette(cx);
+        let preset = keymap::preset(cx);
+        let mac = cx.platform_info().is_mac();
+
+        let mut presets = h_flex().gap_2();
+        for pr in keymap::Preset::ALL {
+            presets = presets.child(
+                settings_option(format!("keys-{}", pr.key()), pr.label().into(), String::new(), pr == preset, &p)
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        keymap::set_preset(pr, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let file = keymap::file_path().map(|f| f.display().to_string()).unwrap_or_default();
+        let actions = h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("keys-open")
+                    .outline()
+                    .icon(Icon::new(IconName::ExternalLink))
+                    .label(t!("keys.open_file").into_owned())
+                    .tooltip(file)
+                    .on_click(cx.listener(|_, _, _, cx| keymap::open_file(cx))),
+            )
+            .child(
+                Button::new("keys-reload")
+                    .ghost()
+                    .icon(Icon::new(IconName::Redo2))
+                    .label(t!("keys.reload").into_owned())
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        keymap::reload(cx);
+                        cx.notify();
+                    })),
+            );
+
+        let errors: Vec<String> = cx
+            .try_global::<keymap::Keymap>()
+            .map(|k| k.errors().cloned().collect())
+            .unwrap_or_default();
+
+        let mut list = v_flex().gap_1();
+        let mut scope = None;
+        for cmd in keymap::COMMANDS {
+            if scope != Some(cmd.scope) {
+                scope = Some(cmd.scope);
+                list = list.child(div().pt_2().child(settings_section(t!(cmd.scope.title_key()).into_owned(), &p)));
+            }
+            let keys = keymap::keys_for(cmd, cx);
+            let custom = keymap::is_overridden(cmd, cx);
+            let mut chips = h_flex().flex_none().gap_1().items_center();
+            if keys.is_empty() {
+                chips = chips.child(div().text_color(p.muted_fg).child("—"));
+            }
+            for k in &keys {
+                chips = chips.child(kbd(keymap::display(k, mac), &p));
+            }
+            list = list.child(
+                h_flex()
+                    .min_h(theme::scaled(theme::CONTROL_H + 4.))
+                    .px_2()
+                    .gap_3()
+                    .items_center()
+                    .rounded(px(4.))
+                    .hover(move |st| st.bg(p.accent))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(theme::scaled(theme::TEXT_MD))
+                                    .text_color(p.foreground)
+                                    .child(t!(cmd.label_key()).into_owned()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::scaled(theme::TEXT_XS))
+                                    .font_family(theme::MONO_FONT)
+                                    .text_color(p.muted_fg)
+                                    .child(cmd.id),
+                            ),
+                    )
+                    .when(custom, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .rounded(px(3.))
+                                .bg(p.accent)
+                                .text_size(theme::scaled(theme::TEXT_XS))
+                                .text_color(p.primary)
+                                .child(t!("keys.custom").into_owned()),
+                        )
+                    })
+                    .child(chips),
+            );
+        }
+
+        v_flex()
+            .gap_2()
+            .child(settings_section(t!("keys.preset").into_owned(), &p))
+            .child(presets)
+            .child(
+                div()
+                    .text_size(theme::scaled(theme::TEXT_SM))
+                    .text_color(p.muted_fg)
+                    .child(t!("keys.file_hint").into_owned()),
+            )
+            .child(actions)
+            .when(!errors.is_empty(), |this| {
+                let mut block = v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.conn_err)
+                    .text_size(theme::scaled(theme::TEXT_SM))
+                    .text_color(p.conn_err)
+                    .child(t!("keys.errors").into_owned());
+                for e in errors {
+                    block = block.child(div().font_family(theme::MONO_FONT).child(e));
+                }
+                this.child(block)
+            })
+            .child(list)
+    }
+}
+
+/// Which page of the Settings dialog is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsTab {
+    Interface,
+    Keyboard,
+    Updates,
+}
+
+/// One selectable option of the Settings dialog; `hint` sits right-aligned
+/// in muted text.
+fn settings_option(id: String, label: String, hint: String, active: bool, p: &theme::Palette) -> gpui::Stateful<gpui::Div> {
+    let p = *p;
+    h_flex()
+        .id(SharedString::from(id))
+        .flex_1()
+        .min_w_0()
+        .h(theme::scaled(theme::CONTROL_H + 8.))
+        .items_center()
+        .gap_2()
+        .px_3()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .border_1()
+        .border_color(if active { p.primary } else { p.border })
+        .bg(if active { p.accent } else { gpui::transparent_black() })
+        .hover(move |st| st.bg(p.accent))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(theme::scaled(theme::TEXT_MD))
+                .text_color(p.foreground)
+                .child(label),
+        )
+        .child(
+            div()
+                .text_size(theme::scaled(theme::TEXT_SM))
+                .text_color(p.muted_fg)
+                .child(hint),
+        )
+        .when(active, |this| {
+            this.child(Icon::new(IconName::Check).size_4().text_color(p.primary))
+        })
+}
+
+fn settings_section(title: String, p: &theme::Palette) -> gpui::Div {
+    div()
+        .pt_1()
+        .text_size(theme::scaled(theme::TEXT_SM))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(p.muted_fg)
+        .child(title)
+}
+
+/// A key cap: `Ctrl+Enter`.
+fn kbd(text: String, p: &theme::Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .py(px(1.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.background)
+        .text_size(theme::scaled(theme::TEXT_SM))
+        .font_family(theme::MONO_FONT)
+        .text_color(p.foreground)
+        .child(text)
 }
 
 /// The "New table" starter statement per SQL dialect; `None` for stores

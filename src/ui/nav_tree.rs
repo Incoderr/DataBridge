@@ -18,7 +18,7 @@ use gpui::{
 use gpui_component::input::Input;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_component::{h_flex, v_flex, v_virtual_list, Icon, IconName, Sizable, Size};
+use gpui_component::{h_flex, v_flex, v_virtual_list, Icon, IconName};
 
 use crate::core::model::{group_digits, ConnectionStatus, DbType, NodeKind, TableMeta};
 use crate::ui::app::DataBridge;
@@ -122,7 +122,7 @@ fn chevron(open: bool, color: Hsla) -> AnyElement {
         IconName::ChevronRight
     };
     Icon::new(icon)
-        .with_size(Size::Size(px(13.)))
+        .size_4()
         .text_color(color)
         .into_any_element()
 }
@@ -140,7 +140,7 @@ fn render_icon_recolored(icon: &TreeIcon, recolor: Option<Hsla>) -> AnyElement {
         TreeIcon::Brand(t) => brand_icon(*t, 15.),
         TreeIcon::Glyph(path, own) => glyph_icon(path, recolor.unwrap_or(*own), 15.),
         TreeIcon::Lucide(name, own) => Icon::new(name.clone())
-            .with_size(Size::Size(px(15.)))
+            .size(theme::scaled(theme::ICON_LG))
             .text_color(recolor.unwrap_or(*own))
             .into_any_element(),
     }
@@ -194,10 +194,10 @@ impl DataBridge {
             .child(
                 h_flex()
                     .flex_none()
+                    .h(theme::scaled(theme::TOOLBAR_H + 4.))
                     .items_center()
-                    .gap(px(6.))
+                    .gap_1()
                     .px_2()
-                    .py(px(8.))
                     .border_b_1()
                     .border_color(p.toolbar_border)
                     .child(
@@ -207,9 +207,7 @@ impl DataBridge {
                             .items_center()
                             .child(
                                 div().flex_1().min_w_0().child(
-                                    Input::new(&self.search)
-                                        .large()
-                                        .h(theme::scaled(36.)),
+                                    Input::new(&self.search),
                                 ),
                             )
                             .when(!self.query.trim().is_empty(), |this| {
@@ -226,7 +224,7 @@ impl DataBridge {
                                         .rounded(px(2.))
                                         .text_color(p.muted_fg)
                                         .hover(move |s| s.text_color(p.foreground))
-                                        .child(Icon::new(IconName::Close).with_size(Size::Size(px(12.))))
+                                        .child(Icon::new(IconName::Close).size_3p5())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.query.clear();
                                             this.search.update(cx, |s, cx| s.set_value(String::new(), window, cx));
@@ -238,19 +236,19 @@ impl DataBridge {
                     .child(
                         div()
                             .id("tree-filter")
-                            .size(theme::scaled(32.))
+                            .size(theme::scaled(theme::CONTROL_H))
                             .flex()
                             .flex_none()
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .rounded(px(2.))
+                            .rounded(px(4.))
                             .hover(move |s| s.bg(p.tree_hover))
                             .when(self.filter_only_tables, move |s| s.bg(p.accent))
                             .child(
                                 svg()
                                     .path("icons/filter.svg")
-                                    .size(theme::scaled(15.))
+                                    .size_4()
                                     .text_color(if self.filter_only_tables { p.primary } else { p.muted_fg }),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -261,7 +259,7 @@ impl DataBridge {
                     .child(
                         div()
                             .id("tree-reload")
-                            .size(theme::scaled(32.))
+                            .size(theme::scaled(theme::CONTROL_H))
                             .flex()
                             .flex_none()
                             .items_center()
@@ -272,7 +270,7 @@ impl DataBridge {
                             .child(
                                 svg()
                                     .path("icons/redo-2.svg")
-                                    .size(theme::scaled(15.))
+                                    .size_4()
                                     .text_color(p.muted_fg),
                             )
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -806,7 +804,7 @@ fn new_table_row(schema: &str, p: &theme::Palette, cx: &mut Context<DataBridge>)
         .child(div().w(theme::scaled(16.)).h_full().flex_none())
         .child(
             Icon::new(IconName::Plus)
-                .with_size(Size::Size(px(14.)))
+                .size_4()
                 .flex_none()
                 .text_color(p.primary.opacity(0.7)),
         )

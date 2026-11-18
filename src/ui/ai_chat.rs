@@ -12,7 +12,7 @@
 //!   (DROP, TRUNCATE, UPDATE/DELETE without WHERE) always wait for Run.
 //!
 //! Conversations persist in `ai_history.json` (history list in the
-//! header). Enter sends, Ctrl+Enter inserts a newline. Streaming and
+//! header). Enter sends, Shift+Enter inserts a newline (chat convention). Streaming and
 //! execution are stale-guarded by `send_id` (same pattern as
 //! `RecordsDelegate::load`); Stop bumps it and drops the stream task,
 //! which cancels the HTTP request.
@@ -24,7 +24,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::{Disableable, Icon, IconName, Sizable, Size, h_flex, v_flex};
+use gpui_component::{Disableable, Icon, IconName, Sizable, h_flex, v_flex};
 
 use crate::core::session::CancelToken;
 use crate::core::ai::{
@@ -108,6 +108,9 @@ impl AiChatView {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 10)
+                // Enter submits (PressEnter, no newline); Shift+Enter
+                // inserts the newline.
+                .submit_on_enter(true)
                 .placeholder(tr!("ai.placeholder"))
         });
         let field = |v: &str, ph: &str, masked: bool, window: &mut Window, cx: &mut Context<Self>| {
@@ -135,23 +138,12 @@ impl AiChatView {
             }
         });
 
-        // Multi-line inputs insert the newline *before* emitting
-        // PressEnter (Ctrl+Enter = `secondary` included, which is exactly
-        // the "new line" gesture). Plain Enter: take that newline back out
-        // and send.
-        let send_sub = cx.subscribe_in(&input, window, |this, state, ev, window, cx| {
-            if let InputEvent::PressEnter { secondary: false, shift: false } = ev {
-                let (mut text, cursor) = {
-                    let s = state.read(cx);
-                    (s.value().to_string(), s.cursor())
-                };
-                if cursor > 0 && cursor <= text.len() && text[..cursor].ends_with('\n') {
-                    text.remove(cursor - 1);
-                }
-                if this.busy() {
-                    state.update(cx, |s, cx| s.set_value(text, window, cx));
-                } else {
-                    this.send_text(text, window, cx);
+        // Enter (and Ctrl+Enter) send; Shift+Enter is a newline, which the
+        // input inserts itself (`submit_on_enter`).
+        let send_sub = cx.subscribe_in(&input, window, |this, _, ev, window, cx| {
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                if !this.busy() {
+                    this.send(window, cx);
                 }
             }
         });
@@ -676,15 +668,15 @@ impl Render for AiChatView {
         let auto = self.cfg.mode == AiMode::Auto;
 
         let icon_btn = |id: &'static str, icon: IconName, tip: SharedString| {
-            Button::new(id).ghost().xsmall().icon(Icon::new(icon)).tooltip(tip)
+            Button::new(id).ghost().icon(Icon::new(icon)).tooltip(tip)
         };
         let mode_btn = |id: &'static str, label: SharedString, on: bool| {
-            let b = Button::new(id).xsmall().label(label);
+            let b = Button::new(id).label(label);
             if on { b.primary() } else { b.ghost() }
         };
 
         let header = h_flex()
-            .h(theme::scaled(38.))
+            .h(theme::scaled(theme::TOOLBAR_H))
             .flex_none()
             .items_center()
             .gap_1()
@@ -692,7 +684,7 @@ impl Render for AiChatView {
             .border_b_1()
             .border_color(p.toolbar_border)
             .bg(p.toolbar)
-            .child(Icon::new(IconName::Bot).with_size(Size::Size(px(14.))).text_color(p.primary))
+            .child(Icon::new(IconName::Bot).size_4().text_color(p.primary))
             .child(
                 div()
                     .flex_1()
@@ -799,14 +791,12 @@ impl Render for AiChatView {
                     )
                     .child(if busy {
                         Button::new("ai-stop")
-                            .small()
                             .outline()
                             .icon(Icon::new(IconName::CircleX))
                             .label(tr!("ai.stop"))
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                     } else {
                         Button::new("ai-send")
-                            .small()
                             .primary()
                             .icon(Icon::new(IconName::ArrowUp))
                             .label(tr!("ai.send"))
@@ -840,7 +830,7 @@ impl AiChatView {
         let mut providers = h_flex().flex_wrap().gap_1();
         for (i, prov) in self.settings.providers.iter().enumerate() {
             let id = prov.id.clone();
-            let b = Button::new(("ai-provider", i)).xsmall().label(prov.name.clone());
+            let b = Button::new(("ai-provider", i)).small().label(prov.name.clone());
             let b = if active_id.as_deref() == Some(prov.id.as_str()) { b.primary() } else { b.outline() };
             providers = providers.child(b.on_click(cx.listener(move |this, _, window, cx| {
                 this.select_provider(id.clone(), window, cx)
@@ -848,7 +838,7 @@ impl AiChatView {
         }
         providers = providers.child(
             Button::new("ai-provider-add")
-                .xsmall()
+                .small()
                 .ghost()
                 .icon(Icon::new(IconName::Plus))
                 .label(tr!("ai.add"))
@@ -863,7 +853,7 @@ impl AiChatView {
             for (i, pr) in PRESETS.iter().enumerate() {
                 row = row.child(
                     Button::new(("ai-preset", i))
-                        .xsmall()
+                        .small()
                         .outline()
                         .label(pr.name)
                         .tooltip(if pr.base_url.is_empty() { tr!("ai.custom_tip") } else { SharedString::from(pr.base_url) })
@@ -886,7 +876,7 @@ impl AiChatView {
             let m = (*m).clone();
             chips = chips.child(
                 Button::new(("ai-model", i))
-                    .xsmall()
+                    .small()
                     .outline()
                     .label(m.clone())
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -916,17 +906,16 @@ impl AiChatView {
             return head.into_any_element();
         }
         head.child(label(tr!("common.name")))
-            .child(Input::new(&self.name).small())
+            .child(Input::new(&self.name))
             .child(label(tr!("ai.server")))
-            .child(Input::new(&self.base_url).small())
+            .child(Input::new(&self.base_url))
             .child(label(tr!("ai.model")))
             .child(
                 h_flex()
                     .gap_1()
-                    .child(div().flex_1().child(Input::new(&self.model).small()))
+                    .child(div().flex_1().child(Input::new(&self.model)))
                     .child(
                         Button::new("ai-models")
-                            .small()
                             .outline()
                             .label(if self.models_loading { SharedString::from("…") } else { tr!("ai.list") })
                             .disabled(self.models_loading)
@@ -937,14 +926,13 @@ impl AiChatView {
             )
             .child(chips)
             .child(label(tr!("ai.api_key")))
-            .child(Input::new(&self.api_key).small().mask_toggle())
+            .child(Input::new(&self.api_key).mask_toggle())
             .child(
                 h_flex()
                     .justify_between()
                     .pt_1()
                     .child(
                         Button::new("ai-provider-remove")
-                            .small()
                             .ghost()
                             .icon(Icon::new(IconName::Delete))
                             .label(tr!("ai.remove"))
@@ -953,7 +941,6 @@ impl AiChatView {
                     )
                     .child(
                         Button::new("ai-save")
-                            .small()
                             .primary()
                             .label(tr!("ai.save"))
                             .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
@@ -1012,7 +999,6 @@ impl AiChatView {
                     .child(
                         Button::new(("ai-conv-del", i))
                             .ghost()
-                            .xsmall()
                             .icon(Icon::new(IconName::Delete))
                             .tooltip(tr!("ai.delete"))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1106,7 +1092,6 @@ impl AiChatView {
                                         .justify_end()
                                         .child(
                                             Button::new(SharedString::from(format!("ai-copy-{mi}-{si}")))
-                                                .xsmall()
                                                 .ghost()
                                                 .icon(Icon::new(IconName::Copy))
                                                 .tooltip(tr!("ai.copy"))
@@ -1116,7 +1101,6 @@ impl AiChatView {
                                         )
                                         .child(
                                             Button::new(SharedString::from(format!("ai-open-{mi}-{si}")))
-                                                .xsmall()
                                                 .outline()
                                                 .label(tr!("ai.open_sql"))
                                                 .disabled(!connected)
@@ -1126,7 +1110,6 @@ impl AiChatView {
                                         )
                                         .child({
                                             let run = Button::new(SharedString::from(format!("ai-run-{mi}-{si}")))
-                                                .xsmall()
                                                 .label(tr!("common.run"))
                                                 .disabled(!connected || busy)
                                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -1157,7 +1140,7 @@ impl AiChatView {
                                     .text_color(color)
                                     .child(
                                         Icon::new(if *ok { IconName::CircleCheck } else { IconName::TriangleAlert })
-                                            .with_size(Size::Size(px(12.))),
+                                            .size_3p5(),
                                     )
                                     .child(if *ok { tr!("ai.executed") } else { tr!("ai.failed") }),
                             )
@@ -1175,7 +1158,6 @@ impl AiChatView {
                     .gap_1()
                     .child(
                         Button::new("ai-regenerate")
-                            .xsmall()
                             .ghost()
                             .icon(Icon::new(IconName::Redo2))
                             .label(tr!("ai.retry"))
@@ -1184,7 +1166,6 @@ impl AiChatView {
                     )
                     .child(
                         Button::new("ai-edit-last")
-                            .xsmall()
                             .ghost()
                             .label(tr!("ai.edit"))
                             .tooltip(tr!("ai.edit_tip"))

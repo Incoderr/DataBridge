@@ -928,6 +928,88 @@ pub fn is_select_like(sql: &str) -> bool {
     }
 }
 
+/// Byte ranges of the statements in a script, split on `;` outside quotes
+/// ('…', "…", `…`) and `--` / `//` / `/* */` comments. Each range is
+/// trimmed of surrounding whitespace and excludes its `;`; empty pieces
+/// are dropped. (`//` covers mongosh scripts; in SQL it never appears
+/// outside a string.)
+pub fn statement_ranges(sql: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut push = |start: usize, end: usize| {
+        let piece = &sql[start..end];
+        let lead = piece.len() - piece.trim_start().len();
+        let trail = piece.len() - piece.trim_end().len();
+        if lead < piece.len() {
+            out.push(start + lead..end - trail);
+        }
+    };
+    let bytes = sql.as_bytes();
+    let mut start = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'-' | b'/' if bytes.get(i + 1) == Some(&c) => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < bytes.len() && !(bytes[i] == b'/' && bytes[i - 1] == b'*') {
+                        i += 1;
+                    }
+                }
+                b';' => {
+                    push(start, i);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    push(start, sql.len());
+    out
+}
+
+/// What the SQL editor runs: the selection when there is one, else the
+/// statement under the cursor (the cursor may sit right after its `;`, or
+/// in the whitespace after it), else the whole text. Returns the range in
+/// `sql` to execute; `None` when there is nothing to run.
+pub fn statement_at(sql: &str, selection: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    if selection.start < selection.end {
+        let piece = &sql[selection.clone()];
+        let lead = piece.len() - piece.trim_start().len();
+        let trail = piece.len() - piece.trim_end().len();
+        return (lead < piece.len()).then(|| selection.start + lead..selection.end - trail);
+    }
+    let ranges = statement_ranges(sql);
+    let cursor = selection.start;
+    // The statement containing the cursor, or ending right before it
+    // (`SELECT 1;|`); else the nearest statement before the cursor; else
+    // the first one after it.
+    ranges
+        .iter()
+        .find(|r| r.start <= cursor && cursor <= r.end)
+        .or_else(|| {
+            ranges.iter().rev().find(|r| {
+                r.end <= cursor && sql[r.end..cursor].trim_start_matches(';').trim().is_empty()
+            })
+        })
+        .or_else(|| ranges.iter().rev().find(|r| r.end <= cursor))
+        .or_else(|| ranges.first())
+        .cloned()
+}
+
 /// Statements after which the schema tree must reload: SQL DDL, and the
 /// mongosh calls that create or drop collections/databases (an insert
 /// into a missing collection creates it).
@@ -1048,6 +1130,29 @@ pub fn group_digits(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statements_split_outside_quotes_and_comments() {
+        let sql = "SELECT ';' FROM t; -- a;b\nSELECT 2 /* ; */ ;\n\n  db.c.find() // x;y\n";
+        let pieces: Vec<&str> = statement_ranges(sql).into_iter().map(|r| &sql[r]).collect();
+        assert_eq!(pieces, ["SELECT ';' FROM t", "-- a;b\nSELECT 2 /* ; */", "db.c.find() // x;y"]);
+        assert!(statement_ranges(" ; ;\n").is_empty());
+    }
+
+    #[test]
+    fn the_editor_runs_the_statement_under_the_cursor() {
+        let sql = "SELECT 1;\nSELECT 2;\n\nSELECT 3";
+        let at = |c: usize| statement_at(sql, c..c).map(|r| &sql[r]);
+        assert_eq!(at(3), Some("SELECT 1"));
+        assert_eq!(at(9), Some("SELECT 1")); // right after `;`
+        assert_eq!(at(10), Some("SELECT 2")); // start of the next line
+        assert_eq!(at(20), Some("SELECT 2")); // the blank line after it
+        assert_eq!(at(sql.len()), Some("SELECT 3"));
+        // A selection wins (trimmed).
+        assert_eq!(statement_at(sql, 0..12).map(|r| &sql[r]), Some("SELECT 1;\nSE"));
+        assert_eq!(statement_at("  \n", 1..1), None);
+        assert_eq!(statement_at("\n\nSELECT 9", 0..0).map(|r| r.start), Some(2));
+    }
 
     fn flt(column: &str, kind: ColumnKind, type_: &str, op: FilterOp, value: Value) -> Filter {
         Filter { column: column.into(), kind, type_: type_.into(), op, value }

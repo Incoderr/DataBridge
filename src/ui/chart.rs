@@ -41,8 +41,9 @@ pub fn chart_element(data: &ChartData, kind: ChartKind, key: u64, cx: &App) -> A
         })
         .collect();
     let n = pts.len();
-    // Thin out X labels on long axes (≈ 12 visible).
-    let tick_margin = (n / 12).max(1);
+    // Thin out X labels on long axes (≈ 6–8 visible: date labels are
+    // wide, and the results pane is often narrow).
+    let tick_margin = n.div_ceil(8).max(1);
     let fmt = |v: f64| SharedString::from(short_number(v));
 
     let chart = match kind {
@@ -120,10 +121,10 @@ pub fn legend(data: &ChartData, cx: &App) -> AnyElement {
             h_flex()
                 .gap_1()
                 .items_center()
-                .child(div().size(px(8.)).rounded_full().bg(colors[s % colors.len()]))
+                .child(div().size(theme::scaled(8.)).rounded_full().bg(colors[s % colors.len()]))
                 .child(
                     div()
-                        .text_size(theme::scaled(theme::TEXT_XS))
+                        .text_size(theme::scaled(theme::TEXT_SM))
                         .text_color(p.muted_fg)
                         .font_family(theme::MONO_FONT)
                         .child(series.name.clone()),

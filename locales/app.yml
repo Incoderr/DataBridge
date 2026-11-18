@@ -31,6 +31,91 @@ settings.theme_dark:
 settings.language:
   en: Language
   ru: Язык
+settings.tab_interface:
+  en: Interface
+  ru: Интерфейс
+settings.tab_keyboard:
+  en: Keyboard
+  ru: Клавиатура
+common.close:
+  en: Close
+  ru: Закрыть
+
+keys.preset:
+  en: Shortcut preset
+  ru: Набор сочетаний клавиш
+keys.file_hint:
+  en: "Any shortcut can be changed in keymap.json: list a command id with its keys (for example \"sql.run\": [\"ctrl-enter\", \"f5\"]; [] removes the shortcut). Changed commands are marked."
+  ru: "Любое сочетание меняется в keymap.json: укажите id команды и клавиши (например \"sql.run\": [\"ctrl-enter\", \"f5\"]; [] убирает сочетание). Изменённые команды помечены."
+keys.open_file:
+  en: Open keymap.json
+  ru: Открыть keymap.json
+keys.reload:
+  en: Reload
+  ru: Перечитать
+keys.custom:
+  en: custom
+  ru: своё
+keys.errors:
+  en: "Problems in keymap.json (the rest is applied):"
+  ru: "Ошибки в keymap.json (остальное применено):"
+keys.scope_sql:
+  en: SQL editor
+  ru: SQL-редактор
+keys.scope_text:
+  en: Text fields
+  ru: Текстовые поля
+keys.scope_app:
+  en: Application
+  ru: Приложение
+keys.sql_run:
+  en: Run the selection or the statement under the cursor
+  ru: Выполнить выделенное или запрос под курсором
+keys.sql_complete:
+  en: Show completions
+  ru: Показать подсказки
+keys.sql_toggle_comment:
+  en: Comment / uncomment lines
+  ru: Закомментировать / раскомментировать строки
+keys.sql_duplicate_line:
+  en: Duplicate line or selection
+  ru: Дублировать строку или выделение
+keys.sql_delete_line:
+  en: Delete line
+  ru: Удалить строку
+keys.sql_move_line_up:
+  en: Move line up
+  ru: Переместить строку вверх
+keys.sql_move_line_down:
+  en: Move line down
+  ru: Переместить строку вниз
+keys.sql_line_below:
+  en: Start a new line below
+  ru: Новая строка ниже
+keys.sql_line_above:
+  en: Start a new line above
+  ru: Новая строка выше
+keys.edit_undo:
+  en: Undo
+  ru: Отменить
+keys.edit_redo:
+  en: Redo
+  ru: Повторить
+keys.app_new_query:
+  en: New SQL editor
+  ru: Новый SQL-запрос
+keys.app_close_tab:
+  en: Close tab
+  ru: Закрыть вкладку
+keys.app_refresh:
+  en: Refresh data
+  ru: Обновить данные
+keys.app_toggle_ai:
+  en: Show / hide the AI assistant
+  ru: Показать / скрыть AI-ассистента
+keys.app_settings:
+  en: Settings
+  ru: Настройки
 
 update.section:
   en: Updates
@@ -394,8 +479,8 @@ query.stop_hint:
   en: "Cancel the running statement"
   ru: "Отменить выполняющийся запрос"
 query.run_hint:
-  en: "Run the statement (Ctrl+Enter)"
-  ru: "Выполнить запрос (Ctrl+Enter)"
+  en: "Run the selection or the statement under the cursor"
+  ru: "Выполнить выделенное или запрос под курсором"
 query.cancelling:
   en: "cancelling…"
   ru: "отмена…"
@@ -577,8 +662,8 @@ filter.and:
   en: "and"
   ru: "и"
 ai.placeholder:
-  en: "Ask about your data…  (Enter — send, Ctrl+Enter — new line)"
-  ru: "Спросите о своих данных…  (Enter — отправить, Ctrl+Enter — новая строка)"
+  en: "Ask about your data…  (Enter — send, Shift+Enter — new line)"
+  ru: "Спросите о своих данных…  (Enter — отправить, Shift+Enter — новая строка)"
 ai.model_ph:
   en: "model id — List shows what the server has"
   ru: "id модели — «Список» покажет, что есть на сервере"

@@ -3,7 +3,7 @@
 use gpui::prelude::*;
 use gpui::{App, ClickEvent, Context, Div, Hsla, IntoElement, SharedString, ParentElement, Stateful, Styled, Window, div, px, rgb, svg};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{v_flex, Icon, IconName, Sizable, Size};
+use gpui_component::{v_flex, Icon, IconName};
 
 use crate::core::model::ConnectionStatus;
 use crate::ui::app::DataBridge;
@@ -106,7 +106,7 @@ impl DataBridge {
             .child(tool_btn(
                 "new-conn",
                 tr!("sidebar.new_connection"),
-                Icon::new(IconName::Plus).with_size(Size::Size(px(16.))),
+                Icon::new(IconName::Plus).size(theme::scaled(theme::ICON_LG)),
                 hover,
                 None,
                 None,
@@ -114,8 +114,8 @@ impl DataBridge {
             ))
             .child(tool_btn(
                 "refresh",
-                tr!("sidebar.refresh"),
-                Icon::new(IconName::Redo2).with_size(Size::Size(px(16.))),
+                crate::ui::keymap::with_shortcut(tr!("sidebar.refresh"), "app.refresh", cx).into(),
+                Icon::new(IconName::Redo2).size(theme::scaled(theme::ICON_LG)),
                 hover,
                 None,
                 None,
@@ -123,8 +123,8 @@ impl DataBridge {
             ))
             .child(tool_btn(
                 "ai-toggle",
-                tr!("ai.title"),
-                Icon::new(IconName::Bot).with_size(Size::Size(px(16.))),
+                crate::ui::keymap::with_shortcut(tr!("ai.title"), "app.toggle_ai", cx).into(),
+                Icon::new(IconName::Bot).size(theme::scaled(theme::ICON_LG)),
                 hover,
                 if self.show_ai { Some(p.accent) } else { None },
                 if self.show_ai { Some(p.primary) } else { None },
@@ -141,8 +141,8 @@ impl DataBridge {
             )
             .child(tool_btn(
                 "settings",
-                tr!("settings.title"),
-                Icon::new(IconName::Settings).with_size(Size::Size(px(16.))),
+                crate::ui::keymap::with_shortcut(tr!("settings.title"), "app.settings", cx).into(),
+                Icon::new(IconName::Settings).size(theme::scaled(theme::ICON_LG)),
                 hover,
                 None,
                 None,
@@ -154,7 +154,7 @@ impl DataBridge {
             .child(tool_btn(
                 "disconnect",
                 tr!("sidebar.disconnect"),
-                Icon::new(IconName::Close).with_size(Size::Size(px(16.))),
+                Icon::new(IconName::Close).size(theme::scaled(theme::ICON_LG)),
                 hover,
                 None,
                 Some(p.destructive),
