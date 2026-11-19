@@ -154,26 +154,35 @@ update.progress_unknown:
   en: "%{done} MB"
   ru: "%{done} МБ"
 update.ready:
-  en: "Update installed"
-  ru: "Обновление установлено"
+  en: "Update downloaded"
+  ru: "Обновление скачано"
 update.ready_body:
-  en: "Restart DataBridge to run version %{new}."
-  ru: "Перезапустите DataBridge, чтобы перейти на версию %{new}."
+  en: "DataBridge restarts to install version %{new}."
+  ru: "DataBridge перезапустится и установит версию %{new}."
+update.ready_portable_body:
+  en: "The %{new} installer is ready. DataBridge closes while it runs; the installed copy then updates itself."
+  ru: "Установщик версии %{new} готов. DataBridge закроется на время установки; установленная версия дальше обновляется сама."
+update.portable_body:
+  en: "Version %{new} is out (you have %{current}). This is a portable copy: the update installs DataBridge, which then keeps itself up to date."
+  ru: "Вышла версия %{new} (у вас %{current}). Это портативная копия: обновление установит DataBridge, и дальше он будет обновляться сам."
+update.download:
+  en: "Download"
+  ru: "Скачать"
+update.run_installer:
+  en: "Run installer"
+  ru: "Запустить установщик"
 update.failed:
   en: "Update failed"
   ru: "Не удалось обновить"
 update.release_page:
   en: "Release notes"
   ru: "Что нового"
-update.install:
-  en: "Download and install"
-  ru: "Скачать и установить"
 update.retry:
   en: "Try again"
   ru: "Повторить"
 update.restart:
-  en: "Restart now"
-  ru: "Перезапустить"
+  en: "Restart and update"
+  ru: "Перезапустить и обновить"
 update.later:
   en: "Later"
   ru: "Позже"
@@ -439,6 +448,9 @@ connect.create_failed:
 common.loading:
   en: "loading…"
   ru: "загрузка…"
+diagram.auto_layout:
+  en: Arrange by relations
+  ru: Расставить по связям
 diagram.summary:
   en: "%{tables} tables, %{relations} relations"
   ru: "таблиц: %{tables}, связей: %{relations}"

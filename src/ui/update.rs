@@ -1,16 +1,23 @@
-//! Self-update UI (`core::update`): the startup check, the floating
+//! Update UI (`core::update`): the startup check, the floating
 //! "update available" card (bottom-right, over the wizard and the
 //! explorer alike) and the Updates section of the Settings dialog.
 //!
+//! Flow: Available → Download (the installer, verified) → Ready → an
+//! installed copy offers "Restart and update" (silent setup, the app comes
+//! back on the new version); a portable copy offers "Run installer" (the
+//! setup wizard: updating a portable copy means installing DataBridge).
+//!
 //! Every check / install bumps `DataBridge::update_id`; results of a
 //! superseded request are dropped (the stale-guard pattern).
+
+use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{div, px, AnyElement, ClickEvent, Context, FontWeight, IntoElement, ParentElement, Styled};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{h_flex, v_flex, Disableable, Icon, IconName};
 
-use crate::core::update::{self, InstallEvent, Release};
+use crate::core::update::{self, InstallEvent, InstallKind, Release};
 use crate::ui::app::DataBridge;
 use crate::ui::theme;
 
@@ -23,8 +30,8 @@ pub enum UpdateState {
     UpToDate,
     Available(Release),
     Downloading { release: Release, done: u64, total: Option<u64> },
-    /// The new exe is in place; a restart runs it.
-    Ready(Release),
+    /// The verified installer is on disk; running it updates the app.
+    Ready { release: Release, setup: PathBuf },
     /// `release` is set when the failure happened while installing it
     /// (the card offers a retry); a failed check has none.
     Failed { release: Option<Release>, error: String },
@@ -46,7 +53,7 @@ impl DataBridge {
     /// "up to date" and errors; the startup one stays silent on failure
     /// (offline is normal).
     pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
-        if matches!(self.update, UpdateState::Downloading { .. } | UpdateState::Ready(_)) {
+        if matches!(self.update, UpdateState::Downloading { .. } | UpdateState::Ready { .. }) {
             return;
         }
         self.update_id += 1;
@@ -83,7 +90,7 @@ impl DataBridge {
         }
     }
 
-    /// Download + verify + swap the exe; ends in `Ready` or `Failed`.
+    /// Download + verify the installer; ends in `Ready` or `Failed`.
     pub fn install_update(&mut self, cx: &mut Context<Self>) {
         let Some(release) = self.pending_release() else { return };
         if !release.installable() {
@@ -94,7 +101,7 @@ impl DataBridge {
         let id = self.update_id;
         self.update = UpdateState::Downloading { release: release.clone(), done: 0, total: None };
         cx.notify();
-        let mut rx = update::install(release.clone());
+        let mut rx = update::download(release.clone());
         cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.recv().await {
                 let alive = this
@@ -106,7 +113,9 @@ impl DataBridge {
                             InstallEvent::Progress(done, total) => {
                                 UpdateState::Downloading { release: release.clone(), done, total }
                             }
-                            InstallEvent::Done => UpdateState::Ready(release.clone()),
+                            InstallEvent::Done(setup) => {
+                                UpdateState::Ready { release: release.clone(), setup }
+                            }
                             InstallEvent::Error(error) => {
                                 UpdateState::Failed { release: Some(release.clone()), error }
                             }
@@ -123,10 +132,11 @@ impl DataBridge {
         .detach();
     }
 
-    /// Start the new exe and quit this one.
+    /// Start the installer and quit: it replaces this exe (waiting for the
+    /// instance mutex to go) and, for an installed copy, starts the new one.
     pub fn restart_after_update(&mut self, cx: &mut Context<Self>) {
-        let UpdateState::Ready(release) = &self.update else { return };
-        match update::restart() {
+        let UpdateState::Ready { release, setup } = &self.update else { return };
+        match update::run_installer(setup) {
             Ok(()) => cx.quit(),
             Err(e) => {
                 self.update = UpdateState::Failed {
@@ -144,10 +154,15 @@ impl DataBridge {
             return None;
         }
         let p = theme::palette(cx);
+        let portable = update::install_kind() == InstallKind::Portable;
         let (title, body, release) = match &self.update {
             UpdateState::Available(r) => (
                 tr!("update.available"),
-                tr!("update.available_body", new = r.version, current = update::current_version()),
+                if portable {
+                    tr!("update.portable_body", new = r.version, current = update::current_version())
+                } else {
+                    tr!("update.available_body", new = r.version, current = update::current_version())
+                },
                 r,
             ),
             UpdateState::Downloading { release, done, total } => (
@@ -158,7 +173,15 @@ impl DataBridge {
                 },
                 release,
             ),
-            UpdateState::Ready(r) => (tr!("update.ready"), tr!("update.ready_body", new = r.version), r),
+            UpdateState::Ready { release: r, .. } => (
+                tr!("update.ready"),
+                if portable {
+                    tr!("update.ready_portable_body", new = r.version)
+                } else {
+                    tr!("update.ready_body", new = r.version)
+                },
+                r,
+            ),
             UpdateState::Failed { release: Some(r), error } => (tr!("update.failed"), error.clone().into(), r),
             _ => return None,
         };
@@ -186,12 +209,12 @@ impl DataBridge {
                     actions = actions.child(
                         Button::new("update-install")
                             .primary()
-                            .label(if retry { tr!("update.retry") } else { tr!("update.install") })
+                            .label(if retry { tr!("update.retry") } else { tr!("update.download") })
                             .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
                     );
                 }
             }
-            UpdateState::Ready(_) => {
+            UpdateState::Ready { .. } => {
                 actions = actions
                     .child(
                         Button::new("update-later")
@@ -205,7 +228,7 @@ impl DataBridge {
                     .child(
                         Button::new("update-restart")
                             .primary()
-                            .label(tr!("update.restart"))
+                            .label(if portable { tr!("update.run_installer") } else { tr!("update.restart") })
                             .on_click(cx.listener(|this, _, _, cx| this.restart_after_update(cx))),
                     );
             }
@@ -283,7 +306,7 @@ impl DataBridge {
             UpdateState::UpToDate => Some(tr!("update.up_to_date")),
             UpdateState::Available(r) => Some(tr!("update.available_short", new = r.version)),
             UpdateState::Downloading { .. } => Some(tr!("update.downloading")),
-            UpdateState::Ready(r) => Some(tr!("update.ready_body", new = r.version)),
+            UpdateState::Ready { release: r, .. } => Some(tr!("update.ready_body", new = r.version)),
             UpdateState::Failed { error, .. } => Some(error.clone().into()),
             UpdateState::Idle => None,
         };

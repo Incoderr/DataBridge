@@ -4,9 +4,14 @@
 # - every push to main / PR: tests, the mock-only build, a release build;
 #   the zipped exe is kept as a workflow artifact for 14 days.
 # - a pushed tag `v*` (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
-#   the same build, attached to a GitHub Release for that tag: the zip plus
-#   the bare `databridge-windows-x64.exe` and its `.sha256` — the in-app
-#   updater (src/core/update.rs) downloads those two; keep the names.
+#   the same build, attached to a GitHub Release for that tag:
+#   - `DataBridge-Setup-x64.exe` + `.sha256` (Inno Setup, installer/
+#     databridge.iss) — the installer, and what the in-app updater
+#     (src/core/update.rs, `SETUP_ASSET`) downloads and runs silently;
+#   - the portable zip;
+#   - the bare `databridge-windows-x64.exe` + `.sha256`: only for 0.3/0.4,
+#     whose updater swaps the exe in place (the new version then offers the
+#     installer). Keep all names.
 name: Windows build
 
 on:
@@ -60,11 +65,28 @@ jobs:
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           "$hash  $exe" | Out-File -FilePath "$exe.sha256" -Encoding ascii -NoNewline
 
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$version" installer\databridge.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "DataBridge-Setup-x64.exe"
+          Copy-Item "dist\$setup" $setup
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $setup" | Out-File -FilePath "$setup.sha256" -Encoding ascii -NoNewline
+
       - uses: actions/upload-artifact@v4
         with:
           name: databridge-windows-x64
           path: |
             ${{ env.ZIP }}
+            DataBridge-Setup-x64.exe
+            DataBridge-Setup-x64.exe.sha256
             databridge-windows-x64.exe
             databridge-windows-x64.exe.sha256
           retention-days: 14
@@ -83,6 +105,8 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
+            DataBridge-Setup-x64.exe
+            DataBridge-Setup-x64.exe.sha256
             *.zip
             databridge-windows-x64.exe
             databridge-windows-x64.exe.sha256

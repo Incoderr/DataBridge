@@ -50,8 +50,10 @@ fn main() {
         eprintln!("DataBridge: unknown argument {a} (see --help)");
     }
     core::registry::init(args.iter().any(|a| a == "--mock"));
-    // Leftovers of a previous self-update (the replaced exe).
+    // Leftovers of earlier updates (a swapped exe, downloaded installers),
+    // and the mutex the installer waits for while we run.
     core::update::cleanup();
+    core::update::hold_instance_mutex();
 
     let fonts: Vec<std::borrow::Cow<'static, [u8]>> = vec![
         include_bytes!("../assets/fonts/PublicSans-Regular.ttf")

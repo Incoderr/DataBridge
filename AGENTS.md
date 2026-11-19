@@ -18,6 +18,7 @@ removed; the GPUI Rust app is the only product code in this repo.
     `runtime` and the drivers land in stages 1–2)
   - `/assets` — fonts (embedded with `include_bytes!`) and SVG icons
   - `/locales/app.yml` — UI translations (rust-i18n, compiled in; en + ru)
+  - `/installer/databridge.iss` — the Windows installer (Inno Setup 6, built by CI)
   - `/site` — Astro landing page. Separate Node toolchain (pnpm), own `AGENTS.md`,
     deployed to Cloudflare Pages (build root directory `site`, output `site/dist`).
     Do not mix toolchains: the repo root is **cargo-only**,
@@ -36,9 +37,12 @@ cargo build --release
 
 CI: `.github/workflows/windows.yml` (windows-latest) runs `cargo test`,
 `cargo check --no-default-features` and `cargo build --release` on pushes
-to main and PRs (not for `site/**` / docs-only changes) and keeps the
-zipped exe as an artifact; a pushed `v*` tag also publishes it as a GitHub
-Release. Release builds on Windows use the GUI subsystem (no console —
+to main and PRs (not for `site/**` / docs-only changes), builds the
+installer (`iscc /DAppVersion=<Cargo.toml version> installer\databridge.iss`
+→ `DataBridge-Setup-x64.exe` + `.sha256`; Inno Setup comes from the
+runner or choco) and keeps it with the portable zip as artifacts; a pushed
+`v*` tag also publishes them as a GitHub Release (plus the bare exe the
+0.3/0.4 updater needs). Release builds on Windows use the GUI subsystem (no console —
 `windows_subsystem` in `main.rs`), debug builds keep the console.
 
 Tests live in `core` (`storage`: URL sanitizing, JSON round-trip). More
@@ -435,8 +439,20 @@ with the generated rows (`simple_select`); any other statement gets a
 - SQLite `auto`: only the rowid alias counts — the sole PK column
   declared exactly `INTEGER` in a rowid table (`mark_rowid_alias`);
   `INT PRIMARY KEY` must be supplied.
-- Diagram (`ui/diagram.rs`): Supabase-style ERD, bezier FK edges,
-  pan/zoom/fit, relations via `list_relations`.
+- Diagram (`ui/diagram.rs`): Supabase-style ERD, pan/zoom/fit, relations
+  via `list_relations`. Cards start in `auto_layout` (pure, tested):
+  layered left → right — a table's layer is its longest FK chain, so
+  referenced tables sit left of the ones pointing at them; layers ordered
+  by neighbour barycenters (one sweep each way) and centered; unrelated
+  tables in a grid below. It re-runs when relations load unless a card was
+  dragged (`arranged`); the toolbar's layout button re-runs it on demand.
+  Edges go from the FK column's row to the referenced column's row on the
+  facing sides (`edge_geom`), with end dots; horizontally overlapping
+  cards (stacked, self-references) get a loop out of the right sides
+  instead of a curve hidden under the cards. Hover or click a card
+  (`hovered` / `selected`; a press that moves < `CLICK_SLOP` is a click,
+  the background clears it): its edges and both end rows highlight, other
+  cards dim; hovering a column row highlights just its edges.
 - AI chat (`core/ai.rs` + `ui/ai_chat.rs`, Stage 6): **OpenAI-compatible
   servers only** (Ollama, LM Studio, llama.cpp, vLLM, …; no vendor SDKs).
   Right-hand panel toggled by the bot icon in the left rail (`sidebar.rs`);
@@ -486,18 +502,29 @@ with the generated rows (`simple_select`); any other statement gets a
   translated on purpose: driver/server error messages, SQL, brand names,
   `PK`/`FK`/`NULL`. Text already sitting in an input (placeholders of
   open views) updates when the view is recreated.
-- Self-update (`core/update.rs` + `ui/update.rs`): release builds ask
+- Updates (`core/update.rs` + `ui/update.rs`), the installed-program
+  way: DataBridge ships as an Inno Setup installer (per-user into
+  `%LOCALAPPDATA%\Programs\DataBridge`, no admin; Start menu, optional
+  desktop icon, uninstaller in "Installed apps"; fixed `AppId` — never
+  change it) and a portable zip. Release builds ask
   `api.github.com/repos/Incoderr/DataBridge/releases/latest` at startup
   (Settings → Updates: toggle + "Check now"; `AppSettings::check_updates`).
   A newer tag (`is_newer`, `v` prefix optional) shows a bottom-right card.
-  Install (Windows release builds only, `can_install`): downloads the
-  release assets `databridge-windows-x64.exe` + `.sha256` (published by
-  CI — keep the names in step), verifies the hash, renames the running exe
-  to `*.old` and moves the download in its place (rolled back on failure),
-  then "Restart now" spawns the new exe and quits; `update::cleanup` in
-  `main` removes the `.old`. Releases without those assets (≤ v0.2.0) and
-  other platforms get a link to the release page. Stale-guarded by
-  `update_id`. Version bumps: `Cargo.toml` `version` must match the tag.
+  Download fetches `DataBridge-Setup-x64.exe` + `.sha256` (`SETUP_ASSET`,
+  published by CI — keep the names in step) into
+  `%TEMP%\DataBridge-update`, verifies the hash, then `run_installer`
+  starts it and the app quits. `install_kind`: an installed copy
+  (`unins000.exe` next to the exe) runs it `/VERYSILENT … /update=1` — the
+  setup waits for the `DataBridge.Instance` mutex (held for the process's
+  life, `hold_instance_mutex` in `main`), installs over the old version and
+  starts the new one; a portable copy runs the wizard (updating it means
+  installing). Debug builds and non-Windows get the release page link.
+  Manual installs / uninstalls ask to close a running app (same mutex).
+  `cleanup` in `main` removes downloaded installers and the `.old` exe the
+  0.3/0.4 in-place swap leaves (CI still publishes that bare exe,
+  `LEGACY_ASSET`, so those versions can reach the installer). Stale-guarded
+  by `update_id`. Version bumps: `Cargo.toml` `version` must match the tag
+  (the installer takes its version from it).
 - Keymap (`ui/keymap.rs`): every customizable shortcut is a row of
   `COMMANDS` — id (`sql.run`, `sql.toggle_comment`, `app.new_query`, …),
   scope (`SqlEditor > Input`, every `Input`, or the app root `DataBridge`),
@@ -600,7 +627,8 @@ with the generated rows (`simple_select`); any other statement gets a
   `rustls-native-certs`, `hmac`, `sha1`, `sha2`, `md-5`, `base64`, `rand`,
   `stringprep`) and tokio's `net` + `io-util` features; on Windows the
   `Win32_NetworkManagement_Dns` + `Win32_Foundation` features of the
-  `windows-sys` 0.61 already in the tree (SRV lookups).
+  `windows-sys` 0.61 already in the tree (SRV lookups), plus
+  `Win32_System_Threading` (the installer's instance mutex).
 - SSH tunnels sanctioned `russh` (0.65, `default-features = false`,
   features `ring` + `rsa`: no aws-lc-rs, no flate2). It brings ~60 small
   RustCrypto crates (ed25519/curve25519, p256/384/521, ssh-key, …) — the

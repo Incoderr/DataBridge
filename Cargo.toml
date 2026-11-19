@@ -1,6 +1,6 @@
 [package]
 name = "databridge-gpui"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "DataBridge — database explorer UI built with GPUI"
 
@@ -64,9 +64,10 @@ russh = { version = "0.65", default-features = false, features = ["ring", "rsa"]
 
 # mongodb+srv:// seed lists: SRV/TXT through the system resolver
 # (`DnsQuery_W`). windows-sys 0.61 is already in the tree (gpui); only
-# the Dns bindings are switched on.
+# the Dns bindings are switched on, plus Threading for the instance mutex
+# the installer waits for (`core::update::hold_instance_mutex`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_Dns", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_Dns", "Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }

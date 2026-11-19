@@ -1,21 +1,29 @@
-//! Self-update from GitHub Releases.
+//! Updates from GitHub Releases, the way installed Windows programs do it.
 //!
-//! The Windows CI (`.github/workflows/windows.yml`) attaches to every `v*`
-//! tag's release the bare exe ([`ASSET`]) and its SHA-256 ([`ASSET`] +
-//! `.sha256`). The app asks the GitHub API for the latest (non-pre)release
-//! ([`check`]); when its tag is newer than `CARGO_PKG_VERSION`, the UI
-//! offers it. [`install`] then streams the exe next to the running one,
-//! verifies the checksum and swaps the files: Windows cannot overwrite a
-//! running exe but can *rename* it, so the current exe becomes
-//! `databridge.exe.old` (removed by [`cleanup`] on the next start) and the
-//! download takes its name. [`restart`] launches the new exe; the caller
-//! quits.
+//! DataBridge ships as an Inno Setup installer (`installer/databridge.iss`,
+//! per-user into `%LOCALAPPDATA%\Programs\DataBridge`, Start menu entry,
+//! uninstaller in "Installed apps") plus a portable zip. The Windows CI
+//! (`.github/workflows/windows.yml`) attaches to every `v*` release the
+//! installer ([`SETUP_ASSET`]) and its SHA-256 (`<SETUP_ASSET>.sha256`).
 //!
-//! Self-install is Windows release builds only ([`can_install`]): other
-//! platforms ship no binary yet, and a debug build lives in `target/`
-//! where cargo owns the exe — those get a link to the release page.
-//! Nothing personal is sent: the request carries only a generic
+//! The app asks the GitHub API for the latest (non-pre)release ([`check`]);
+//! when its tag is newer than `CARGO_PKG_VERSION`, the UI offers it.
+//! [`download`] streams the installer into the temp dir and verifies the
+//! checksum; [`run_installer`] starts it and the caller quits:
+//! - an installed copy ([`InstallKind::Installed`]: `unins000.exe` next to
+//!   the exe) runs it silently with `/update=1` — the setup waits for this
+//!   process's instance mutex ([`hold_instance_mutex`]) to disappear,
+//!   installs over the old version and starts the new one;
+//! - a portable copy runs it interactively: updating means installing.
+//!
+//! Debug builds (cargo owns the exe in `target/`) and other platforms
+//! ([`InstallKind::Unsupported`]) get a link to the release page.
+//! Nothing personal is sent: the requests carry only a generic
 //! `DataBridge/<version>` user agent.
+//!
+//! 0.3 / 0.4 updated by swapping the exe in place; CI still publishes that
+//! bare exe ([`LEGACY_ASSET`]) so those versions can reach this one, and
+//! [`cleanup`] removes the `.old` file such a swap leaves.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,8 +38,14 @@ use crate::core::runtime;
 
 /// `owner/name` of the GitHub repository that publishes the releases.
 pub const REPO: &str = "Incoderr/DataBridge";
-/// Release asset with the bare Windows exe (and `<ASSET>.sha256`).
-pub const ASSET: &str = "databridge-windows-x64.exe";
+/// Release asset with the Windows installer (and `<SETUP_ASSET>.sha256`).
+pub const SETUP_ASSET: &str = "DataBridge-Setup-x64.exe";
+/// The bare exe the 0.3 / 0.4 updater swaps in (see the module doc);
+/// CI publishes it, this version never downloads it.
+#[allow(dead_code)]
+pub const LEGACY_ASSET: &str = "databridge-windows-x64.exe";
+/// Named mutex held while the app runs; the installer waits for it.
+pub const INSTANCE_MUTEX: &str = "DataBridge.Instance";
 
 /// The running version (`Cargo.toml`).
 pub fn current_version() -> &'static str {
@@ -45,21 +59,42 @@ pub struct Release {
     pub version: String,
     /// The release page (notes; manual download).
     pub page_url: String,
-    /// Exe + checksum download URLs, when the release carries them
-    /// (releases before the self-updater only had a zip).
-    pub exe_url: Option<String>,
+    /// Installer + checksum download URLs, when the release carries them
+    /// (releases before 0.5 had no installer).
+    pub setup_url: Option<String>,
     pub sha256_url: Option<String>,
 }
 
 impl Release {
     pub fn installable(&self) -> bool {
-        can_install() && self.exe_url.is_some() && self.sha256_url.is_some()
+        install_kind() != InstallKind::Unsupported && self.setup_url.is_some() && self.sha256_url.is_some()
     }
 }
 
-/// Whether this build can replace itself (see the module doc).
-pub fn can_install() -> bool {
-    cfg!(windows) && !cfg!(debug_assertions)
+/// How this copy of the app was deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    /// Installed by the setup: updates run the setup silently.
+    Installed,
+    /// The portable zip: an update installs DataBridge (interactive setup).
+    Portable,
+    /// A debug build or a platform without an installer: release page only.
+    Unsupported,
+}
+
+/// An exe directory with Inno Setup's uninstaller is an installed copy.
+fn kind_of_dir(dir: &Path) -> InstallKind {
+    if dir.join("unins000.exe").is_file() { InstallKind::Installed } else { InstallKind::Portable }
+}
+
+pub fn install_kind() -> InstallKind {
+    if !cfg!(windows) || cfg!(debug_assertions) {
+        return InstallKind::Unsupported;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(kind_of_dir))
+        .unwrap_or(InstallKind::Portable)
 }
 
 // ---------- version compare ----------
@@ -137,8 +172,8 @@ fn newer_release(rel: GhRelease, current: &str) -> Option<Release> {
     Some(Release {
         version: rel.tag_name.trim_start_matches(['v', 'V']).to_string(),
         page_url: rel.html_url.clone(),
-        exe_url: asset(ASSET),
-        sha256_url: asset(&format!("{ASSET}.sha256")),
+        setup_url: asset(SETUP_ASSET),
+        sha256_url: asset(&format!("{SETUP_ASSET}.sha256")),
     })
 }
 
@@ -174,15 +209,15 @@ pub fn check() -> tokio::sync::oneshot::Receiver<Result<Option<Release>, DbError
     runtime::spawn(check_inner())
 }
 
-// ---------- install ----------
+// ---------- download + install ----------
 
-/// Progress of [`install`]. The stream ends with `Done` or `Error`.
+/// Progress of [`download`]. The stream ends with `Done` or `Error`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstallEvent {
     /// Bytes downloaded so far, total when the server sent a length.
     Progress(u64, Option<u64>),
-    /// The new exe is in place; [`restart`] runs it.
-    Done,
+    /// The verified installer; [`run_installer`] starts it.
+    Done(PathBuf),
     Error(String),
 }
 
@@ -198,13 +233,16 @@ fn parse_checksum(text: &str) -> Option<String> {
     (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(token)
 }
 
-async fn install_inner(rel: Release, tx: &mpsc::UnboundedSender<InstallEvent>) -> Result<(), DbError> {
-    let (Some(exe_url), Some(sum_url)) = (rel.exe_url.as_deref(), rel.sha256_url.as_deref()) else {
-        return Err(DbError::new("this release has no installable Windows build"));
+/// Where installers are downloaded (one per version; older ones are
+/// removed by [`cleanup`]).
+fn download_dir() -> PathBuf {
+    std::env::temp_dir().join("DataBridge-update")
+}
+
+async fn download_inner(rel: Release, tx: &mpsc::UnboundedSender<InstallEvent>) -> Result<PathBuf, DbError> {
+    let (Some(setup_url), Some(sum_url)) = (rel.setup_url.as_deref(), rel.sha256_url.as_deref()) else {
+        return Err(DbError::new("this release has no Windows installer"));
     };
-    let exe = std::env::current_exe()
-        .and_then(|p| p.canonicalize().or(Ok(p)))
-        .map_err(|e| DbError::with_source("cannot locate the running exe", e))?;
     let client = runtime::http_client()?;
 
     let sum_text = get(&client, sum_url)
@@ -217,8 +255,9 @@ async fn install_inner(rel: Release, tx: &mpsc::UnboundedSender<InstallEvent>) -
         .map_err(|e| DbError::with_source(format!("cannot download the checksum: {e}"), e))?;
     let expected = parse_checksum(&sum_text).ok_or_else(|| DbError::new("malformed checksum file"))?;
 
+    // No overall timeout here: the installer may take a while on a slow line.
     let mut resp = client
-        .get(exe_url)
+        .get(setup_url)
         .header(reqwest::header::USER_AGENT, format!("DataBridge/{}", current_version()))
         .send()
         .await
@@ -226,12 +265,15 @@ async fn install_inner(rel: Release, tx: &mpsc::UnboundedSender<InstallEvent>) -
         .map_err(|e| DbError::with_source(format!("cannot download the update: {e}"), e))?;
     let total = resp.content_length();
 
-    let tmp = sibling(&exe, ".download");
+    let dir = download_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| DbError::with_source(format!("cannot create {}: {e}", dir.display()), e))?;
+    let target = dir.join(format!("DataBridge-Setup-{}.exe", rel.version));
+    let tmp = sibling(&target, ".part");
     // std::fs: tokio's `fs` feature is not enabled (mock-only build); the
     // chunks are small, a blocking write on a sidecar worker is fine.
-    let mut file = std::fs::File::create(&tmp).map_err(|e| {
-        DbError::with_source(format!("cannot write next to {}: {e}", exe.display()), e)
-    })?;
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|e| DbError::with_source(format!("cannot write {}: {e}", tmp.display()), e))?;
     let mut hasher = Sha256::new();
     let mut done = 0u64;
     let mut reported = 0u64;
@@ -267,29 +309,18 @@ async fn install_inner(rel: Release, tx: &mpsc::UnboundedSender<InstallEvent>) -
         let _ = std::fs::remove_file(&tmp);
         return Err(DbError::new("checksum mismatch — the download is corrupt, try again"));
     }
-
-    // Swap: running exe → .old, download → exe; undo the first rename if
-    // the second fails so the app stays launchable.
-    let old = sibling(&exe, ".old");
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        DbError::with_source(format!("cannot replace {}: {e}", exe.display()), e)
-    })?;
-    if let Err(e) = std::fs::rename(&tmp, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DbError::with_source(format!("cannot replace {}: {e}", exe.display()), e));
-    }
-    Ok(())
+    let _ = std::fs::remove_file(&target);
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| DbError::with_source(format!("cannot write {}: {e}", target.display()), e))?;
+    Ok(target)
 }
 
-/// Download, verify and put the release's exe in place of the running one.
-pub fn install(rel: Release) -> mpsc::UnboundedReceiver<InstallEvent> {
+/// Download and verify the release's installer.
+pub fn download(rel: Release) -> mpsc::UnboundedReceiver<InstallEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     runtime::handle().spawn(async move {
-        let end = match install_inner(rel, &tx).await {
-            Ok(()) => InstallEvent::Done,
+        let end = match download_inner(rel, &tx).await {
+            Ok(path) => InstallEvent::Done(path),
             Err(e) => InstallEvent::Error(e.message().to_string()),
         };
         let _ = tx.send(end);
@@ -297,24 +328,49 @@ pub fn install(rel: Release) -> mpsc::UnboundedReceiver<InstallEvent> {
     rx
 }
 
-/// Launch the (new) exe with the same arguments; the caller quits.
-pub fn restart() -> Result<(), DbError> {
-    let exe = std::env::current_exe()
-        .map_err(|e| DbError::with_source("cannot locate the running exe", e))?;
-    std::process::Command::new(&exe)
-        .args(std::env::args_os().skip(1))
+/// The setup's command line: silent with `/update=1` for an installed
+/// copy (it waits for this process, installs, restarts the app), the
+/// normal wizard for a portable one.
+fn installer_args(kind: InstallKind) -> Vec<&'static str> {
+    match kind {
+        InstallKind::Installed => vec!["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/update=1"],
+        _ => vec!["/SP-"],
+    }
+}
+
+/// Start the downloaded installer; the caller quits right after.
+pub fn run_installer(setup: &Path) -> Result<(), DbError> {
+    std::process::Command::new(setup)
+        .args(installer_args(install_kind()))
         .spawn()
-        .map_err(|e| DbError::with_source(format!("cannot start {}: {e}", exe.display()), e))?;
+        .map_err(|e| DbError::with_source(format!("cannot start {}: {e}", setup.display()), e))?;
     Ok(())
 }
 
-/// Remove what a previous update left behind (`.old`, a broken
-/// `.download`). Called once at startup; failures are harmless.
+/// Hold the named instance mutex for the life of the process: the
+/// installer (`installer/databridge.iss`) waits until it is gone before
+/// replacing the exe, and asks the user to close the app otherwise.
+pub fn hold_instance_mutex() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        let name: Vec<u16> = INSTANCE_MUTEX.encode_utf16().chain(Some(0)).collect();
+        // The handle is never closed: the OS releases it when we exit.
+        unsafe {
+            CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        }
+    }
+}
+
+/// Remove what earlier updates left behind: the `.old` exe of a 0.3 / 0.4
+/// in-place swap, a broken `.download`, and installers already run.
+/// Called once at startup; failures are harmless.
 pub fn cleanup() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(sibling(&exe, ".old"));
         let _ = std::fs::remove_file(sibling(&exe, ".download"));
     }
+    let _ = std::fs::remove_dir_all(download_dir());
 }
 
 #[cfg(test)]
@@ -349,16 +405,21 @@ mod tests {
 
     #[test]
     fn picks_assets_of_a_newer_release() {
-        let sum = format!("{ASSET}.sha256");
-        let r = newer_release(gh("v0.3.0", &["x.zip", ASSET, &sum]), "0.2.0").unwrap();
-        assert_eq!(r.version, "0.3.0");
-        assert_eq!(r.exe_url.as_deref(), Some(format!("https://dl/{ASSET}").as_str()));
+        let sum = format!("{SETUP_ASSET}.sha256");
+        let legacy_sum = format!("{LEGACY_ASSET}.sha256");
+        let r = newer_release(
+            gh("v0.5.0", &["x.zip", SETUP_ASSET, &sum, LEGACY_ASSET, &legacy_sum]),
+            "0.4.0",
+        )
+        .unwrap();
+        assert_eq!(r.version, "0.5.0");
+        assert_eq!(r.setup_url.as_deref(), Some(format!("https://dl/{SETUP_ASSET}").as_str()));
         assert_eq!(r.sha256_url.as_deref(), Some(format!("https://dl/{sum}").as_str()));
-        // Old zip-only releases are offered as a page link only.
-        let r = newer_release(gh("v0.3.0", &["x.zip"]), "0.2.0").unwrap();
-        assert!(r.exe_url.is_none() && !r.installable());
-        assert!(newer_release(gh("v0.2.0", &[ASSET]), "0.2.0").is_none());
-        let mut pre = gh("v0.4.0", &[ASSET]);
+        // Releases without an installer are offered as a page link only.
+        let r = newer_release(gh("v0.4.0", &["x.zip", LEGACY_ASSET, &legacy_sum]), "0.2.0").unwrap();
+        assert!(r.setup_url.is_none() && r.sha256_url.is_none() && !r.installable());
+        assert!(newer_release(gh("v0.2.0", &[SETUP_ASSET]), "0.2.0").is_none());
+        let mut pre = gh("v0.6.0", &[SETUP_ASSET]);
         pre.prerelease = true;
         assert!(newer_release(pre, "0.2.0").is_none());
     }
@@ -367,8 +428,21 @@ mod tests {
     fn checksum_file_formats() {
         let h = "a".repeat(64);
         assert_eq!(parse_checksum(&h), Some(h.clone()));
-        assert_eq!(parse_checksum(&format!("{}  {ASSET}\n", h.to_uppercase())), Some(h.clone()));
+        assert_eq!(parse_checksum(&format!("{}  {SETUP_ASSET}\n", h.to_uppercase())), Some(h.clone()));
         assert_eq!(parse_checksum("deadbeef  x.exe"), None);
         assert_eq!(parse_checksum(""), None);
+    }
+
+    #[test]
+    fn installed_copies_update_silently_portable_ones_install() {
+        let dir = std::env::temp_dir().join(format!("databridge-kind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(kind_of_dir(&dir), InstallKind::Portable);
+        std::fs::write(dir.join("unins000.exe"), b"").unwrap();
+        assert_eq!(kind_of_dir(&dir), InstallKind::Installed);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(installer_args(InstallKind::Installed).contains(&"/update=1"));
+        assert!(installer_args(InstallKind::Installed).contains(&"/VERYSILENT"));
+        assert!(!installer_args(InstallKind::Portable).iter().any(|a| a.contains("SILENT")));
     }
 }
